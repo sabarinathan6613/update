@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Skadomation — Account Setup</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #060B18;
+      color: #F1F5F9;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      background: #0D1526;
+      border: 1px solid #1E2D4A;
+      border-radius: 16px;
+      padding: 40px;
+      width: 100%;
+      max-width: 440px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+    }
+    .logo {
+      font-size: 1.4rem;
+      font-weight: 800;
+      color: #0EA5E9;
+      letter-spacing: -0.03em;
+      margin-bottom: 8px;
+    }
+    .subtitle {
+      font-size: 0.85rem;
+      color: #7C9DBF;
+      margin-bottom: 32px;
+    }
+    label {
+      display: block;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: #7C9DBF;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .form-group { margin-bottom: 20px; }
+    input, select {
+      width: 100%;
+      height: 44px;
+      padding: 0 14px;
+      background: #040810;
+      border: 1px solid #1E2D4A;
+      border-radius: 8px;
+      color: #F1F5F9;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input:focus, select:focus { border-color: #3B82F6; box-shadow: 0 0 0 3px rgba(59,130,246,0.15); }
+    select option { background: #0D1526; }
+    .btn {
+      width: 100%;
+      height: 46px;
+      background: #3B82F6;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.9375rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.15s;
+      margin-top: 8px;
+    }
+    .btn:hover { background: #2563EB; }
+    .alert {
+      padding: 14px 16px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      margin-top: 20px;
+      display: none;
+    }
+    .alert.success { background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); color: #10B981; }
+    .alert.error   { background: rgba(239,68,68,0.1);  border: 1px solid rgba(239,68,68,0.3);  color: #EF4444;  }
+    .redirect-link {
+      display: inline-block;
+      margin-top: 12px;
+      color: #0EA5E9;
+      font-weight: 600;
+      font-size: 0.9rem;
+      text-decoration: none;
+    }
+    .divider { border: none; border-top: 1px solid #1E2D4A; margin: 28px 0; }
+    .existing-users { font-size: 0.82rem; color: #4A6480; text-align: center; }
+    h2 { font-size: 1.1rem; font-weight: 700; margin-bottom: 24px; color: #F1F5F9; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">⚡ SKADOMATION</div>
+    <div class="subtitle">Administrator Account Setup</div>
+
+    <h2>Create Login Account</h2>
+
+    <div class="form-group">
+      <label>Full Name</label>
+      <input type="text" id="name" placeholder="e.g. Plant Administrator" />
+    </div>
+    <div class="form-group">
+      <label>Email Address</label>
+      <input type="email" id="email" placeholder="admin@yourplant.com" />
+    </div>
+    <div class="form-group">
+      <label>Password</label>
+      <input type="password" id="password" placeholder="Choose a strong password" />
+    </div>
+    <div class="form-group">
+      <label>Role</label>
+      <select id="role">
+        <option value="Super Admin">Super Admin</option>
+        <option value="Plant Admin">Plant Admin</option>
+        <option value="Operator">Operator</option>
+        <option value="Viewer">Viewer</option>
+      </select>
+    </div>
+
+    <button class="btn" onclick="createUser()">Create Account & Go to App</button>
+
+    <div class="alert success" id="success">
+      ✅ Account created successfully! Redirecting to login...
+      <br/><a class="redirect-link" href="/">→ Go to Login Now</a>
+    </div>
+    <div class="alert error" id="error"></div>
+
+    <hr class="divider" />
+    <div class="existing-users" id="existingInfo">Checking existing accounts...</div>
+
+    <hr class="divider" />
+    <div style="background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.25);border-radius:10px;padding:16px;">
+      <div style="font-size:0.78rem;font-weight:700;color:#EF4444;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px;">⚠ Danger Zone</div>
+      <p style="font-size:0.82rem;color:#7C9DBF;margin-bottom:12px;">This will permanently delete ALL user accounts and reset the app to factory state.</p>
+      <button class="btn" onclick="clearAllUsers()" style="background:#EF4444;width:100%;">🗑 Delete All Users & Reset</button>
+    </div>
+  </div>
+
+  <script>
+    // Show existing users on load
+    window.onload = function() {
+      try {
+        const users = JSON.parse(localStorage.getItem('prod_users')) || [];
+        const info = document.getElementById('existingInfo');
+        if (users.length === 0) {
+          info.textContent = 'No accounts exist yet. Create the first administrator.';
+          info.style.color = '#F59E0B';
+        } else {
+          info.innerHTML = `<strong style="color:#7C9DBF">${users.length} account(s) already exist:</strong><br>` +
+            users.map(u => `<span style="color:#0EA5E9">${u.email}</span> — ${u.role}`).join('<br>');
+        }
+      } catch(e) {
+        document.getElementById('existingInfo').textContent = 'Could not read existing accounts.';
+      }
+    };
+
+    function createUser() {
+      const name     = document.getElementById('name').value.trim();
+      const email    = document.getElementById('email').value.trim().toLowerCase();
+      const password = document.getElementById('password').value;
+      const role     = document.getElementById('role').value;
+
+      const errEl = document.getElementById('error');
+      const sucEl = document.getElementById('success');
+      errEl.style.display = 'none';
+      sucEl.style.display = 'none';
+
+      if (!name)     { showError('Please enter a name.'); return; }
+      if (!email || !email.includes('@')) { showError('Please enter a valid email address.'); return; }
+      if (!password || password.length < 4) { showError('Password must be at least 4 characters.'); return; }
+
+      try {
+        // Init if key doesn't exist
+        if (!localStorage.getItem('prod_users')) {
+          localStorage.setItem('prod_users', JSON.stringify([]));
+        }
+
+        const users = JSON.parse(localStorage.getItem('prod_users')) || [];
+
+        // Check duplicate
+        if (users.find(u => u.email === email)) {
+          showError(`An account with email "${email}" already exists.`);
+          return;
+        }
+
+        const newUser = {
+          id: 'local-' + Date.now(),
+          email,
+          name,
+          password,
+          role,
+          plantId: 'all',
+          active: true
+        };
+
+        users.push(newUser);
+        localStorage.setItem('prod_users', JSON.stringify(users));
+
+        sucEl.style.display = 'block';
+
+        // Auto-redirect after 2 seconds
+        setTimeout(() => { window.location.href = '/'; }, 2000);
+
+      } catch(e) {
+        showError('Failed to create account: ' + e.message);
+      }
+    }
+
+    function showError(msg) {
+      const el = document.getElementById('error');
+      el.textContent = '⚠ ' + msg;
+      el.style.display = 'block';
+    }
+
+    function clearAllUsers() {
+      if (!confirm('DELETE ALL user accounts? The app will reset to factory state and you will need to create a new admin account. This cannot be undone.')) return;
+      localStorage.removeItem('prod_users');
+      localStorage.removeItem('prod_settings');
+      localStorage.removeItem('prod_plants');
+      localStorage.removeItem('prod_schedules');
+      localStorage.removeItem('prod_history');
+      localStorage.removeItem('prod_sync_logs');
+      localStorage.removeItem('prod_email_logs');
+      localStorage.removeItem('prod_tag_config');
+      localStorage.removeItem('prod_reports_list');
+      document.getElementById('existingInfo').innerHTML = '<span style="color:#10B981;font-weight:600;">✅ All data cleared. Create a new admin account above.</span>';
+      document.getElementById('success').style.display = 'none';
+      document.getElementById('error').style.display = 'none';
+    }
+  </script>
+</body>
+</html>

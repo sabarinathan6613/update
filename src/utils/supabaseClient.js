@@ -16,6 +16,16 @@ export function getSupabaseConfig() {
   } catch (e) {
     console.error("Failed to parse settings for Supabase configuration:", e);
   }
+
+  // Fallback to Vite environment variables if local storage is empty
+  try {
+    const envUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
+    const envKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
+    if (envUrl && envKey && envUrl !== 'your-supabase-url' && envKey !== 'your-anon-key') {
+      return { url: envUrl, anonKey: envKey };
+    }
+  } catch { /* ignored */ }
+
   return null;
 }
 

@@ -1,6 +1,6 @@
 // src/components/Alarms.jsx
-import React, { useState, useEffect, useMemo } from 'react';
-import { getPlants } from '../utils/db';
+import { useState, useEffect, useMemo } from 'react';
+import { getPlants, getHistorianData, getTagConfigs } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
 export default function Alarms() {
@@ -8,17 +8,67 @@ export default function Alarms() {
   const [activeTab, setActiveTab] = useState('active'); // active, history, analytics
   const [historyData, setHistoryData] = useState([]);
   const [plantsList, setPlantsList] = useState([]);
-
   const [activeAlarms, setActiveAlarms] = useState([]);
+  
+  // Keep track of acknowledged alarm IDs in local storage
+  const [acknowledgedIds, setAcknowledgedIds] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('acknowledged_alarms') || '[]');
+    } catch {
+      return [];
+    }
+  });
 
-  // Load plants list
+  // Load plants and fetch alarms from database historian records
   useEffect(() => {
     const loadAlarmData = async () => {
       const plist = await getPlants();
       setPlantsList(plist);
+
+      try {
+        const records = await getHistorianData({ limit: 1000 });
+        const configs = await getTagConfigs();
+        const configMap = {};
+        configs.forEach(c => { configMap[c.TagIndex] = c; });
+
+        // Filter database records for non-normal quality (Status !== 192) or explicit Marker alerts
+        const anomalies = records.filter(r => r.Status !== 192 || (r.Marker && r.Marker.trim() !== ''));
+
+        // Map historian records directly to structured alarm events
+        const mappedAlarms = anomalies.map(r => {
+          const config = configMap[r.TagIndex] || { TagName: `Tag Index ${r.TagIndex}`, Unit: '' };
+          const isAcked = acknowledgedIds.includes(`alarm-${r.DateAndTime}-${r.TagIndex}`);
+          
+          let severity = 'INFO';
+          if (r.Status === 0) severity = 'CRITICAL';
+          else if (r.Status === 128) severity = 'WARNING';
+          else if (r.Marker && r.Marker.toUpperCase().includes('FAIL')) severity = 'CRITICAL';
+
+          const reason = r.Marker 
+            ? `${config.TagName}: ${r.Marker}`
+            : `${config.TagName} Status Fault (Code ${r.Status})`;
+
+          return {
+            id: `alarm-${r.DateAndTime}-${r.TagIndex}`,
+            plantId: currentPlantId, // Scope dynamically to active selected plant for supervisor view
+            time: new Date(r.DateAndTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+            timestamp: r.DateAndTime,
+            reason: reason,
+            severity: severity,
+            acknowledged: isAcked,
+            duration: Math.min(60, Math.floor((Date.now() - new Date(r.DateAndTime).getTime()) / 60000)) || 5, // time difference in mins
+            shift: new Date(r.DateAndTime).getHours() >= 8 && new Date(r.DateAndTime).getHours() < 16 ? 'Shift A' : 'Shift B'
+          };
+        });
+
+        setActiveAlarms(mappedAlarms.filter(a => !a.acknowledged));
+        setHistoryData(mappedAlarms);
+      } catch (err) {
+        console.error("Failed to query historian database for alarms:", err);
+      }
     };
     loadAlarmData();
-  }, [currentPlantId, syncTrigger]);
+  }, [currentPlantId, syncTrigger, acknowledgedIds]);
 
   // Filter alarms based on current active plant selection in Layout
   const filteredActiveAlarms = useMemo(() => {
@@ -31,12 +81,9 @@ export default function Alarms() {
 
   // Acknowledge alarm handler
   const handleAcknowledge = (id) => {
-    setActiveAlarms(prev => prev.map(a => {
-      if (a.id === id) {
-        return { ...a, acknowledged: true };
-      }
-      return a;
-    }));
+    const nextAcked = [...acknowledgedIds, id];
+    setAcknowledgedIds(nextAcked);
+    localStorage.setItem('acknowledged_alarms', JSON.stringify(nextAcked));
     alert("Alarm acknowledged and silenced.");
   };
 
@@ -115,7 +162,7 @@ export default function Alarms() {
       {/* 1. Active Alarms view */}
       {activeTab === 'active' && (
         <div className="card" style={{ padding: '24px' }}>
-          <h3 style={{ marginBottom: '6px', fontSize: '1.1rem', color: 'white' }}>🚨 Active Alarm Annunciator Panel</h3>
+          <h3 style={{ marginBottom: '6px', fontSize: '1.1rem', color: 'var(--text)' }}>🚨 Active Alarm Annunciator Panel</h3>
           <p className="text-xs text-muted" style={{ marginBottom: '16px' }}>Current unacknowledged stops or parameter deviations requiring supervisor verification.</p>
 
           <div className="table-responsive">
@@ -147,8 +194,8 @@ export default function Alarms() {
                           ⚠️ {alarm.severity}
                         </span>
                       </td>
-                      <td className="font-mono text-xs" style={{ color: 'white' }}>{alarm.time}</td>
-                      <td className="font-semibold" style={{ color: 'white' }}>{alarm.reason}</td>
+                      <td className="font-mono text-xs" style={{ color: 'var(--text)' }}>{alarm.time}</td>
+                      <td className="font-semibold" style={{ color: 'var(--text)' }}>{alarm.reason}</td>
                       <td>{plantsList.find(p => p.id === alarm.plantId)?.name}</td>
                       <td>
                         <button onClick={() => handleAcknowledge(alarm.id)} className="btn btn-primary text-xs" style={{ padding: '4px 8px' }}>
@@ -167,7 +214,7 @@ export default function Alarms() {
       {/* 2. Historical Alarm Log view */}
       {activeTab === 'history' && (
         <div className="card" style={{ padding: '24px' }}>
-          <h3 style={{ marginBottom: '6px', fontSize: '1.1rem', color: 'white' }}>📁 Alarm Archive History Logs</h3>
+          <h3 style={{ marginBottom: '6px', fontSize: '1.1rem', color: 'var(--text)' }}>📁 Alarm Archive History Logs</h3>
           <p className="text-xs text-muted" style={{ marginBottom: '16px' }}>Audited history of downtime incidents, register codes, and resolutions.</p>
 
           <div className="table-responsive">

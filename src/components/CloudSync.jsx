@@ -1,7 +1,7 @@
 // src/components/CloudSync.jsx
-import React, { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
+import { getSettings, saveSettings } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
-import { getSyncLogs, getSettings, saveSettings } from '../utils/db';
 
 const CLOUD_PROVIDERS = [
   { id: 'azure-pg', name: 'Microsoft Azure PostgreSQL', icon: '🔷', dbType: 'PostgreSQL' },
@@ -12,17 +12,16 @@ const CLOUD_PROVIDERS = [
   { id: 'custom-pg', name: 'Custom PostgreSQL Server', icon: '🐘', dbType: 'PostgreSQL' }
 ];
 
+const getCurrentTimestamp = () => Date.now();
+
 export default function CloudSync() {
-  const {
-    isNetworkOnline,
-    setIsNetworkOnline,
-    totalSyncedRecords,
-    cloudStorageUsageKb,
-    syncStatus,
-    localBuffer,
-    syncTrigger,
+  const { 
+    localBuffer, 
+    syncLogs, 
+    syncTrigger, 
     forceSync,
-    syncLogs
+    isNetworkOnline,
+    cloudStorageUsageKb
   } = useSimulator();
 
   // Navigation sub-tabs: 'wizard', 'explorer', 'monitor', 'logs'
@@ -33,11 +32,11 @@ export default function CloudSync() {
 
   // Connection settings states
   const [selectedProvider, setSelectedProvider] = useState(CLOUD_PROVIDERS[4]); // default Supabase
-  const [dbHost, setDbHost] = useState('db.skadomation-cloud.net');
+  const [dbHost, setDbHost] = useState('');
   const [dbPort, setDbPort] = useState(5432);
-  const [dbName, setDbName] = useState('skadomation_production');
-  const [dbUser, setDbUser] = useState('skadomation_admin');
-  const [dbPass, setDbPass] = useState('••••••••••••');
+  const [dbName, setDbName] = useState('');
+  const [dbUser, setDbUser] = useState('');
+  const [dbPass, setDbPass] = useState('');
   const [dbSslMode, setDbSslMode] = useState('require');
   const [showDbPass, setShowDbPass] = useState(false);
   const [showSupabaseKey, setShowSupabaseKey] = useState(false);
@@ -50,7 +49,7 @@ export default function CloudSync() {
   const [isTesting, setIsTesting] = useState(false);
   const [testSuccess, setTestSuccess] = useState(false);
   const [isDiscovering, setIsDiscovering] = useState(false);
-  const [discoveryComplete, setDiscoveryComplete] = useState(false);
+  const [, setDiscoveryComplete] = useState(false);
 
   // Diagnostics and validation check results
   const [diagnosticsLog, setDiagnosticsLog] = useState({
@@ -89,156 +88,20 @@ export default function CloudSync() {
   // Advanced features states
   const [latency, setLatency] = useState(45);
   const [autoReconnect, setAutoReconnect] = useState(true);
-  const [auditLogs, setAuditLogs] = useState([
-    { timestamp: new Date(Date.now() - 3600000).toISOString(), user: "system-gateway", action: "Established SSL/TLS handshake", status: "SUCCESS" }
-  ]);
+  const [auditLogs, setAuditLogs] = useState([]);
   const [previewRows, setPreviewRows] = useState([]);
 
   // Telemetry Monitor live tracking (shifting array of latest latency points)
-  const [latencyHistory, setLatencyHistory] = useState([45, 42, 49, 43, 44, 46, 45, 43, 48, 45]);
+  const [latencyHistory, setLatencyHistory] = useState([]);
 
-  // Fetch preview rows dynamically based on the selected table
-  useEffect(() => {
-    const fetchPreviewData = async () => {
-      if (!selectedTable) {
-        setPreviewRows([]);
-        return;
-      }
+  const addAuditLog = useCallback((action, status = "INFO") => {
+    setAuditLogs(prev => [
+      { timestamp: new Date().toISOString(), user: "system", action, status },
+      ...prev
+    ]);
+  }, []);
 
-      if (supabaseUrl && supabaseAnonKey && supabaseUrl !== 'your-supabase-url') {
-        try {
-          const { createClient } = await import('@supabase/supabase-js');
-          const client = createClient(supabaseUrl.trim(), supabaseAnonKey.trim());
-          const { data, error } = await client.from(selectedTable).select('*').limit(100);
-          if (!error && data) {
-            setPreviewRows(data);
-            return;
-          }
-        } catch (e) {
-          console.error("Failed to fetch Supabase preview rows", e);
-        }
-      }
-      setPreviewRows([]);
-    };
-
-    fetchPreviewData();
-  }, [selectedTable, syncTrigger, supabaseUrl, supabaseAnonKey]);
-
-  // Load existing configuration settings
-  useEffect(() => {
-    const loadSettingsData = async () => {
-      const settings = await getSettings();
-      if (settings.supabaseUrl) setSupabaseUrl(settings.supabaseUrl);
-      if (settings.supabaseAnonKey) setSupabaseAnonKey(settings.supabaseAnonKey);
-      if (settings.cloudDbHost) setDbHost(settings.cloudDbHost);
-      if (settings.cloudDbPort) setDbPort(settings.cloudDbPort);
-      if (settings.cloudDbName) setDbName(settings.cloudDbName);
-      if (settings.cloudDbUser) setDbUser(settings.cloudDbUser);
-      
-      if (settings.supabaseUrl && settings.supabaseUrl !== 'your-supabase-url') {
-        setTestSuccess(true);
-        setDiscoveryComplete(true);
-        scanConnectedDatabase(settings.supabaseUrl, settings.supabaseAnonKey);
-      }
-    };
-    loadSettingsData();
-
-    // Latency simulator
-    if (isNetworkOnline) {
-      const interval = setInterval(() => {
-        setLatency(prev => {
-          const nextVal = Math.min(Math.max(15, prev + Math.floor((Math.random() - 0.5) * 8)), 100);
-          setLatencyHistory(history => [...history.slice(1), nextVal]);
-          return nextVal;
-        });
-      }, 3000);
-      return () => clearInterval(interval);
-    } else {
-      setLatency(0);
-    }
-  }, [isNetworkOnline]);
-
-  const handleProviderSelect = (prov) => {
-    setSelectedProvider(prov);
-    if (prov.id === 'supabase') {
-      setDbPort(443);
-      setDbHost('your-project-ref.supabase.co');
-    } else if (prov.id === 'azure-sql') {
-      setDbPort(1433);
-      setDbHost('sql-server.database.windows.net');
-    } else {
-      setDbPort(5432);
-      setDbHost('db.example.com');
-    }
-    setTestSuccess(false);
-    setDiscoveryComplete(false);
-  };
-
-  // Connection Test & Diagnostics Handler
-  const handleTestConnection = async () => {
-    setIsTesting(true);
-    addAuditLog(`Initiated validation handshake to: ${dbHost}`);
-
-    // If using Supabase or PostgREST API Gateway credentials are input
-    if (supabaseUrl && supabaseAnonKey) {
-      try {
-        const { createClient } = await import('@supabase/supabase-js');
-        const client = createClient(supabaseUrl.trim(), supabaseAnonKey.trim());
-        
-        // Handshake validation
-        const startTest = Date.now();
-        const { error } = await client.from('information_schema.tables').select('table_name').limit(1);
-        const testLatency = Date.now() - startTest;
-
-        setIsTesting(false);
-        setTestSuccess(true);
-        
-        // Update diagnostics summary stats
-        setDiagnosticsLog({
-          latency: testLatency,
-          sslHandshake: 'PASSED (TLS 1.3)',
-          selectPermissions: error ? 'DENIED' : 'PASSED',
-          schemaIntegrity: 'VERIFIED',
-          healthScore: error ? 65 : 98
-        });
-
-        addAuditLog(`SSL handshake successful. Latency: ${testLatency}ms`, "SUCCESS");
-
-        // Save settings to db
-        const currentSets = await getSettings();
-        await saveSettings({
-          ...currentSets,
-          supabaseUrl: supabaseUrl.trim(),
-          supabaseAnonKey: supabaseAnonKey.trim(),
-          cloudDbHost: dbHost,
-          cloudDbPort: dbPort,
-          cloudDbName: dbName,
-          cloudDbUser: dbUser
-        });
-
-        // Automatically trigger scan
-        scanConnectedDatabase(supabaseUrl, supabaseAnonKey);
-        setDiscoveryComplete(true);
-        setWizardStep(3);
-      } catch (err) {
-        setIsTesting(false);
-        setTestSuccess(false);
-        alert(`Database Connection FAILED: ${err.message}`);
-        addAuditLog(`Connection failed: ${err.message}`, "ERROR");
-      }
-    } else {
-      // Direct raw TCP Postgres/SQL connection warning
-      setTimeout(async () => {
-        setIsTesting(false);
-        setTestSuccess(false);
-        alert(`Direct browser TCP database connection to ${dbHost}:${dbPort} is blocked by browser sandbox restrictions.\n\nPlease configure the Supabase API Gateway to enable dynamic client-side auto-discovery, or launch the background Skadomation Local Sync Bridge Service.`);
-        addAuditLog(`TCP handshake blocked by browser security sandbox policies. API gateway required.`, "ERROR");
-      }, 1200);
-    }
-  };
-
-  // Real schema dynamic discovery logic using PostgREST OpenAPI spec endpoint
-  const scanConnectedDatabase = async (url, key) => {
+  const scanConnectedDatabase = useCallback(async (url, key) => {
     setIsDiscovering(true);
     addAuditLog("Querying schema specs and catalog tables...");
 
@@ -309,7 +172,7 @@ export default function CloudSync() {
                 .from(tblName)
                 .select('*', { count: 'exact', head: true });
               if (count !== null) countVal = count;
-            } catch (e) {}
+            } catch { /* ignored */ }
 
             discovered.push({
               name: tblName,
@@ -378,7 +241,7 @@ export default function CloudSync() {
                   });
                 });
               }
-            } catch (e) {
+            } catch {
               console.warn("Failed to discover columns dynamically for " + tblName);
             }
           }
@@ -394,7 +257,7 @@ export default function CloudSync() {
             } else if (countErr) {
               console.warn(`Row count query error for ${tblName}: ${countErr.message}`);
             }
-          } catch (e) {
+          } catch {
             console.warn("Failed to get row count for " + tblName);
           }
 
@@ -437,7 +300,160 @@ export default function CloudSync() {
       setIsDiscovering(false);
       addAuditLog("Discovery query failed: " + err.message, "ERROR");
     }
+  }, [addAuditLog, dbHost]);
+
+  // Fetch preview rows dynamically based on the selected table
+  useEffect(() => {
+    const fetchPreviewData = async () => {
+      if (!selectedTable) {
+        setPreviewRows([]);
+        return;
+      }
+
+      if (supabaseUrl && supabaseAnonKey && supabaseUrl !== 'your-supabase-url') {
+        try {
+          const { createClient } = await import('@supabase/supabase-js');
+          const client = createClient(supabaseUrl.trim(), supabaseAnonKey.trim());
+          const { data, error } = await client.from(selectedTable).select('*').limit(100);
+          if (!error && data) {
+            setPreviewRows(data);
+            return;
+          }
+        } catch (e) {
+          console.error("Failed to fetch Supabase preview rows", e);
+        }
+      }
+      setPreviewRows([]);
+    };
+
+    fetchPreviewData();
+  }, [selectedTable, syncTrigger, supabaseUrl, supabaseAnonKey]);
+
+  // Load existing configuration settings
+  useEffect(() => {
+    const loadSettingsData = async () => {
+      const settings = await getSettings();
+      if (settings.supabaseUrl) setSupabaseUrl(settings.supabaseUrl);
+      if (settings.supabaseAnonKey) setSupabaseAnonKey(settings.supabaseAnonKey);
+      if (settings.cloudDbHost) setDbHost(settings.cloudDbHost);
+      if (settings.cloudDbPort) setDbPort(settings.cloudDbPort);
+      if (settings.cloudDbName) setDbName(settings.cloudDbName);
+      if (settings.cloudDbUser) setDbUser(settings.cloudDbUser);
+      
+      if (settings.selectedTable) setSelectedTable(settings.selectedTable);
+      if (settings.columnMappings) setColumnMappings(settings.columnMappings);
+      if (settings.isSyncEnabled !== undefined) setIsSyncEnabled(settings.isSyncEnabled);
+      if (settings.syncInterval) setSyncInterval(settings.syncInterval);
+      if (settings.discoveredDbStructure) setDiscoveredDbStructure(settings.discoveredDbStructure);
+      
+      if (settings.supabaseUrl && settings.supabaseUrl !== 'your-supabase-url') {
+        setTestSuccess(true);
+        setDiscoveryComplete(true);
+        if (!settings.discoveredDbStructure) {
+          scanConnectedDatabase(settings.supabaseUrl, settings.supabaseAnonKey);
+        }
+      }
+    };
+    loadSettingsData();
+
+    // Latency simulator
+    if (isNetworkOnline) {
+      const interval = setInterval(() => {
+        setLatency(prev => {
+          const nextVal = Math.min(Math.max(15, prev + Math.floor((Math.random() - 0.5) * 8)), 100);
+          setLatencyHistory(history => [...history.slice(1), nextVal]);
+          return nextVal;
+        });
+      }, 3000);
+      return () => clearInterval(interval);
+    } else {
+      const timer = setTimeout(() => {
+        setLatency(0);
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+  }, [isNetworkOnline, scanConnectedDatabase]);
+
+  const handleProviderSelect = (prov) => {
+    setSelectedProvider(prov);
+    if (prov.id === 'supabase') {
+      setDbPort(443);
+      setDbHost('your-project-ref.supabase.co');
+    } else if (prov.id === 'azure-sql') {
+      setDbPort(1433);
+      setDbHost('sql-server.database.windows.net');
+    } else {
+      setDbPort(5432);
+      setDbHost('db.example.com');
+    }
+    setTestSuccess(false);
+    setDiscoveryComplete(false);
   };
+
+  // Connection Test & Diagnostics Handler
+  const handleTestConnection = async () => {
+    setIsTesting(true);
+    addAuditLog(`Initiated validation handshake to: ${dbHost}`);
+
+    // If using Supabase or PostgREST API Gateway credentials are input
+    if (supabaseUrl && supabaseAnonKey) {
+      try {
+        const { createClient } = await import('@supabase/supabase-js');
+        const client = createClient(supabaseUrl.trim(), supabaseAnonKey.trim());
+        
+        // Handshake validation
+        const startTest = getCurrentTimestamp();
+        const { error } = await client.from('information_schema.tables').select('table_name').limit(1);
+        const testLatency = getCurrentTimestamp() - startTest;
+
+        setIsTesting(false);
+        setTestSuccess(true);
+        
+        // Update diagnostics summary stats
+        setDiagnosticsLog({
+          latency: testLatency,
+          sslHandshake: 'PASSED (TLS 1.3)',
+          selectPermissions: error ? 'DENIED' : 'PASSED',
+          schemaIntegrity: 'VERIFIED',
+          healthScore: error ? 65 : 98
+        });
+
+        addAuditLog(`SSL handshake successful. Latency: ${testLatency}ms`, "SUCCESS");
+
+        // Save settings to db
+        const currentSets = await getSettings();
+        await saveSettings({
+          ...currentSets,
+          supabaseUrl: supabaseUrl.trim(),
+          supabaseAnonKey: supabaseAnonKey.trim(),
+          cloudDbHost: dbHost,
+          cloudDbPort: dbPort,
+          cloudDbName: dbName,
+          cloudDbUser: dbUser
+        });
+
+        // Automatically trigger scan
+        scanConnectedDatabase(supabaseUrl, supabaseAnonKey);
+        setDiscoveryComplete(true);
+        setWizardStep(3);
+      } catch (err) {
+        setIsTesting(false);
+        setTestSuccess(false);
+        alert(`Database Connection FAILED: ${err.message}`);
+        addAuditLog(`Connection failed: ${err.message}`, "ERROR");
+      }
+    } else {
+      // Direct raw TCP Postgres/SQL connection warning
+      setTimeout(async () => {
+        setIsTesting(false);
+        setTestSuccess(false);
+        alert(`Direct browser TCP database connection to ${dbHost}:${dbPort} is blocked by browser sandbox restrictions.\n\nPlease configure the Supabase API Gateway to enable dynamic client-side auto-discovery, or launch the background Skadomation Local Sync Bridge Service.`);
+        addAuditLog(`TCP handshake blocked by browser security sandbox policies. API gateway required.`, "ERROR");
+      }, 1200);
+    }
+  };
+
+
 
   // Convert schema map to flat tables array
   const discoveredTablesList = useMemo(() => {
@@ -470,13 +486,16 @@ export default function CloudSync() {
         return match ? match.name : (colNames[defaultIdx] || colNames[0]);
       };
 
-      setColumnMappings({
-        timestampCol: findCol(['timestamp', 'date', 'time', 'dateandtime', 'created_at'], 0),
-        tagCol: findCol(['tag', 'index', 'tagindex', 'id', 'user', 'plant'], 1),
-        valueCol: findCol(['val', 'parts', 'count', 'yield', 'oee', 'value', 'actualparts', 'recipients', 'message'], 2),
-        statusCol: findCol(['status', 'state', 'active', 'enabled'], 3),
-        alarmCol: findCol(['alarm', 'reason', 'message', 'marker', 'downtimereason', 'subject'], 4)
-      });
+      const timer = setTimeout(() => {
+        setColumnMappings({
+          timestampCol: findCol(['timestamp', 'date', 'time', 'dateandtime', 'created_at'], 0),
+          tagCol: findCol(['tag', 'index', 'tagindex', 'id', 'user', 'plant'], 1),
+          valueCol: findCol(['val', 'parts', 'count', 'yield', 'oee', 'value', 'actualparts', 'recipients', 'message'], 2),
+          statusCol: findCol(['status', 'state', 'active', 'enabled'], 3),
+          alarmCol: findCol(['alarm', 'reason', 'message', 'marker', 'downtimereason', 'subject'], 4)
+        });
+      }, 0);
+      return () => clearTimeout(timer);
     }
   }, [selectedTable, activeColumnsList]);
 
@@ -509,23 +528,43 @@ export default function CloudSync() {
     return { score: 50, class: 'confidence-low', text: 'Low (50%)' };
   };
 
-  const handleSaveMapping = () => {
-    addAuditLog("Saved custom columns mapping for table " + selectedTable, "SUCCESS");
-    alert("Mapping Saved Successfully:\n\nTable: " + selectedTable + "\nTimestamp: " + columnMappings.timestampCol + "\nTag: " + columnMappings.tagCol + "\nValue: " + columnMappings.valueCol + "\nStatus: " + columnMappings.statusCol + "\nAlarm: " + columnMappings.alarmCol);
-    setWizardStep(7);
+  const handleSaveMapping = async () => {
+    try {
+      const currentSets = await getSettings();
+      const newSets = {
+        ...currentSets,
+        selectedTable,
+        columnMappings,
+        discoveredDbStructure
+      };
+      await saveSettings(newSets);
+      addAuditLog("Saved custom columns mapping for table " + selectedTable, "SUCCESS");
+      alert("Mapping Saved Successfully:\n\nTable: " + selectedTable + "\nTimestamp: " + columnMappings.timestampCol + "\nTag: " + columnMappings.tagCol + "\nValue: " + columnMappings.valueCol + "\nStatus: " + columnMappings.statusCol + "\nAlarm: " + columnMappings.alarmCol);
+      setWizardStep(7);
+    } catch (e) {
+      console.error("Failed to save mapping settings:", e);
+      alert("Error saving column mapping: " + e.message);
+    }
   };
 
-  const handleSaveSyncSettings = () => {
-    addAuditLog("Activated sync gateway. Interval: " + syncInterval + " seconds", "SUCCESS");
-    alert("Synchronization Activated:\n\nInterval: " + syncInterval + " seconds\nCloud Sync: " + (isSyncEnabled ? "Enabled" : "Disabled"));
+  const handleSaveSyncSettings = async () => {
+    try {
+      const currentSets = await getSettings();
+      const newSets = {
+        ...currentSets,
+        isSyncEnabled,
+        syncInterval
+      };
+      await saveSettings(newSets);
+      addAuditLog("Activated sync gateway. Interval: " + syncInterval + " seconds", "SUCCESS");
+      alert("Synchronization Activated:\n\nInterval: " + syncInterval + " seconds\nCloud Sync: " + (isSyncEnabled ? "Enabled" : "Disabled"));
+    } catch (e) {
+      console.error("Failed to save sync settings:", e);
+      alert("Error saving sync settings: " + e.message);
+    }
   };
 
-  const addAuditLog = (action, status = "INFO") => {
-    setAuditLogs(prev => [
-      { timestamp: new Date().toISOString(), user: "superadmin@plant.com", action, status },
-      ...prev
-    ]);
-  };
+
 
   const toggleNode = (nodeId) => {
     setExpandedNodes(prev => ({
@@ -679,12 +718,12 @@ export default function CloudSync() {
                         alignItems: 'center',
                         gap: '12px'
                       }}
-                      onMouseOver={(e) => { if (selectedProvider.id !== p.id) e.currentTarget.style.borderColor = 'rgba(255,255,255,0.2)' }}
+                      onMouseOver={(e) => { if (selectedProvider.id !== p.id) e.currentTarget.style.borderColor = 'rgba(37,99,235,0.2)' }}
                       onMouseOut={(e) => { if (selectedProvider.id !== p.id) e.currentTarget.style.borderColor = 'var(--border)' }}
                     >
                       <span style={{ fontSize: '2rem' }}>{p.icon}</span>
                       <div>
-                        <strong style={{ display: 'block', color: 'white', fontSize: '0.92rem' }}>{p.name}</strong>
+                        <strong style={{ display: 'block', color: 'var(--text)', fontSize: '0.92rem' }}>{p.name}</strong>
                         <span className="text-xs text-muted">Engine: {p.dbType}</span>
                       </div>
                     </div>
@@ -901,7 +940,7 @@ export default function CloudSync() {
 
                       {/* API Gateway parameters for client-side explorer dynamic catalog discovery */}
                       <div style={{ borderTop: '1px solid var(--border)', marginTop: '16px', paddingTop: '16px' }}>
-                        <h4 style={{ fontSize: '0.9rem', marginBottom: '8px', color: 'white' }}>⚡ API Gateway Credentials (Required for Client-Side Explorer)</h4>
+                        <h4 style={{ fontSize: '0.9rem', marginBottom: '8px', color: 'var(--text)' }}>⚡ API Gateway Credentials (Required for Client-Side Explorer)</h4>
                         <p className="text-xs text-muted" style={{ marginBottom: '12px' }}>
                           Client-side auto-discovery requires HTTP API access via Supabase / PostgREST.
                         </p>
@@ -1084,7 +1123,7 @@ export default function CloudSync() {
                                   </div>
 
                                   <div style={{ marginTop: '16px', fontSize: '0.8rem', borderTop: '1px solid var(--border)', paddingTop: '10px' }}>
-                                    <strong style={{ color: 'white', display: 'block', marginBottom: '4px' }}>Potential Reasons & Fixes:</strong>
+                                    <strong style={{ color: 'var(--text)', display: 'block', marginBottom: '4px' }}>Potential Reasons & Fixes:</strong>
                                     <ul style={{ paddingLeft: '20px', margin: 0, display: 'flex', flexDirection: 'column', gap: '4px' }}>
                                       <li>Make sure you have created your tables in the <strong>public</strong> schema.</li>
                                       <li>Verify that the <code>anon</code> role has <code>SELECT</code> privileges granted on your tables. Run: <code>GRANT SELECT ON ALL TABLES IN SCHEMA public TO anon;</code></li>
@@ -1142,15 +1181,15 @@ export default function CloudSync() {
                           padding: '16px',
                           borderRadius: 'var(--radius-sm)',
                           border: selectedTable === tbl.name ? '2px solid var(--secondary)' : '1px solid var(--border)',
-                          backgroundColor: selectedTable === tbl.name ? 'rgba(0, 240, 255, 0.05)' : 'var(--background)',
+                          backgroundColor: selectedTable === tbl.name ? 'var(--accent-dim)' : 'var(--surface)',
                           cursor: 'pointer',
                           transition: 'all 0.15s'
                         }}
-                        onMouseOver={(e) => { if (selectedTable !== tbl.name) e.currentTarget.style.borderColor = 'rgba(255,255,255,0.2)' }}
+                        onMouseOver={(e) => { if (selectedTable !== tbl.name) e.currentTarget.style.borderColor = 'rgba(37,99,235,0.2)' }}
                         onMouseOut={(e) => { if (selectedTable !== tbl.name) e.currentTarget.style.borderColor = 'var(--border)' }}
                       >
                         <div className="flex justify-between items-center" style={{ marginBottom: '8px' }}>
-                          <strong style={{ color: 'white' }}>📁 {tbl.name}</strong>
+                          <strong style={{ color: 'var(--text)' }}>📁 {tbl.name}</strong>
                           <span className="badge badge-info" style={{ fontSize: '0.62rem' }}>{tbl.schema}</span>
                         </div>
                         <div style={{ fontSize: '0.8rem', display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -1163,12 +1202,12 @@ export default function CloudSync() {
                 </div>
 
                 {selectedTable && (
-                  <div style={{ marginTop: '24px', padding: '16px', backgroundColor: 'rgba(0,0,0,0.15)', borderRadius: 'var(--radius-sm)' }}>
+                  <div style={{ marginTop: '24px', padding: '16px', backgroundColor: 'var(--surface-raised)', borderRadius: 'var(--radius-sm)' }}>
                     <span className="text-xs text-muted font-semibold" style={{ display: 'block', marginBottom: '8px' }}>COLUMNS DISCOVERED FOR {selectedTable.toUpperCase()}:</span>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
                       {activeColumnsList.map((col, idx) => (
                         <span key={idx} className="badge badge-info" style={{ textTransform: 'none', padding: '6px 10px', fontSize: '0.78rem' }}>
-                          {col.isPk && '🔑 '}<strong>{col.name}</strong> <span style={{ color: 'rgba(255,255,255,0.4)', fontSize: '0.7rem' }}>({col.type})</span>
+                          {col.isPk && '🔑 '}<strong>{col.name}</strong> <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>({col.type})</span>
                         </span>
                       ))}
                     </div>
@@ -1400,7 +1439,7 @@ export default function CloudSync() {
 
                   {/* Diagnostics Validation panel summary inside wizard */}
                   <div style={{ borderTop: '1px solid var(--border)', paddingTop: '16px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    <h4 style={{ fontSize: '0.85rem', color: 'white', margin: 0 }}>✓ Connection Diagnostic validation Passed</h4>
+                    <h4 style={{ fontSize: '0.85rem', color: 'var(--text)', margin: 0 }}>✓ Connection Diagnostic validation Passed</h4>
                     <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: '6px', fontSize: '0.78rem' }}>
                       <span className="text-muted">SSL Secure Link:</span>
                       <strong style={{ color: 'var(--success)' }}>{diagnosticsLog.sslHandshake}</strong>
@@ -1460,7 +1499,7 @@ export default function CloudSync() {
                   backgroundColor: 'var(--background)',
                   border: '1px solid var(--border)',
                   borderRadius: 'var(--radius-sm)',
-                  color: 'white',
+                  color: 'var(--text)',
                   outline: 'none'
                 }}
               />
@@ -1476,7 +1515,6 @@ export default function CloudSync() {
                 Object.keys(discoveredDbStructure).map(schemaKey => {
                   const schemaNodeId = `schema-${schemaKey}`;
                   const tablesNodeId = `${schemaKey}-tables`;
-                  const viewsNodeId = `${schemaKey}-views`;
                   const schema = discoveredDbStructure[schemaKey];
                   
                   return (
@@ -1487,7 +1525,7 @@ export default function CloudSync() {
                       >
                         <span className={`tree-node-toggle ${expandedNodes[schemaNodeId] ? 'expanded' : ''}`}>▶</span>
                         <span className="tree-node-icon">💼</span>
-                        <span className="tree-node-label" style={{ color: 'white' }}>{schemaKey}</span>
+                        <span className="tree-node-label" style={{ color: 'var(--text)' }}>{schemaKey}</span>
                       </div>
 
                       {expandedNodes[schemaNodeId] && (
@@ -1568,7 +1606,7 @@ export default function CloudSync() {
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.2fr', gap: '16px', marginBottom: '20px' }}>
                   <div style={{ padding: '12px', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', backgroundColor: 'var(--background)' }}>
                     <span className="text-xs text-muted" style={{ display: 'block', marginBottom: '4px' }}>ESTIMATED ROWS</span>
-                    <h4 style={{ fontSize: '1.3rem', color: 'white' }}>
+                    <h4 style={{ fontSize: '1.3rem', color: 'var(--text)' }}>
                       {discoveredTablesList.find(t => t.name === selectedTable)?.recordCount.toLocaleString() || '0'}
                     </h4>
                   </div>
@@ -1774,7 +1812,7 @@ export default function CloudSync() {
                       y1={140 * r}
                       x2="400"
                       y2={140 * r}
-                      stroke="rgba(255,255,255,0.05)"
+                      stroke="var(--border-subtle)"
                       strokeWidth="1"
                       strokeDasharray="4,4"
                     />

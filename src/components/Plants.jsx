@@ -1,5 +1,5 @@
 // src/components/Plants.jsx
-import React, { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { getPlants, savePlant, getProductionHistory } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
@@ -27,7 +27,10 @@ export default function Plants() {
   };
 
   useEffect(() => {
-    loadPlantData();
+    const timer = setTimeout(() => {
+      loadPlantData();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [syncTrigger]);
 
   // Aggregate stats for each plant dynamically
@@ -135,7 +138,7 @@ export default function Plants() {
             
             <div className="flex justify-between items-start" style={{ marginBottom: '12px' }}>
               <div>
-                <strong style={{ display: 'block', fontSize: '1.05rem', color: 'white' }}>{plant.name}</strong>
+                <strong style={{ display: 'block', fontSize: '1.05rem', color: 'var(--text)' }}>{plant.name}</strong>
                 <span className="text-xs text-muted">📍 {plant.location}</span>
               </div>
               <span className={`badge ${
@@ -156,19 +159,19 @@ export default function Plants() {
               </div>
               <div className="flex justify-between">
                 <span className="text-muted">Node Uptime rate:</span>
-                <strong style={{ color: 'white' }}>{plant.avgUptime !== null ? plant.avgUptime + '%' : 'No data'}</strong>
+                <strong style={{ color: 'var(--text)' }}>{plant.avgUptime !== null ? plant.avgUptime + '%' : 'No data'}</strong>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted">Daily Good Yield:</span>
-                <strong style={{ color: 'white' }}>{plant.todayYield.toLocaleString()} parts</strong>
+                <strong style={{ color: 'var(--text)' }}>{plant.todayYield.toLocaleString()} parts</strong>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted">Daily Rejection Parts:</span>
-                <strong style={{ color: plant.todayRejects > 25 ? 'var(--error)' : 'white' }}>{plant.todayRejects.toLocaleString()} parts</strong>
+                <strong style={{ color: plant.todayRejects > 25 ? 'var(--error)' : 'var(--text)' }}>{plant.todayRejects.toLocaleString()} parts</strong>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted">Target Capacity:</span>
-                <strong style={{ color: 'white' }}>{plant.capacity.toLocaleString()} / day</strong>
+                <strong style={{ color: 'var(--text)' }}>{plant.capacity.toLocaleString()} / day</strong>
               </div>
             </div>
 
@@ -207,7 +210,7 @@ export default function Plants() {
               alignItems: 'center',
               gap: '16px'
             }}>
-              <strong style={{ fontSize: '0.85rem', color: 'white' }}>{p.name}</strong>
+              <strong style={{ fontSize: '0.85rem', color: 'var(--text)' }}>{p.name}</strong>
               <div style={{ height: '10px', backgroundColor: 'var(--border)', borderRadius: '5px', overflow: 'hidden' }}>
                 <div style={{
                   height: '100%',
@@ -216,7 +219,7 @@ export default function Plants() {
                   borderRadius: '5px'
                 }} />
               </div>
-              <span className="font-mono text-xs text-right" style={{ color: 'white', fontWeight: 700 }}>
+              <span className="font-mono text-xs text-right" style={{ color: 'var(--text)', fontWeight: 700 }}>
                 {p.calculatedOee !== null ? p.calculatedOee + '% OEE' : 'No data'}
               </span>
             </div>
@@ -229,10 +232,10 @@ export default function Plants() {
         <div className="modal-overlay">
           <div className="modal-container" style={{ maxWidth: '440px' }}>
             <div className="drawer-header" style={{ padding: '16px 20px' }}>
-              <h3 style={{ margin: 0, color: 'white', fontSize: '1.1rem' }}>
+              <h3 style={{ margin: 0, color: 'var(--text)', fontSize: '1.1rem' }}>
                 {editPlantObj.id ? "⚙️ Configure Node Settings" : "🏭 Register New Plant Node"}
               </h3>
-              <button onClick={() => setShowModal(false)} style={{ background: 'transparent', border: 'none', color: 'white', fontSize: '1.5rem', cursor: 'pointer' }}>×</button>
+              <button onClick={() => setShowModal(false)} style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', fontSize: '1.5rem', cursor: 'pointer' }}>×</button>
             </div>
             
             <form onSubmit={handleSavePlant} style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -242,7 +245,7 @@ export default function Plants() {
                   id="plant-name"
                   type="text"
                   className="form-control"
-                  placeholder="Detroit Engine Plant"
+                  placeholder="Enter plant name"
                   value={editPlantObj.name}
                   onChange={(e) => setEditPlantObj({ ...editPlantObj, name: e.target.value })}
                   required
@@ -255,7 +258,7 @@ export default function Plants() {
                   id="plant-location"
                   type="text"
                   className="form-control"
-                  placeholder="Detroit, MI"
+                  placeholder="Enter location"
                   value={editPlantObj.location}
                   onChange={(e) => setEditPlantObj({ ...editPlantObj, location: e.target.value })}
                   required

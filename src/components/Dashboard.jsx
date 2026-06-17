@@ -1,110 +1,385 @@
 // src/components/Dashboard.jsx
-import React, { useState, useEffect, useMemo } from 'react';
-import { getHistorianData, getTagConfigs, getSettings, getSyncLogs } from '../utils/db';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { getHistorianData, getTagConfigs, getSettings } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
-export default function Dashboard({ user }) {
-  const { syncTrigger, isNetworkOnline, localBuffer, totalSyncedRecords, cloudStorageUsageKb, failedSyncAttempts } = useSimulator();
-  
-  // Settings & configs state
-  const [dashboardTags, setDashboardTags] = useState([]);
-  const [tagConfigs, setTagConfigs] = useState([]);
-  const [dbTable, setDbTable] = useState('Database');
-  
-  // Data states
-  const [historianRecords, setHistorianRecords] = useState([]);
-  const [recentLogs, setRecentLogs] = useState([]);
-  const [loading, setLoading] = useState(true);
+// ─── Constants ────────────────────────────────────────────────────────────────
+const ACCENT_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#a78bfa'];
 
-  // Load configuration
-  useEffect(() => {
-    const loadConfigs = async () => {
-      const settings = await getSettings();
+// ─── Micro Sparkline ──────────────────────────────────────────────────────────
+function Sparkline({ points, color }) {
+  if (!points || points.length < 2) return null;
+  const W = 110, H = 32;
+  const min = Math.min(...points);
+  const max = Math.max(...points);
+  const range = max - min || 1;
+  const coords = points
+    .map((v, i) => {
+      const x = (i / (points.length - 1)) * W;
+      const y = H - 2 - ((v - min) / range) * (H - 6);
+      return `${x},${y}`;
+    })
+    .join(' ');
+
+  // Area fill path
+  const first = points[0];
+  const x0 = 0, xN = W;
+  const y0 = H - 2 - ((first - min) / range) * (H - 6);
+  const areaPath = `M ${x0},${y0} ` + points
+    .map((v, i) => {
+      const x = (i / (points.length - 1)) * W;
+      const y = H - 2 - ((v - min) / range) * (H - 6);
+      return `L ${x},${y}`;
+    })
+    .join(' ') + ` L ${xN},${H} L ${x0},${H} Z`;
+
+  return (
+    <svg width={W} height={H} style={{ overflow: 'visible', display: 'block' }}>
+      <defs>
+        <linearGradient id={`spark-fill-${color.replace('#', '')}`} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.25" />
+          <stop offset="100%" stopColor={color} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <path d={areaPath} fill={`url(#spark-fill-${color.replace('#', '')})`} />
+      <polyline
+        fill="none"
+        stroke={color}
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        points={coords}
+      />
+    </svg>
+  );
+}
+
+// ─── KPI Card ─────────────────────────────────────────────────────────────────
+function KpiCard({ kpi, accentColor }) {
+  const formattedVal = kpi.currentValue !== null && kpi.currentValue !== undefined
+    ? kpi.currentValue.toFixed(kpi.decimalPlaces)
+    : '—';
+
+  // Status mapping
+  let statusBg = 'rgba(59, 130, 246, 0.1)';
+  let statusColorText = 'var(--secondary)';
+  let statusBorder = '1px solid rgba(59, 130, 246, 0.25)';
+  let statusLabelText = 'Uncertain';
+
+  if (kpi.currentValue === null) {
+    statusBg = 'rgba(245, 158, 11, 0.1)';
+    statusColorText = 'var(--warning)';
+    statusBorder = '1px solid rgba(245, 158, 11, 0.25)';
+    statusLabelText = 'No Data';
+  } else if (kpi.status === 0) {
+    statusBg = 'rgba(239, 68, 68, 0.1)';
+    statusColorText = 'var(--error)';
+    statusBorder = '1px solid rgba(239, 68, 68, 0.25)';
+    statusLabelText = 'Bad';
+  } else if (kpi.status === 1) {
+    statusBg = 'rgba(16, 185, 129, 0.1)';
+    statusColorText = 'var(--success)';
+    statusBorder = '1px solid rgba(16, 185, 129, 0.25)';
+    statusLabelText = 'Good';
+  }
+
+  return (
+    <div
+      className="card"
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '14px',
+        padding: '18px 20px',
+        borderLeft: `4px solid ${kpi.currentValue !== null ? (kpi.status === 1 ? 'var(--success)' : 'var(--error)') : 'var(--warning)'}`,
+        position: 'relative'
+      }}
+    >
+      {/* Glow effect */}
+      <div style={{
+        position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+        background: `radial-gradient(ellipse at 0% 0%, ${accentColor}08 0%, transparent 60%)`,
+        pointerEvents: 'none'
+      }} />
+
+      {/* Header Row: Name + Index badge + Status */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            Tag #{kpi.tagIndex}
+          </span>
+          <strong
+            title={kpi.tagName}
+            style={{ fontSize: '0.92rem', color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '180px', marginTop: '2px' }}
+          >
+            {kpi.tagName}
+          </strong>
+        </div>
+
+        <span style={{
+          padding: '2px 8px',
+          borderRadius: '10px',
+          fontSize: '0.68rem',
+          fontWeight: 600,
+          background: statusBg,
+          color: statusColorText,
+          border: statusBorder,
+          textTransform: 'uppercase',
+          letterSpacing: '0.03em'
+        }}>
+          {statusLabelText}
+        </span>
+      </div>
+
+      {/* Middle row: Current Value + Unit + Trend Arrow */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px' }}>
+          <span className="font-mono" style={{ fontSize: '2.2rem', fontWeight: 800, color: 'var(--text)' }}>
+            {formattedVal}
+          </span>
+          {kpi.unit && (
+            <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontFamily: 'var(--mono)' }}>
+              {kpi.unit}
+            </span>
+          )}
+        </div>
+
+        {/* Trend Indicator */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          {kpi.trend === 'up' && (
+            <span style={{ color: 'var(--success)', fontSize: '1.5rem', fontWeight: 'bold' }} title="Trending Up">↑</span>
+          )}
+          {kpi.trend === 'down' && (
+            <span style={{ color: 'var(--error)', fontSize: '1.5rem', fontWeight: 'bold' }} title="Trending Down">↓</span>
+          )}
+          {kpi.trend === 'stable' && (
+            <span style={{ color: 'var(--text-dim)', fontSize: '1.5rem', fontWeight: 'bold' }} title="Stable">→</span>
+          )}
+        </div>
+      </div>
+
+      {/* Sparkline visualization */}
+      {kpi.sparkPoints && kpi.sparkPoints.length >= 2 && (
+        <div style={{ margin: '4px 0 2px' }}>
+          <Sparkline points={kpi.sparkPoints} color={accentColor} />
+        </div>
+      )}
+
+      {/* Statistics Grid (Min, Max, Avg, Records) */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(4, 1fr)',
+        gap: '8px',
+        padding: '10px',
+        background: 'var(--surface-raised)',
+        borderRadius: 'var(--radius-sm)',
+        border: '1px solid var(--border-subtle)',
+        textAlign: 'center'
+      }}>
+        <div style={{ borderRight: '1px solid var(--border-subtle)' }}>
+          <div style={{ fontSize: '0.62rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.03em' }}>Min</div>
+          <div className="font-mono" style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)', marginTop: '2px' }}>
+            {kpi.minVal !== null ? kpi.minVal.toFixed(kpi.decimalPlaces) : '—'}
+          </div>
+        </div>
+        <div style={{ borderRight: '1px solid var(--border-subtle)' }}>
+          <div style={{ fontSize: '0.62rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.03em' }}>Max</div>
+          <div className="font-mono" style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)', marginTop: '2px' }}>
+            {kpi.maxVal !== null ? kpi.maxVal.toFixed(kpi.decimalPlaces) : '—'}
+          </div>
+        </div>
+        <div style={{ borderRight: '1px solid var(--border-subtle)' }}>
+          <div style={{ fontSize: '0.62rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.03em' }}>Average</div>
+          <div className="font-mono" style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)', marginTop: '2px' }}>
+            {kpi.avgVal !== null ? kpi.avgVal.toFixed(kpi.decimalPlaces) : '—'}
+          </div>
+        </div>
+        <div>
+          <div style={{ fontSize: '0.62rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.03em' }}>Records</div>
+          <div className="font-mono" style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)', marginTop: '2px' }}>
+            {kpi.recordCount !== undefined ? kpi.recordCount : 0}
+          </div>
+        </div>
+      </div>
+
+      {/* Footer: Last Update time */}
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        fontSize: '0.72rem',
+        color: 'var(--text-dim)',
+        marginTop: 'auto',
+        paddingTop: '6px',
+        borderTop: '1px dashed var(--border-subtle)'
+      }}>
+        <span>Last Ingested:</span>
+        <span className="font-mono" style={{ fontWeight: 500 }}>
+          {kpi.lastTimestamp ? new Date(kpi.lastTimestamp).toLocaleString() : 'Never'}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Empty State ──────────────────────────────────────────────────────────────
+function EmptyState({ onNavigate }) {
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+      padding: '80px 24px', textAlign: 'center', gap: '16px',
+      background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 'var(--radius)'
+    }}>
+      <svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect width="64" height="64" rx="16" fill="rgba(0,240,255,0.06)" />
+        <rect x="10" y="42" width="8" height="12" rx="2" fill="rgba(0,240,255,0.25)" />
+        <rect x="22" y="30" width="8" height="24" rx="2" fill="rgba(0,240,255,0.4)" />
+        <rect x="34" y="20" width="8" height="34" rx="2" fill="rgba(0,240,255,0.6)" />
+        <rect x="46" y="10" width="8" height="44" rx="2" fill="rgba(0,240,255,0.85)" />
+        <polyline
+          points="14,38 26,24 38,16 50,8"
+          fill="none"
+          stroke="#00F0FF"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeDasharray="4 2"
+        />
+      </svg>
+      <div>
+        <h2 style={{ margin: '0 0 8px', fontSize: '1.3rem', fontWeight: 700, color: 'var(--text)' }}>
+          No Dashboard Tags Configured
+        </h2>
+        <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.88rem', maxWidth: '380px' }}>
+          Select tags to monitor in Tag Configuration and enable Dashboard visibility on them.
+        </p>
+      </div>
+      <button
+        onClick={() => onNavigate && onNavigate('tagConfig')}
+        className="btn btn-primary"
+      >
+        Configure Tags
+      </button>
+    </div>
+  );
+}
+
+// ─── SavingSpinner ────────────────────────────────────────────────────────────
+const SavingSpinner = () => (
+  <svg className="animate-spin" style={{ width: '12px', height: '12px', color: 'currentColor', display: 'inline-block' }} viewBox="0 0 24 24" fill="none">
+    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" style={{ opacity: 0.25 }} />
+    <path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+  </svg>
+);
+
+const getNowTime = () => Date.now();
+
+// ─── Main Dashboard Component ─────────────────────────────────────────────────
+export default function Dashboard({ onNavigate }) {
+  const { syncTrigger, dbConnectionStatus } = useSimulator();
+
+  // ── State ────────────────────────────────────────────────────────────────
+  const [tagConfigs, setTagConfigs]         = useState([]);
+  const [historianRecords, setHistorianRecords] = useState([]);
+  const [loading, setLoading]               = useState(true);
+  const [settings, setSettings]             = useState({});
+  const [totalRecordsCount, setTotalRecordsCount] = useState(0);
+  const [latestIngestionTime, setLatestIngestionTime] = useState(null);
+
+  // ── Fetch data ───────────────────────────────────────────────────────────
+  const loadDashboardData = useCallback(async () => {
+    setLoading(true);
+    try {
+      // 1. Load configs
       const configs = await getTagConfigs();
       setTagConfigs(configs);
 
-      // Filter settings dashboardTags to only include those with DashboardVisible = Yes
-      let activeKpiIds = settings.dashboardTags || [];
-      activeKpiIds = activeKpiIds.filter(id => {
-        const conf = configs.find(c => c.TagIndex === id);
-        return conf ? conf.DashboardVisible : false;
-      });
+      const dashboardTagIndexes = configs.filter(c => c.DashboardVisible).map(c => c.TagIndex);
 
-      setDashboardTags(activeKpiIds.slice(0, 5));
-      setDbTable(settings.selectedTable || 'Database');
-    };
-    loadConfigs();
-  }, [syncTrigger]);
+      // 2. Fetch all historian data
+      const allData = await getHistorianData();
+      setTotalRecordsCount(allData.length);
 
-  // Fetch telemetry data and logs on simulator ticks
+      if (allData.length > 0) {
+        setLatestIngestionTime(allData[0].DateAndTime);
+      } else {
+        setLatestIngestionTime(null);
+      }
+
+      // Filter historian records to only include dashboard tags
+      const filteredRecords = allData.filter(r => dashboardTagIndexes.includes(r.TagIndex));
+      setHistorianRecords(filteredRecords);
+
+      // 3. Fetch settings
+      const sysSettings = await getSettings();
+      setSettings(sysSettings);
+    } catch (err) {
+      console.error('Failed to load dashboard data:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    const fetchTelemetry = async () => {
-      if (dashboardTags.length === 0) {
-        setHistorianRecords([]);
-        setLoading(false);
-        return;
-      }
-      
-      setLoading(true);
-      try {
-        const result = await getHistorianData({
-          tagIndexes: dashboardTags,
-          limit: 300
-        });
-        setHistorianRecords(result);
+    const timer = setTimeout(() => {
+      loadDashboardData();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [loadDashboardData, syncTrigger]);
 
-        const logs = await getSyncLogs();
-        setRecentLogs(logs.slice(0, 5));
-      } catch (err) {
-        console.error("Failed to fetch dashboard data:", err);
-      } finally {
-        setLoading(false);
+  // ── Active Tags Count ─────────────────────────────────────────────────────
+  const activeTagsCount = useMemo(() => {
+    const now = getNowTime();
+    const activeIndexes = new Set();
+    historianRecords.forEach(r => {
+      const recTime = new Date(r.DateAndTime).getTime();
+      if ((now - recTime) / 1000 <= 60) {
+        activeIndexes.add(r.TagIndex);
       }
-    };
-    fetchTelemetry();
-  }, [dashboardTags, syncTrigger]);
+    });
+    return activeIndexes.size;
+  }, [historianRecords]);
 
-  // Tag configuration map helper
+  // ── Tag Map ───────────────────────────────────────────────────────────────
   const tagMap = useMemo(() => {
     const map = {};
-    tagConfigs.forEach(c => {
-      map[c.TagIndex] = c;
-    });
+    tagConfigs.forEach(c => { map[c.TagIndex] = c; });
     return map;
   }, [tagConfigs]);
 
-  // Process data for the KPI Cards
+  // ── dashboardTags (visible tag indexes) ───────────────────────────────────
+  const dashboardTagIndexes = useMemo(() => {
+    return tagConfigs.filter(c => c.DashboardVisible).map(c => c.TagIndex);
+  }, [tagConfigs]);
+
+  // ── KPI Data ──────────────────────────────────────────────────────────────
   const kpiData = useMemo(() => {
-    return dashboardTags.map(tagIndex => {
-      const config = tagMap[tagIndex] || {
-        TagName: `Tag Index ${tagIndex}`,
-        Unit: '',
-        DecimalPlaces: 2
-      };
-
-      // Filter records belonging to this specific tag
-      const tagRecords = historianRecords
+    return tagConfigs.filter(c => c.DashboardVisible).map(tag => {
+      const tagIndex = tag.TagIndex;
+      const tagRecs = historianRecords
         .filter(r => r.TagIndex === tagIndex)
-        .sort((a, b) => new Date(b.DateAndTime) - new Date(a.DateAndTime)); // desc order
+        .sort((a, b) => new Date(b.DateAndTime) - new Date(a.DateAndTime)); // desc
 
-      const latest = tagRecords[0];
-      const previous = tagRecords[1];
+      const latest = tagRecs[0];
+      const previous = tagRecs[1];
 
       let currentValue = null;
-      let lastUpdated = 'N/A';
-      let trend = 'stable'; // up, down, stable
-      let status = 0; // default Bad if no record
-      let marker = '';
-      
-      if (latest) {
+      let lastTimestamp = null;
+      let status = null;
+      let minVal = null;
+      let maxVal = null;
+      let avgVal = null;
+      let trend = 'stable';
+
+      if (tagRecs.length > 0) {
         currentValue = latest.Val;
+        lastTimestamp = latest.DateAndTime;
         status = latest.Status;
-        marker = latest.Marker;
-        
-        const dateObj = new Date(latest.DateAndTime);
-        lastUpdated = isNaN(dateObj.getTime()) 
-          ? latest.DateAndTime.split('T')[1]?.substring(0, 8) || latest.DateAndTime 
-          : dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+        const values = tagRecs.map(r => r.Val);
+        minVal = Math.min(...values);
+        maxVal = Math.max(...values);
+        avgVal = values.reduce((sum, v) => sum + v, 0) / values.length;
 
         if (previous) {
           if (latest.Val > previous.Val) trend = 'up';
@@ -112,420 +387,140 @@ export default function Dashboard({ user }) {
         }
       }
 
-      // Extract last 10 points for sparkline
-      const sparkPoints = tagRecords
-        .slice(0, 12)
-        .map(r => r.Val)
-        .reverse();
+      const sparkPoints = tagRecs.slice(0, 12).map(r => r.Val).reverse();
 
       return {
         tagIndex,
-        tagName: config.TagName,
-        unit: config.Unit,
-        decimalPlaces: config.DecimalPlaces,
+        tagName: tag.TagName,
+        unit: tag.Unit || '',
+        decimalPlaces: tag.DecimalPlaces ?? 2,
         currentValue,
-        lastUpdated,
-        trend,
+        lastTimestamp,
         status,
-        marker,
-        sparkPoints
+        minVal,
+        maxVal,
+        avgVal,
+        trend,
+        sparkPoints,
+        recordCount: tagRecs.length
       };
     });
-  }, [dashboardTags, historianRecords, tagMap]);
-
-  // Generate micro SVG Sparkline for KPI Card
-  const renderMicroSparkline = (points, trend) => {
-    if (!points || points.length < 2) return null;
-    const min = Math.min(...points);
-    const max = Math.max(...points);
-    const range = max - min || 1;
-    const width = 100;
-    const height = 30;
-
-    const coords = points.map((val, idx) => {
-      const x = (idx / (points.length - 1)) * width;
-      const y = height - 2 - ((val - min) / range) * (height - 4);
-      return `${x},${y}`;
-    }).join(' ');
-
-    const strokeColor = trend === 'up' ? 'var(--success)' : trend === 'down' ? 'var(--error)' : 'var(--secondary)';
-
-    return (
-      <svg width={width} height={height} style={{ overflow: 'visible' }}>
-        <polyline
-          fill="none"
-          stroke={strokeColor}
-          strokeWidth="1.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          points={coords}
-        />
-      </svg>
-    );
-  };
-
-  // Prepare chart data for main trends visualizer
-  const mainChartData = useMemo(() => {
-    const timestampsSet = new Set();
-    historianRecords.forEach(r => {
-      if (r.DateAndTime) timestampsSet.add(r.DateAndTime);
-    });
-    
-    const sortedTimestamps = Array.from(timestampsSet)
-      .sort((a, b) => new Date(a) - new Date(b)) // asc
-      .slice(-15); // get last 15 points
-
-    const datasets = dashboardTags.map(tagIndex => {
-      const config = tagMap[tagIndex] || { TagName: `Tag ${tagIndex}` };
-      const tagRecs = historianRecords.filter(r => r.TagIndex === tagIndex);
-      
-      const values = sortedTimestamps.map(ts => {
-        const match = tagRecs.find(r => r.DateAndTime === ts);
-        return match ? match.Val : null;
-      });
-
-      return {
-        tagIndex,
-        displayName: config.TagName,
-        unit: config.Unit,
-        values
-      };
-    });
-
-    const labels = sortedTimestamps.map(ts => {
-      const dateObj = new Date(ts);
-      return isNaN(dateObj.getTime()) 
-        ? ts.split('T')[1]?.substring(0, 5) || ts 
-        : dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    });
-
-    return { labels, datasets };
-  }, [dashboardTags, historianRecords, tagMap]);
+  }, [tagConfigs, historianRecords]);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-      
-      {/* 1. Page Header & Info Banner */}
-      <div className="card" style={{
-        padding: '18px 24px',
-        background: 'linear-gradient(135deg, var(--surface) 0%, #111A30 100%)',
-        border: '1px solid var(--border)'
-      }}>
-        <div className="flex justify-between items-center" style={{ flexWrap: 'wrap', gap: '16px' }}>
-          <div>
-            <span style={{ fontSize: '0.68rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--secondary)', fontWeight: 700 }}>
-              SCADA Process Value Annunciator
-            </span>
-            <h1 style={{ color: 'white', margin: '2px 0 0', fontSize: '1.4rem', fontWeight: 800 }}>
-              Smart Historian Dashboard
-            </h1>
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', margin: 0 }}>
-              Direct live connection table: <code style={{ color: 'white', fontFamily: 'var(--mono)' }}>{dbTable}</code> | Dynamic polling active.
-            </p>
-          </div>
-          <div style={{ display: 'flex', gap: '12px' }}>
-            <div style={{ backgroundColor: 'rgba(255,255,255,0.02)', padding: '6px 12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)' }}>
-              <span style={{ display: 'block', fontSize: '0.6rem', color: 'var(--text-muted)', fontWeight: 600 }}>GATEWAY LINK</span>
-              <span style={{ fontSize: '0.9rem', fontWeight: 700, color: isNetworkOnline ? 'var(--success)' : 'var(--error)' }}>
-                {isNetworkOnline ? 'CONNECTED' : 'DISCONNECTED'}
-              </span>
-            </div>
-            <div style={{ backgroundColor: 'rgba(255,255,255,0.02)', padding: '6px 12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)' }}>
-              <span style={{ display: 'block', fontSize: '0.6rem', color: 'var(--text-muted)', fontWeight: 600 }}>SQL Spooler Queue</span>
-              <span style={{ fontSize: '0.9rem', fontWeight: 700, color: localBuffer.length > 0 ? 'var(--warning)' : 'var(--text-muted)' }} className="font-mono">
-                +{localBuffer.length} rows
-              </span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* 2. Exactly 5 KPI Cards Section */}
-      {dashboardTags.length === 0 ? (
-        <div className="card" style={{ padding: '40px', textAlign: 'center' }}>
-          <span style={{ fontSize: '2.5rem', display: 'block', marginBottom: '12px' }}>📊</span>
-          <h3 style={{ margin: '0 0 6px 0', color: 'white' }}>No dashboard tags configured.</h3>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.88rem', margin: 0 }}>
-            Please configure tags and set "Dashboard Visible = Yes" in the Tag Configuration module.
-          </p>
-        </div>
-      ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: `repeat(${dashboardTags.length}, 1fr)`, gap: '14px' }} className="kpi-grid-container">
-          {kpiData.map((kpi, index) => {
-            const formattedVal = kpi.currentValue !== null && kpi.currentValue !== undefined
-              ? kpi.currentValue.toFixed(kpi.decimalPlaces)
-              : '---';
-
-            return (
-              <div 
-                key={index} 
-                className="card" 
-                style={{ 
-                  padding: '16px', 
-                  display: 'flex', 
-                  flexDirection: 'column', 
-                  justifyContent: 'space-between',
-                  minHeight: '138px',
-                  borderLeft: kpi.status === 192 ? '3px solid var(--secondary)' : '3px solid var(--error)',
-                  boxShadow: 'var(--shadow-sm)'
-                }}
-              >
-                {/* Card Title Info */}
-                <div className="flex justify-between items-start" style={{ width: '100%' }}>
-                  <div style={{ overflow: 'hidden' }}>
-                    <span className="font-mono text-xs text-muted" style={{ fontSize: '0.68rem', display: 'block' }}>TAG {kpi.tagIndex}</span>
-                    <strong style={{ color: 'white', fontSize: '0.85rem', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden', display: 'block' }} title={kpi.tagName}>
-                      {kpi.tagName}
-                    </strong>
-                  </div>
-                  {/* Trend arrows */}
-                  <span style={{ 
-                    fontSize: '1rem', 
-                    color: kpi.trend === 'up' ? 'var(--success)' : kpi.trend === 'down' ? 'var(--error)' : 'var(--text-muted)',
-                    fontWeight: 'bold'
-                  }}>
-                    {kpi.trend === 'up' ? '▲' : kpi.trend === 'down' ? '▼' : '➔'}
-                  </span>
-                </div>
-
-                {/* Large Value Display */}
-                <div style={{ margin: '8px 0' }}>
-                  <span 
-                    className="font-mono" 
-                    style={{ 
-                      fontSize: '1.75rem', 
-                      fontWeight: 700, 
-                      color: kpi.status === 192 ? 'var(--secondary)' : 'var(--error)',
-                      textShadow: kpi.status === 192 ? '0 0 10px rgba(0, 240, 255, 0.1)' : '0 0 10px rgba(255, 46, 46, 0.1)'
-                    }}
-                  >
-                    {formattedVal}
-                  </span>
-                  {kpi.unit && <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginLeft: '4px', fontFamily: 'var(--mono)' }}>{kpi.unit}</span>}
-                </div>
-
-                {/* Sparkline & Status */}
-                <div className="flex justify-between items-end" style={{ width: '100%', marginTop: 'auto' }}>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                    <span className={`badge ${kpi.status === 192 ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: '0.58rem', padding: '1px 4px' }}>
-                      {kpi.status === 192 ? 'Good' : 'Bad'}
-                    </span>
-                    <span style={{ fontSize: '0.62rem', color: 'var(--text-muted)' }} className="font-mono">
-                      {kpi.lastUpdated}
-                    </span>
-                  </div>
-                  {/* Micro sparkline */}
-                  {renderMicroSparkline(kpi.sparkPoints, kpi.trend)}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '0' }}>
       <style>{`
-        @media (max-width: 1200px) {
-          .kpi-grid-container {
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)) !important;
-          }
+        @keyframes spin {
+          to { transform: rotate(360deg); }
+        }
+        .animate-spin {
+          animation: spin 1s linear infinite;
         }
       `}</style>
 
-      {/* 3. Main Dashboard Charts & Diagnostics Row */}
-      {dashboardTags.length > 0 && (
-        <div className="grid-3" style={{ gridTemplateColumns: '2fr 1fr' }}>
-          
-          {/* Left Side: Real-time Multi-Tag Overlay trend */}
-          <div className="card" style={{ padding: '20px' }}>
-            <div className="flex justify-between items-center" style={{ marginBottom: '16px' }}>
-              <span className="text-xs text-muted font-semibold" style={{ textTransform: 'uppercase' }}>
-                🎯 Live Telemetry Trend Overlay (KPI Tags)
-              </span>
-              <div style={{ display: 'flex', gap: '10px' }}>
-                {mainChartData.datasets.map((ds, idx) => (
-                  <span key={idx} style={{ fontSize: '0.68rem', display: 'flex', alignItems: 'center', gap: '4px', color: 'white' }}>
-                    <span style={{
-                      width: '8px',
-                      height: '8px',
-                      borderRadius: '50%',
-                      backgroundColor: ['#00F0FF', '#00FF66', '#FFB800', '#FF2E2E', '#A78BFA'][idx]
-                    }} />
-                    {ds.displayName}
-                  </span>
-                ))}
-              </div>
-            </div>
-
-            <div style={{ height: '220px', position: 'relative' }}>
-              {mainChartData.labels.length > 1 ? (
-                <svg viewBox="0 0 500 220" style={{ width: '100%', height: '100%', overflow: 'visible' }}>
-                  {/* Horizontal gridlines */}
-                  {[0, 0.25, 0.5, 0.75, 1].map((r, i) => (
-                    <line
-                      key={i}
-                      x1="0"
-                      y1={220 * r}
-                      x2="500"
-                      y2={220 * r}
-                      stroke="rgba(255,255,255,0.04)"
-                      strokeWidth="1"
-                    />
-                  ))}
-
-                  {/* Plot line for each tag */}
-                  {mainChartData.datasets.map((dataset, dsIdx) => {
-                    const color = ['#00F0FF', '#00FF66', '#FFB800', '#FF2E2E', '#A78BFA'][dsIdx];
-                    const nonNullValues = dataset.values.filter(v => v !== null);
-                    const min = Math.min(...nonNullValues);
-                    const max = Math.max(...nonNullValues);
-                    const range = max - min || 1;
-
-                    const points = dataset.values.map((val, idx) => {
-                      if (val === null) return null;
-                      const x = (idx / (dataset.values.length - 1)) * 500;
-                      const y = 200 - ((val - min) / range) * 170;
-                      return { x, y };
-                    }).filter(p => p !== null);
-
-                    const pathStr = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ');
-
-                    return (
-                      <g key={dsIdx}>
-                        <path
-                          d={pathStr}
-                          fill="none"
-                          stroke={color}
-                          strokeWidth="1.8"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          style={{ opacity: 0.8 }}
-                        />
-                        {points.map((p, idx) => (
-                          <circle
-                            key={idx}
-                            cx={p.x}
-                            cy={p.y}
-                            r="2.5"
-                            fill="var(--background)"
-                            stroke={color}
-                            strokeWidth="1.2"
-                          />
-                        ))}
-                      </g>
-                    );
-                  })}
-
-                  {/* X Axis Timestamps Labels */}
-                  {mainChartData.labels.map((lbl, idx) => {
-                    const x = (idx / (mainChartData.labels.length - 1)) * 500;
-                    if (idx % 3 !== 0 && idx !== mainChartData.labels.length - 1) return null;
-                    return (
-                      <text
-                        key={idx}
-                        x={x}
-                        y="216"
-                        fill="var(--text-muted)"
-                        fontSize="8"
-                        textAnchor="middle"
-                        fontFamily="var(--mono)"
-                      >
-                        {lbl}
-                      </text>
-                    );
-                  })}
-                </svg>
-              ) : (
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)' }}>
-                  Waiting for PLC Simulation ticks...
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Right Side: Database metrics */}
-          <div className="card" style={{ padding: '20px', display: 'flex', flexDirection: 'column' }}>
-            <span className="text-xs text-muted font-semibold" style={{ display: 'block', textTransform: 'uppercase', marginBottom: '14px' }}>
-              ⚙️ DB Connection Diagnostics
-            </span>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', flex: 1, justifyContent: 'center' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.03)', paddingBottom: '6px' }}>
-                <span className="text-xs text-muted">Gateway SSL Status</span>
-                <span className="text-xs font-semibold" style={{ color: 'var(--success)' }}>SECURED (TLS 1.3)</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.03)', paddingBottom: '6px' }}>
-                <span className="text-xs text-muted">SQL Gateway API</span>
-                <span className="text-xs font-semibold font-mono" style={{ color: 'white' }}>PostgREST client</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.03)', paddingBottom: '6px' }}>
-                <span className="text-xs text-muted">Total Synced Records</span>
-                <span className="text-xs font-semibold font-mono" style={{ color: 'var(--secondary)' }}>
-                  {totalSyncedRecords.toLocaleString()} rows
-                </span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.03)', paddingBottom: '6px' }}>
-                <span className="text-xs text-muted">Cloud DB Storage</span>
-                <span className="text-xs font-semibold font-mono" style={{ color: 'white' }}>{cloudStorageUsageKb} KB</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.03)', paddingBottom: '6px' }}>
-                <span className="text-xs text-muted">Driver Health Score</span>
-                <span className="text-xs font-semibold" style={{ color: failedSyncAttempts > 0 ? 'var(--warning)' : 'var(--success)' }}>
-                  {failedSyncAttempts > 0 ? '85% Warning' : '100% Optimal'}
-                </span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', paddingBottom: '2px' }}>
-                <span className="text-xs text-muted">Avg Database Latency</span>
-                <span className="text-xs font-semibold font-mono" style={{ color: 'white' }}>45 ms</span>
-              </div>
-            </div>
-          </div>
-
+      {/* ── Page Header ────────────────────────────────────────────────────── */}
+      <div className="page-header" style={{ marginBottom: '24px' }}>
+        <div className="page-header-title">
+          <span className="section-label">Historian</span>
+          <h2>Historian Summary Dashboard</h2>
+          <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
+            Analytical view of historical process values and telemetry statistics.
+          </p>
         </div>
-      )}
-
-      {/* 4. Bottom System Messages Gateway Logs */}
-      <div className="card" style={{ padding: '20px' }}>
-        <div className="flex justify-between items-center" style={{ borderBottom: '1px solid var(--border)', paddingBottom: '8px', marginBottom: '12px' }}>
-          <h3 style={{ fontSize: '0.9rem', margin: 0, color: 'white' }}>📡 SCADA Historian Sync Gateway Monitor Logs</h3>
-          <span className="badge badge-secondary font-mono" style={{ fontSize: '0.62rem' }}>
-            AUTO REFRESH: ON
-          </span>
-        </div>
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '150px', overflowY: 'auto' }}>
-          {recentLogs.length === 0 ? (
-            <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', textAlign: 'center', padding: '16px 0' }}>
-              No messages logged from the sync daemon yet.
-            </span>
-          ) : (
-            recentLogs.map((log, idx) => {
-              const dateObj = new Date(log.timestamp);
-              const logTime = isNaN(dateObj.getTime())
-                ? log.timestamp
-                : dateObj.toLocaleDateString() + ' ' + dateObj.toLocaleTimeString();
-
-              return (
-                <div 
-                  key={idx} 
-                  className="font-mono"
-                  style={{ 
-                    display: 'flex', 
-                    fontSize: '0.72rem', 
-                    padding: '5px 8px', 
-                    backgroundColor: 'rgba(0,0,0,0.2)', 
-                    borderRadius: 'var(--radius-sm)',
-                    borderLeft: `2.5px solid ${log.type === 'SYNC' ? 'var(--secondary)' : log.type === 'ERROR' ? 'var(--error)' : 'var(--success)'}`
-                  }}
-                >
-                  <span style={{ color: 'var(--text-muted)', marginRight: '10px', whiteSpace: 'nowrap' }}>[{logTime}]</span>
-                  <span style={{ color: 'var(--text-muted)', marginRight: '8px', fontWeight: 600 }}>[{log.type}]</span>
-                  <span style={{ color: 'white', flex: 1, whiteSpace: 'normal', wordBreak: 'break-all' }}>{log.message}</span>
-                </div>
-              );
-            })
-          )}
+        <div className="page-header-actions">
+          <button
+            onClick={loadDashboardData}
+            disabled={loading}
+            className="btn btn-secondary btn-sm"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+          >
+            {loading ? <SavingSpinner /> : (
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M1 4c1-2.5 4-4 7-3.5A7 7 0 0115 8" />
+                <path d="M15 12c-1 2.5-4 4-7 3.5A7 7 0 011 8" />
+                <polyline points="1,1 1,4 4,4" />
+                <polyline points="15,15 15,12 12,12" />
+              </svg>
+            )}
+            Refresh Historian
+          </button>
         </div>
       </div>
 
+      {/* ── Historian Summary Cards ────────────────────────────────────── */}
+      <div className="grid-5" style={{ marginBottom: '24px' }}>
+        {/* Card 1: Total Configured Tags */}
+        <div className="stat-card">
+          <div className="stat-card-label">Configured Tags</div>
+          <div className="stat-card-value">
+            {tagConfigs.length}
+            <span className="stat-card-unit">Tags</span>
+          </div>
+          <div className="stat-card-meta">All configured SCADA points</div>
+        </div>
+
+        {/* Card 2: Active Tags */}
+        <div className="stat-card">
+          <div className="stat-card-label">Active Tags</div>
+          <div className="stat-card-value" style={{ color: 'var(--success)' }}>
+            {activeTagsCount}
+            <span className="stat-card-unit" style={{ color: 'var(--success)' }}>Active</span>
+          </div>
+          <div className="stat-card-meta">Telemetry received in last 60s</div>
+        </div>
+
+        {/* Card 3: Total Historian Records */}
+        <div className="stat-card">
+          <div className="stat-card-label">Total Records</div>
+          <div className="stat-card-value" style={{ color: 'var(--secondary)' }}>
+            {totalRecordsCount}
+            <span className="stat-card-unit" style={{ color: 'var(--secondary)' }}>Rows</span>
+          </div>
+          <div className="stat-card-meta">Total database row count</div>
+        </div>
+
+        {/* Card 4: Latest Ingestion Time */}
+        <div className="stat-card">
+          <div className="stat-card-label">Latest Timestamp</div>
+          <div className="stat-card-value" style={{ fontSize: '1.25rem', padding: '6px 0', color: 'var(--accent)' }}>
+            {latestIngestionTime ? new Date(latestIngestionTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Never'}
+          </div>
+          <div className="stat-card-meta">{latestIngestionTime ? new Date(latestIngestionTime).toLocaleDateString() : 'No historian logs'}</div>
+        </div>
+
+        {/* Card 5: Database Connection Status */}
+        <div className="stat-card">
+          <div className="stat-card-label">DB Link Status</div>
+          <div className="stat-card-value" style={{
+            color: dbConnectionStatus === 'Connected' ? 'var(--success)' : dbConnectionStatus === 'Syncing' ? 'var(--warning)' : 'var(--error)',
+            fontSize: '1.38rem'
+          }}>
+            {dbConnectionStatus}
+          </div>
+          <div className="stat-card-meta">Database Link Status</div>
+        </div>
+      </div>
+
+      {/* ── KPI Cards ──────────────────────────────────────────────────────── */}
+      {dashboardTagIndexes.length === 0 ? (
+        <EmptyState onNavigate={onNavigate} />
+      ) : (
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+          gap: '20px',
+          marginBottom: '24px'
+        }}>
+          {kpiData.map((kpi, idx) => (
+            <KpiCard
+              key={kpi.tagIndex}
+              kpi={kpi}
+              accentColor={ACCENT_COLORS[idx % ACCENT_COLORS.length]}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
+
