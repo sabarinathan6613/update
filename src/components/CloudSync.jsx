@@ -18,7 +18,7 @@ export default function CloudSync() {
   const { 
     localBuffer, 
     syncLogs, 
-    syncTrigger, 
+    refreshTrigger, 
     forceSync,
     isNetworkOnline,
     cloudStorageUsageKb
@@ -327,7 +327,7 @@ export default function CloudSync() {
     };
 
     fetchPreviewData();
-  }, [selectedTable, syncTrigger, supabaseUrl, supabaseAnonKey]);
+  }, [selectedTable, refreshTrigger, supabaseUrl, supabaseAnonKey]);
 
   // Load existing configuration settings
   useEffect(() => {

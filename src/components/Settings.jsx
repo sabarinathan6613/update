@@ -3,7 +3,9 @@ import { useState, useEffect, useCallback } from 'react';
 import { 
   getSettings, saveSettings, 
   getSchedules, saveSchedule, deleteSchedule, 
-  getPlants, getEmailLogs, addEmailLog 
+  getPlants, getEmailLogs, addEmailLog,
+  getTagConfigs, compileReportData,
+  getRecipients, saveRecipient, deleteRecipient, bulkUpdateRecipientsStatus
 } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
@@ -73,7 +75,7 @@ function ToggleSwitch({ checked, onChange, id }) {
    Main Component
 ───────────────────────────────────────────── */
 export default function Settings({ user }) {
-  const { currentPlantId, syncTrigger } = useSimulator();
+  const { currentPlantId } = useSimulator();
 
   const isSuperAdmin = user.role === 'Super Admin';
   const targetPlantId = isSuperAdmin ? currentPlantId : user.plantId;
@@ -114,10 +116,36 @@ export default function Settings({ user }) {
   // ── Report Templates
   const [logoText, setLogoText]           = useState('');
   const [headerColor, setHeaderColor]     = useState('#1e293b');
-  const [footerColor, setFooterColor]     = useState('#0f172a');
+  const [footerText, setFooterText]       = useState('');
 
   // ── Retry queue (hidden when empty)
   const [retryQueue, setRetryQueue] = useState([]);
+
+  // ── Recipients State
+  const [recipientsList, setRecipientsList] = useState([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [selectedRecipientIds, setSelectedRecipientIds] = useState([]);
+  const [showRecipientModal, setShowRecipientModal] = useState(false);
+  const [isSavingRecipient, setIsSavingRecipient] = useState(false);
+  const [isTestingDistribution, setIsTestingDistribution] = useState(false);
+  const [editRecipientObj, setEditRecipientObj] = useState({
+    id: '', email: '', name: '', role: 'Operator', active: true,
+    groups: '', report_types: ''
+  });
+
+  const [smtpStatus, setSmtpStatus] = useState(null); // { type: 'success' | 'error', text: string }
+  const [templateStatus, setTemplateStatus] = useState(null); // { type: 'success' | 'error', text: string }
+
+  const showSmtpStatus = (type, text) => {
+    setSmtpStatus({ type, text });
+    setTimeout(() => setSmtpStatus(null), 6000);
+  };
+
+  const showTemplateStatus = (type, text) => {
+    setTemplateStatus({ type, text });
+    setTimeout(() => setTemplateStatus(null), 6000);
+  };
 
   /* ── Load data ────────────────────────── */
   const loadData = useCallback(async () => {
@@ -132,13 +160,16 @@ export default function Settings({ user }) {
     setSmtpSecure(sets.smtpSecure !== undefined ? sets.smtpSecure : true);
     setLogoText(sets.logoText   || '');
     setHeaderColor(sets.headerColor || '#1e293b');
-    setFooterColor(sets.footerColor || '#0f172a');
+    setFooterText(sets.templateFooterText || sets.footerColor || '');
 
     const allSchedules = await getSchedules();
     setSchedulesList(allSchedules.filter(s => s.plantId === targetPlantId));
 
     const allEmailLogs = await getEmailLogs();
     setEmailLogsList(allEmailLogs);
+
+    const recs = await getRecipients();
+    setRecipientsList(recs);
   }, [targetPlantId]);
 
   useEffect(() => {
@@ -146,40 +177,239 @@ export default function Settings({ user }) {
       loadData();
     }, 0);
     return () => clearTimeout(timer);
-  }, [loadData, currentPlantId, syncTrigger]);
+  }, [loadData]);
 
   /* ── SMTP Handlers ────────────────────── */
   const handleSaveSystemConfigs = async (e) => {
     e.preventDefault();
     const existing = await getSettings();
     await saveSettings({ ...existing, smtpHost, smtpPort, smtpUser, smtpPass, smtpSecure });
-    alert('SMTP connection settings updated successfully.');
+    showSmtpStatus('success', 'SMTP connection settings updated successfully.');
   };
 
-  const handleTestSmtpConnection = () => {
-    if (!smtpHost) { alert('Please configure an SMTP host before testing.'); return; }
+  const handleTestSmtpConnection = async () => {
+    if (!smtpHost) { showSmtpStatus('error', 'Please configure an SMTP host before testing.'); return; }
     setIsTestingSmtp(true);
-    setTimeout(() => {
+    try {
+      const response = await fetch('/api/send-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          smtpConfig: {
+            host: smtpHost,
+            port: smtpPort,
+            username: smtpUser,
+            password: smtpPass,
+            secure: smtpSecure,
+            logoText: logoText,
+            headerColor: headerColor,
+            footerText: footerText
+          },
+          recipient: smtpUser,
+          subject: `SMTP Gateway Diagnostic Check - Skadomation`,
+          message: `Connection handshake verification. Test OK.`
+        })
+      });
+
+      const result = await response.json();
+      if (!response.ok || result.error) {
+        throw new Error(result.error || 'Failed to verify SMTP credentials.');
+      }
+
+      showSmtpStatus('success', `SMTP handshake verified successfully! Connection established with ${smtpHost}:${smtpPort}.`);
+    } catch (err) {
+      console.error("SMTP Test Connection failed:", err);
+      showSmtpStatus('error', `SMTP Connection Failure: ${err.message}`);
+    } finally {
       setIsTestingSmtp(false);
-      alert(`SMTP test dispatched to ${smtpHost}:${smtpPort}. Check your email server logs to confirm delivery.`);
-    }, 1200);
+    }
   };
 
-  const handleSendTestEmail = (e) => {
+  const handleSendTestEmail = async (e) => {
     e.preventDefault();
     setIsSendingTestEmail(true);
-    setTimeout(async () => {
-      setIsSendingTestEmail(false);
-      setShowTestEmailModal(false);
+    try {
+      const response = await fetch('/api/send-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          smtpConfig: {
+            host: smtpHost,
+            port: smtpPort,
+            username: smtpUser,
+            password: smtpPass,
+            secure: smtpSecure,
+            logoText: logoText,
+            headerColor: headerColor,
+            footerText: footerText
+          },
+          recipient: testEmailRecipient,
+          subject: `SMTP Diagnostic Test Email - Skadomation Gateway`,
+          message: `This is a diagnostic test email dispatched from Skadomation's central historian gateway.\n\nConnection Handshake: Successful\nSMTP Host: ${smtpHost}:${smtpPort}\nEncryption: ${smtpSecure ? 'SSL/TLS' : 'STARTTLS'}\nTimestamp: ${new Date().toLocaleString()}`
+        })
+      });
+
+      const result = await response.json();
+      if (!response.ok || result.error) {
+        throw new Error(result.error || 'Failed to dispatch test email.');
+      }
+
       await addEmailLog({
         recipient: testEmailRecipient,
         subject: `SMTP Diagnostic Test Email - Skadomation Gateway`,
         status: 'SENT',
         message: 'SMTP handshake verification message. Test connection OK.',
       });
-      alert(`Test email successfully dispatched to ${testEmailRecipient}. Verify SMTP log feed.`);
+
+      showSmtpStatus('success', `Test email successfully dispatched to ${testEmailRecipient}. Verify SMTP log feed.`);
+      setShowTestEmailModal(false);
       loadData();
-    }, 1500);
+    } catch (err) {
+      console.error("Test email failed:", err);
+      showSmtpStatus('error', `SMTP Dispatch Failure: ${err.message}`);
+    } finally {
+      setIsSendingTestEmail(false);
+    }
+  };
+
+  /* ── Recipient Handlers ────────────────── */
+  const validateEmail = (email) => {
+    return String(email)
+      .toLowerCase()
+      .match(
+        /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|.(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/
+      );
+  };
+
+  const handleOpenRecipientEdit = (rec = null) => {
+    if (rec) {
+      setEditRecipientObj({
+        id: rec.id,
+        email: rec.email,
+        name: rec.name,
+        role: rec.role || 'Operator',
+        active: rec.active !== false,
+        groups: rec.groups || '',
+        report_types: rec.report_types || ''
+      });
+    } else {
+      setEditRecipientObj({
+        id: '',
+        email: '',
+        name: '',
+        role: 'Operator',
+        active: true,
+        groups: 'Management',
+        report_types: 'Daily Reports'
+      });
+    }
+    setShowRecipientModal(true);
+  };
+
+  const handleSaveRecipient = async (e) => {
+    e.preventDefault();
+    if (!editRecipientObj.name.trim()) {
+      alert('Name is required.');
+      return;
+    }
+    if (!validateEmail(editRecipientObj.email.trim())) {
+      alert('Please enter a valid email address.');
+      return;
+    }
+    setIsSavingRecipient(true);
+    try {
+      await saveRecipient(editRecipientObj);
+      setShowRecipientModal(false);
+      await loadData();
+    } catch (err) {
+      console.error('Failed to save recipient:', err);
+      alert(`Error saving recipient: ${err.message}`);
+    } finally {
+      setIsSavingRecipient(false);
+    }
+  };
+
+  const handleDeleteRecipient = async (id) => {
+    if (window.confirm('Are you sure you want to delete this recipient?')) {
+      try {
+        await deleteRecipient(id);
+        setSelectedRecipientIds(prev => prev.filter(x => x !== id));
+        await loadData();
+      } catch (err) {
+        alert(`Failed to delete: ${err.message}`);
+      }
+    }
+  };
+
+  const handleToggleRecipientActive = async (rec) => {
+    try {
+      await saveRecipient({ ...rec, active: !rec.active });
+      await loadData();
+    } catch (err) {
+      alert(`Failed to update status: ${err.message}`);
+    }
+  };
+
+  const handleBulkRecipientStatus = async (active) => {
+    if (selectedRecipientIds.length === 0) return;
+    try {
+      await bulkUpdateRecipientsStatus(selectedRecipientIds, active);
+      setSelectedRecipientIds([]);
+      await loadData();
+      alert(`Bulk updated selected recipients to ${active ? 'Active' : 'Inactive'}.`);
+    } catch (err) {
+      alert(`Bulk update failed: ${err.message}`);
+    }
+  };
+
+  const handleTestDistribution = async () => {
+    const activeRecs = recipientsList.filter(r => r.active);
+    if (activeRecs.length === 0) {
+      alert('No active recipients configured to test.');
+      return;
+    }
+    
+    setIsTestingDistribution(true);
+    const emailsList = activeRecs.map(r => r.email);
+    
+    try {
+      const sets = await getSettings();
+      if (!sets.smtpHost || !sets.smtpUser || !sets.smtpPass) {
+        throw new Error('SMTP credentials are not configured. Please complete configuration in SMTP Config tab first.');
+      }
+
+      const response = await fetch('/api/send-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          smtpConfig: {
+            host: sets.smtpHost,
+            port: sets.smtpPort,
+            username: sets.smtpUser,
+            password: sets.smtpPass,
+            secure: sets.smtpSecure,
+            logoText: sets.templateLogoText || sets.logoText,
+            headerColor: sets.templateHeaderColor || sets.headerColor,
+            footerText: sets.templateFooterText || sets.footerColor
+          },
+          to: emailsList,
+          subject: `Skadomation SMTP Broadcast Test Distribution`,
+          message: `This is a test broadcast report distribution sent to verify email routing.\n\nRecipients Configured: ${activeRecs.length} Active users\nRecipients List: ${emailsList.join(', ')}\nTimestamp: ${new Date().toLocaleString()}\n\nDelivery verification: SUCCESS.`
+        })
+      });
+
+      const result = await response.json();
+      if (!response.ok || result.error) {
+        throw new Error(result.error || 'Failed to dispatch broadcast email.');
+      }
+
+      alert(`Test distribution broadcast successfully sent to all ${activeRecs.length} active recipients!`);
+    } catch (err) {
+      console.error("Test distribution failed:", err);
+      alert(`SMTP Test Distribution Failure: ${err.message}`);
+    } finally {
+      setIsTestingDistribution(false);
+    }
   };
 
   /* ── Schedule Handlers ────────────────── */
@@ -223,16 +453,109 @@ export default function Settings({ user }) {
     if (sched.formatPdf !== false)   formatsMsg.push('PDF');
     if (sched.formatExcel !== false) formatsMsg.push('Excel');
     const attachmentInfo = formatsMsg.length > 0 ? `[Attachments: ${formatsMsg.join(', ')}]` : '[No Attachments]';
-    await addEmailLog({
-      recipient: sched.emailRecipients,
-      subject,
-      status: 'SENT',
-      message: `Triggered manual test dispatch for: ${sched.reportType}. ${attachmentInfo}`,
-    });
-    const updatedSched = { ...sched, lastRun: new Date().toISOString().replace('T', ' ').substring(0, 19) };
-    await saveSchedule(updatedSched);
-    alert(`Simulated SMTP Success: Email report with attached ${formatsMsg.join(' & ')} files dispatched to [${sched.emailRecipients}]`);
-    await loadData();
+    
+    const getReportCategory = (type) => {
+      const t = (type || '').toLowerCase();
+      if (t.includes('daily')) return 'Daily Reports';
+      if (t.includes('shift')) return 'Shift Reports';
+      if (t.includes('weekly')) return 'Weekly Reports';
+      if (t.includes('monthly')) return 'Monthly Reports';
+      if (t.includes('alarm') || t.includes('incident')) return 'Alarm Reports';
+      if (t.includes('historian') || t.includes('audit') || t.includes('process')) return 'Historian Reports';
+      return 'Historian Reports';
+    };
+
+    try {
+      const sets = await getSettings();
+      if (!sets.smtpHost || !sets.smtpUser || !sets.smtpPass) {
+        throw new Error('SMTP credentials are not configured. Please complete configuration in SMTP Config tab first.');
+      }
+
+      const recs = await getRecipients();
+      const category = getReportCategory(sched.reportType);
+      const activeSubscribers = recs.filter(r => {
+        if (!r.active) return false;
+        const subbedTypes = (r.report_types || '').split(',').map(x => x.trim()).filter(Boolean);
+        return subbedTypes.includes(category);
+      });
+
+      const toList = activeSubscribers.map(r => r.email);
+      const manualRecs = (sched.emailRecipients || '').split(',').map(x => x.trim()).filter(Boolean);
+      manualRecs.forEach(email => {
+        if (!toList.includes(email)) {
+          toList.push(email);
+        }
+      });
+
+      if (toList.length === 0) {
+        throw new Error(`No active recipients are subscribed to ${category}, and no manual recipients are configured on the schedule.`);
+      }
+
+      // Compile actual database telemetry for the simulation report
+      const tagConfigs = await getTagConfigs();
+      const activeTags = tagConfigs.filter(t => t.ReportsVisible !== false).map(t => t.TagIndex);
+      
+      const endDate = new Date().toISOString();
+      const startDate = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const dateInfo = `${startDate.replace('T', ' ').substring(0, 16)} to ${endDate.replace('T', ' ').substring(0, 16)}`;
+
+      const tempReport = {
+        id: 'sched-sim-' + Date.now(),
+        name: `Automated ${sched.reportType} - ${activePlantName}`,
+        type: sched.reportType,
+        dateInfo,
+        startDate,
+        endDate,
+        tags: activeTags.length > 0 ? activeTags : [1],
+        generatedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
+        createdBy: 'System Scheduler'
+      };
+
+      const reportData = await compileReportData(tempReport);
+
+      const response = await fetch('/api/send-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          smtpConfig: {
+            host: sets.smtpHost,
+            port: sets.smtpPort,
+            username: sets.smtpUser,
+            password: sets.smtpPass,
+            secure: sets.smtpSecure,
+            logoText: sets.templateLogoText || sets.logoText,
+            headerColor: sets.templateHeaderColor || sets.headerColor,
+            footerText: sets.templateFooterText || sets.footerColor
+          },
+          to: toList,
+          subject,
+          message: `This is an automated dispatch of your production report.\n\nReport Type: ${sched.reportType}\nPlant Assigned: ${activePlantName}\nTrigger Time: ${sched.time}\nFormat(s): ${formatsMsg.join(', ')}\n\n${attachmentInfo}\n\nReport compilation completed successfully. Telemetry data attached.`,
+          reportData: {
+            meta: tempReport,
+            data: reportData
+          }
+        })
+      });
+
+      const result = await response.json();
+      if (!response.ok || result.error) {
+        throw new Error(result.error || 'Failed to dispatch report email.');
+      }
+
+      await addEmailLog({
+        recipient: toList.join(', '),
+        subject,
+        status: 'SENT',
+        message: `Triggered automated test dispatch for: ${sched.reportType}. ${attachmentInfo}`,
+      });
+      const updatedSched = { ...sched, lastRun: new Date().toISOString().replace('T', ' ').substring(0, 19) };
+      await saveSchedule(updatedSched);
+      alert(`SMTP Success: Email report dispatched to [${toList.join(', ')}]`);
+      await loadData();
+    } catch (err) {
+      console.error("Force dispatch failed:", err);
+      alert(`SMTP Dispatch Failure: ${err.message}`);
+    }
   };
 
   /* ── Retry Queue Handler ──────────────── */
@@ -256,12 +579,16 @@ export default function Settings({ user }) {
     }, 1200);
   };
 
-  /* ── Report Templates Handler ─────────── */
   const handleSaveTemplates = async (e) => {
     e.preventDefault();
     const existing = await getSettings();
-    await saveSettings({ ...existing, logoText, headerColor, footerColor });
-    alert('Report template settings saved successfully.');
+    await saveSettings({
+      ...existing,
+      templateLogoText: logoText,
+      templateHeaderColor: headerColor,
+      templateFooterText: footerText
+    });
+    showTemplateStatus('success', 'Report template settings saved successfully.');
   };
 
   /* ─────────────────────────────────────────────
@@ -272,9 +599,11 @@ export default function Settings({ user }) {
     { key: 'emaillogs', label: 'Email Logs' },
     { key: 'schedules', label: 'Scheduled Reports' },
     { key: 'templates', label: 'Report Templates' },
+    { key: 'recipients', label: 'Recipient Management' },
   ];
   const plantAdminTabs = [
     { key: 'schedules', label: 'Scheduled Reports' },
+    { key: 'recipients', label: 'Recipient Management' },
   ];
   const tabs = isSuperAdmin ? superAdminTabs : plantAdminTabs;
 
@@ -607,6 +936,24 @@ export default function Settings({ user }) {
               Configure outbound mail relay for automated report delivery.
             </p>
 
+            {smtpStatus && (
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                padding: '10px 14px',
+                borderRadius: '6px',
+                fontSize: '0.85rem',
+                fontWeight: 500,
+                backgroundColor: smtpStatus.type === 'success' ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.08)',
+                border: smtpStatus.type === 'success' ? '1px solid rgba(16, 185, 129, 0.25)' : '1px solid rgba(239, 68, 68, 0.25)',
+                color: smtpStatus.type === 'success' ? '#34D399' : '#F87171',
+                marginBottom: '16px'
+              }}>
+                {smtpStatus.type === 'success' ? '✓' : '✗'} {smtpStatus.text}
+              </div>
+            )}
+
             <form onSubmit={handleSaveSystemConfigs} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
               {/* Host */}
               <div style={S.formGroup}>
@@ -632,7 +979,11 @@ export default function Settings({ user }) {
                     className="form-control"
                     placeholder="587"
                     value={smtpPort}
-                    onChange={e => setSmtpPort(parseInt(e.target.value) || 587)}
+                    onChange={e => {
+                      const val = parseInt(e.target.value) || 587;
+                      setSmtpPort(val);
+                      setSmtpSecure(val === 465);
+                    }}
                     required
                   />
                 </div>
@@ -642,10 +993,14 @@ export default function Settings({ user }) {
                     id="smtp-security"
                     className="form-control"
                     value={smtpSecure ? 'SSL' : 'TLS'}
-                    onChange={e => setSmtpSecure(e.target.value === 'SSL')}
+                    onChange={e => {
+                      const isSSL = e.target.value === 'SSL';
+                      setSmtpSecure(isSSL);
+                      setSmtpPort(isSSL ? 465 : 587);
+                    }}
                   >
-                    <option value="SSL">SSL / TLS</option>
-                    <option value="TLS">STARTTLS</option>
+                    <option value="SSL">SSL / TLS (Port 465)</option>
+                    <option value="TLS">STARTTLS (Port 587)</option>
                   </select>
                 </div>
               </div>
@@ -698,8 +1053,32 @@ export default function Settings({ user }) {
                 <ToggleSwitch
                   id="smtp-tls-toggle"
                   checked={smtpSecure}
-                  onChange={() => setSmtpSecure(v => !v)}
+                  onChange={() => {
+                    setSmtpSecure(v => {
+                      const next = !v;
+                      setSmtpPort(next ? 465 : 587);
+                      return next;
+                    });
+                  }}
                 />
+              </div>
+
+              {/* SMTP Configuration Guidance Tip */}
+              <div style={{
+                padding: '16px 20px',
+                background: 'rgba(59, 130, 246, 0.05)',
+                border: '1px solid rgba(59, 130, 246, 0.15)',
+                borderRadius: 'var(--radius-sm)',
+                fontSize: '0.825rem',
+                lineHeight: '1.5',
+                color: 'var(--text-muted)'
+              }}>
+                <strong style={{ color: 'var(--text)', display: 'block', marginBottom: '8px' }}>💡 Quick SMTP Tips:</strong>
+                <ul style={{ paddingLeft: '18px', margin: 0, display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <li><strong>Gmail Users:</strong> You must generate and use a 16-character <strong>App Password</strong> in your Google Account security settings. Your standard Gmail login password will be rejected.</li>
+                  <li><strong>Port & Security Sync:</strong> Port <strong>465</strong> requires <strong>SSL/TLS</strong>. Port <strong>587</strong> requires <strong>STARTTLS</strong>. The system will automatically align these settings.</li>
+                  <li><strong>Self-Signed Industrial Relays:</strong> The backend automatically bypasses SSL handshake checks to accommodate local enterprise SMTP servers.</li>
+                </ul>
               </div>
 
               <div style={S.divider} />
@@ -979,6 +1358,24 @@ export default function Settings({ user }) {
               Customize the visual identity of exported PDF and Excel reports.
             </p>
 
+            {templateStatus && (
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                padding: '10px 14px',
+                borderRadius: '6px',
+                fontSize: '0.85rem',
+                fontWeight: 500,
+                backgroundColor: templateStatus.type === 'success' ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.08)',
+                border: templateStatus.type === 'success' ? '1px solid rgba(16, 185, 129, 0.25)' : '1px solid rgba(239, 68, 68, 0.25)',
+                color: templateStatus.type === 'success' ? '#34D399' : '#F87171',
+                marginBottom: '16px'
+              }}>
+                {templateStatus.type === 'success' ? '✓' : '✗'} {templateStatus.text}
+              </div>
+            )}
+
             <form onSubmit={handleSaveTemplates} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
               {/* Logo / Company name */}
               <div style={S.formGroup}>
@@ -998,48 +1395,41 @@ export default function Settings({ user }) {
 
               <div style={S.divider} />
 
-              {/* Color pickers */}
-              <div style={S.formGrid2}>
-                <div style={S.formGroup}>
-                  <label style={S.label} htmlFor="tmpl-header-color">Header Background Color</label>
-                  <div style={S.colorWrap}>
-                    <input
-                      id="tmpl-header-color"
-                      type="color"
-                      value={headerColor}
-                      onChange={e => setHeaderColor(e.target.value)}
-                      style={S.colorInput}
-                    />
-                    <input
-                      type="text"
-                      className="form-control"
-                      value={headerColor}
-                      onChange={e => setHeaderColor(e.target.value)}
-                      style={{ flex: 1, fontFamily: 'monospace', fontSize: '0.85rem' }}
-                      maxLength={7}
-                    />
-                  </div>
+              {/* Template settings customization fields */}
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="tmpl-header-color">Header Background Color</label>
+                <div style={S.colorWrap}>
+                  <input
+                    id="tmpl-header-color"
+                    type="color"
+                    value={headerColor}
+                    onChange={e => setHeaderColor(e.target.value)}
+                    style={S.colorInput}
+                  />
+                  <input
+                    type="text"
+                    className="form-control"
+                    value={headerColor}
+                    onChange={e => setHeaderColor(e.target.value)}
+                    style={{ flex: 1, fontFamily: 'monospace', fontSize: '0.85rem' }}
+                    maxLength={7}
+                  />
                 </div>
-                <div style={S.formGroup}>
-                  <label style={S.label} htmlFor="tmpl-footer-color">Footer Background Color</label>
-                  <div style={S.colorWrap}>
-                    <input
-                      id="tmpl-footer-color"
-                      type="color"
-                      value={footerColor}
-                      onChange={e => setFooterColor(e.target.value)}
-                      style={S.colorInput}
-                    />
-                    <input
-                      type="text"
-                      className="form-control"
-                      value={footerColor}
-                      onChange={e => setFooterColor(e.target.value)}
-                      style={{ flex: 1, fontFamily: 'monospace', fontSize: '0.85rem' }}
-                      maxLength={7}
-                    />
-                  </div>
-                </div>
+              </div>
+
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="tmpl-footer-text">PDF Footer Compliance Text</label>
+                <input
+                  id="tmpl-footer-text"
+                  type="text"
+                  className="form-control"
+                  placeholder="e.g. Confidential Report. For internal use only."
+                  value={footerText}
+                  onChange={e => setFooterText(e.target.value)}
+                />
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                  Appears at the very bottom of exported report files.
+                </span>
               </div>
 
               {/* Live preview bar */}
@@ -1054,8 +1444,8 @@ export default function Settings({ user }) {
                 <div style={{ background: 'var(--background)', padding: '10px 16px', fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center' }}>
                   — Report body content —
                 </div>
-                <div style={{ background: footerColor, padding: '8px 16px', fontSize: '0.65rem', color: 'rgba(255,255,255,0.45)', textAlign: 'center' }}>
-                  Footer Preview · Skadomation Automated Reports
+                <div style={{ background: '#0f172a', padding: '8px 16px', fontSize: '0.65rem', color: 'rgba(255,255,255,0.45)', textAlign: 'center' }}>
+                  {footerText || 'CONFIDENTIAL — AUTOMATED REPORT DISPATCHED BY SKADOMATION HISTORIAN MODULE.'}
                 </div>
               </div>
 
@@ -1067,6 +1457,196 @@ export default function Settings({ user }) {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════
+          TAB: RECIPIENT MANAGEMENT
+      ═══════════════════════════════════════ */}
+      {activeSubTab === 'recipients' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          <div style={S.card}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '16px' }}>
+              <div>
+                <p style={S.sectionTitle}>Recipient Management</p>
+                <p style={{ ...S.sectionSub, marginBottom: 0 }}>
+                  Manage report distribution lists, contact groups, and delivery configurations.
+                </p>
+              </div>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  onClick={handleTestDistribution}
+                  disabled={isTestingDistribution}
+                  className="btn btn-secondary"
+                >
+                  ⚡ {isTestingDistribution ? 'Testing Broadcast…' : 'Test Distribution'}
+                </button>
+                <button
+                  onClick={() => handleOpenRecipientEdit()}
+                  className="btn btn-primary"
+                >
+                  ➕ Add Recipient
+                </button>
+              </div>
+            </div>
+
+            {/* Filters and search row */}
+            <div style={{ display: 'flex', gap: '12px', marginBottom: '20px', flexWrap: 'wrap', alignItems: 'center' }}>
+              <div style={{ flex: 1, minWidth: '240px' }}>
+                <input
+                  type="text"
+                  className="form-control"
+                  placeholder="Search by name or email..."
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                />
+              </div>
+              <div style={{ width: '150px' }}>
+                <select
+                  className="form-control"
+                  value={statusFilter}
+                  onChange={e => setStatusFilter(e.target.value)}
+                >
+                  <option value="all">All Statuses</option>
+                  <option value="active">Active Only</option>
+                  <option value="inactive">Inactive Only</option>
+                </select>
+              </div>
+
+              {selectedRecipientIds.length > 0 && (
+                <div style={{ display: 'flex', gap: '8px', marginLeft: 'auto' }}>
+                  <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', alignSelf: 'center', marginRight: '8px' }}>
+                    {selectedRecipientIds.length} selected
+                  </span>
+                  <button onClick={() => handleBulkRecipientStatus(true)} className="btn btn-secondary btn-sm">
+                    Bulk Enable
+                  </button>
+                  <button onClick={() => handleBulkRecipientStatus(false)} className="btn btn-secondary btn-sm">
+                    Bulk Disable
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Recipient Directory Table */}
+            <div style={S.tableWrap}>
+              <table style={S.table}>
+                <thead>
+                  <tr>
+                    <th style={{ ...S.th, width: 40, textAlign: 'center' }}>
+                      <input
+                        type="checkbox"
+                        checked={
+                          recipientsList.length > 0 &&
+                          recipientsList.every(r => selectedRecipientIds.includes(r.id))
+                        }
+                        onChange={e => {
+                          if (e.target.checked) {
+                            setSelectedRecipientIds(recipientsList.map(r => r.id));
+                          } else {
+                            setSelectedRecipientIds([]);
+                          }
+                        }}
+                      />
+                    </th>
+                    <th style={S.th}>Name</th>
+                    <th style={S.th}>Email Address</th>
+                    <th style={S.th}>Role</th>
+                    <th style={S.th}>Groups</th>
+                    <th style={S.th}>Report Types</th>
+                    <th style={{ ...S.th, width: 80, textAlign: 'center' }}>Status</th>
+                    <th style={{ ...S.th, width: 120, textAlign: 'center' }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recipientsList
+                    .filter(r => {
+                      const matchesSearch =
+                        r.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                        r.email?.toLowerCase().includes(searchQuery.toLowerCase());
+                      const matchesStatus =
+                        statusFilter === 'all' ||
+                        (statusFilter === 'active' && r.active) ||
+                        (statusFilter === 'inactive' && !r.active);
+                      return matchesSearch && matchesStatus;
+                    })
+                    .map(rec => (
+                      <tr key={rec.id} style={{ background: selectedRecipientIds.includes(rec.id) ? 'rgba(59,130,246,0.05)' : 'transparent' }}>
+                        <td style={{ ...S.td, textAlign: 'center' }}>
+                          <input
+                            type="checkbox"
+                            checked={selectedRecipientIds.includes(rec.id)}
+                            onChange={e => {
+                              if (e.target.checked) {
+                                setSelectedRecipientIds(prev => [...prev, rec.id]);
+                              } else {
+                                setSelectedRecipientIds(prev => prev.filter(id => id !== rec.id));
+                              }
+                            }}
+                          />
+                        </td>
+                        <td style={{ ...S.td, fontWeight: 600, color: 'var(--text)' }}>{rec.name}</td>
+                        <td style={S.td}>{rec.email}</td>
+                        <td style={S.td}>
+                          <span style={{ fontSize: '0.75rem', background: 'var(--surface-raised)', padding: '2px 6px', borderRadius: 4, color: 'var(--text-muted)' }}>
+                            {rec.role || 'Operator'}
+                          </span>
+                        </td>
+                        <td style={S.td}>
+                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                            {(rec.groups || '').split(',').filter(Boolean).map(g => (
+                              <span key={g} style={{ fontSize: '0.7rem', padding: '1px 6px', background: 'rgba(59,130,246,0.1)', color: 'var(--secondary)', borderRadius: 3 }}>
+                                {g.trim()}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                        <td style={S.td}>
+                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                            {(rec.report_types || '').split(',').filter(Boolean).map(rt => (
+                              <span key={rt} style={{ fontSize: '0.7rem', padding: '1px 6px', background: 'rgba(16,185,129,0.1)', color: 'var(--success)', borderRadius: 3 }}>
+                                {rt.trim()}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                        <td style={{ ...S.td, textAlign: 'center' }}>
+                          <ToggleSwitch
+                            id={`status-${rec.id}`}
+                            checked={rec.active}
+                            onChange={() => handleToggleRecipientActive(rec)}
+                          />
+                        </td>
+                        <td style={{ ...S.td, textAlign: 'center' }}>
+                          <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
+                            <button
+                              onClick={() => handleOpenRecipientEdit(rec)}
+                              className="btn btn-secondary btn-sm"
+                            >
+                              Edit
+                            </button>
+                            <button
+                              onClick={() => handleDeleteRecipient(rec.id)}
+                              className="btn btn-danger btn-sm"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+
+                  {recipientsList.length === 0 && (
+                    <tr>
+                      <td colSpan="8" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
+                        No report recipients configured. Add recipients to start routing reports.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}
@@ -1211,6 +1791,169 @@ export default function Settings({ user }) {
                 </button>
                 <button type="submit" className="btn btn-primary" style={{ flex: 2 }}>
                   {editSchedule.id ? 'Save Changes' : 'Create Schedule'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════
+          MODAL: Add / Edit Recipient
+      ═══════════════════════════════════════ */}
+      {showRecipientModal && (
+        <div style={S.modalOverlay}>
+          <div style={S.modalBox(480)}>
+            <div style={S.modalHead}>
+              <h3 style={S.modalTitle}>
+                {editRecipientObj.id ? 'Edit Report Recipient' : 'Add Report Recipient'}
+              </h3>
+              <button onClick={() => setShowRecipientModal(false)} style={S.modalClose}>×</button>
+            </div>
+            
+            <form onSubmit={handleSaveRecipient} style={S.modalBody}>
+              {/* Name */}
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="rec-name">Recipient Name</label>
+                <input
+                  id="rec-name"
+                  type="text"
+                  className="form-control"
+                  placeholder="e.g. John Doe"
+                  value={editRecipientObj.name}
+                  onChange={e => setEditRecipientObj({ ...editRecipientObj, name: e.target.value })}
+                  required
+                />
+              </div>
+
+              {/* Email */}
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="rec-email">Email Address</label>
+                <input
+                  id="rec-email"
+                  type="email"
+                  className="form-control"
+                  placeholder="e.g. john@company.com"
+                  value={editRecipientObj.email}
+                  onChange={e => setEditRecipientObj({ ...editRecipientObj, email: e.target.value })}
+                  required
+                />
+              </div>
+
+              {/* Role */}
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="rec-role">Role / Job Title</label>
+                <input
+                  id="rec-role"
+                  type="text"
+                  className="form-control"
+                  placeholder="e.g. Production Manager"
+                  value={editRecipientObj.role}
+                  onChange={e => setEditRecipientObj({ ...editRecipientObj, role: e.target.value })}
+                />
+              </div>
+
+              {/* Groups Selector */}
+              <div style={S.formGroup}>
+                <label style={S.label}>Assigned Groups</label>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px', background: 'var(--background)', padding: '12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)' }}>
+                  {['Management', 'Plant Admins', 'Operations Team', 'Maintenance Team', 'Quality Team'].map(group => {
+                    const activeGroups = (editRecipientObj.groups || '').split(',').map(x => x.trim()).filter(Boolean);
+                    const isChecked = activeGroups.includes(group);
+                    return (
+                      <label key={group} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.8rem', cursor: 'pointer', color: 'var(--text)' }}>
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={e => {
+                            let nextGroups;
+                            if (e.target.checked) {
+                              nextGroups = [...activeGroups, group];
+                            } else {
+                              nextGroups = activeGroups.filter(g => g !== group);
+                            }
+                            setEditRecipientObj({ ...editRecipientObj, groups: nextGroups.join(', ') });
+                          }}
+                        />
+                        {group}
+                      </label>
+                    );
+                  })}
+                </div>
+                <div style={{ marginTop: '8px' }}>
+                  <label style={{ ...S.label, fontSize: '0.72rem', textTransform: 'none', letterSpacing: 'normal', marginBottom: '4px', display: 'block' }} htmlFor="custom-groups-input">Custom Groups (comma-separated)</label>
+                  <input
+                    id="custom-groups-input"
+                    type="text"
+                    className="form-control"
+                    placeholder="e.g. Finance, Safety Board"
+                    value={
+                      (() => {
+                        const standardGroups = ['Management', 'Plant Admins', 'Operations Team', 'Maintenance Team', 'Quality Team'];
+                        const activeGroups = (editRecipientObj.groups || '').split(',').map(x => x.trim()).filter(Boolean);
+                        return activeGroups.filter(g => !standardGroups.includes(g)).join(', ');
+                      })()
+                    }
+                    onChange={e => {
+                      const standardGroups = ['Management', 'Plant Admins', 'Operations Team', 'Maintenance Team', 'Quality Team'];
+                      const activeGroups = (editRecipientObj.groups || '').split(',').map(x => x.trim()).filter(Boolean);
+                      const selectedStandard = activeGroups.filter(g => standardGroups.includes(g));
+                      const customInput = e.target.value.split(',').map(x => x.trim()).filter(Boolean);
+                      setEditRecipientObj({ ...editRecipientObj, groups: [...selectedStandard, ...customInput].join(', ') });
+                    }}
+                  />
+                </div>
+              </div>
+
+              {/* Report Types Selector */}
+              <div style={S.formGroup}>
+                <label style={S.label}>Assigned Report Subscriptions</label>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px', background: 'var(--background)', padding: '12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)' }}>
+                  {['Daily Reports', 'Shift Reports', 'Weekly Reports', 'Monthly Reports', 'Alarm Reports', 'Historian Reports'].map(type => {
+                    const activeTypes = (editRecipientObj.report_types || '').split(',').map(x => x.trim()).filter(Boolean);
+                    const isChecked = activeTypes.includes(type);
+                    return (
+                      <label key={type} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.8rem', cursor: 'pointer', color: 'var(--text)' }}>
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={e => {
+                            let nextTypes;
+                            if (e.target.checked) {
+                              nextTypes = [...activeTypes, type];
+                            } else {
+                              nextTypes = activeTypes.filter(t => t !== type);
+                            }
+                            setEditRecipientObj({ ...editRecipientObj, report_types: nextTypes.join(', ') });
+                          }}
+                        />
+                        {type}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Active Toggle */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+                <div>
+                  <p style={{ margin: 0, fontSize: '0.8rem', fontWeight: 600, color: 'var(--text)' }}>Enabled Status</p>
+                  <p style={{ margin: 0, fontSize: '0.7rem', color: 'var(--text-muted)' }}>Include recipient in active broadcasts</p>
+                </div>
+                <ToggleSwitch
+                  id="recipient-active-toggle"
+                  checked={editRecipientObj.active}
+                  onChange={e => setEditRecipientObj({ ...editRecipientObj, active: e.target.checked })}
+                />
+              </div>
+
+              {/* Submit Buttons */}
+              <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
+                <button type="button" onClick={() => setShowRecipientModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>
+                  Cancel
+                </button>
+                <button type="submit" disabled={isSavingRecipient} className="btn btn-primary" style={{ flex: 2 }}>
+                  {isSavingRecipient ? 'Saving…' : (editRecipientObj.id ? 'Save Changes' : 'Add Recipient')}
                 </button>
               </div>
             </form>

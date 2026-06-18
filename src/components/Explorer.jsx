@@ -466,7 +466,7 @@ function SortArrow({ field, sortField, sortDirection }) {
    Main Component
    ───────────────────────────────────────────── */
 export default function Explorer() {
-  const { syncTrigger } = useSimulator();
+  const { refreshTrigger } = useSimulator();
 
   // ── State ──────────────────────────────────
   const [data, setData]               = useState([]);
@@ -515,7 +515,7 @@ export default function Explorer() {
       }
     };
     loadConfigAndTable();
-  }, [syncTrigger]);
+  }, [refreshTrigger]);
 
   const activeTableObj = useMemo(() => {
     return discoveredTables.find(t => t.name === dbTable);
@@ -544,7 +544,7 @@ export default function Explorer() {
       }
     };
     fetchTableData();
-  }, [dbTable, selectedTag, limit, startDateFilter, endDateFilter, autoRefresh, syncTrigger, data.length]);
+  }, [dbTable, selectedTag, limit, startDateFilter, endDateFilter, autoRefresh, refreshTrigger, data.length]);
 
   // ── Tag map ────────────────────────────────
   const tagMap = useMemo(() => {

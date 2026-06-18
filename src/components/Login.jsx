@@ -1,5 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { getSupabaseClient, getSupabaseConfig } from '../utils/supabaseClient';
+import { addAuditLog } from '../utils/db';
+
 
 /* ─────────────────────────── inline SVG icons ─────────────────────────── */
 const EyeIcon = () => (
@@ -117,26 +119,7 @@ export default function Login({ onLogin }) {
   const [forgotEmail, setForgotEmail] = useState('');
   const [forgotSent, setForgotSent] = useState(false);
 
-  const [isInitialSetup, setIsInitialSetup] = useState(false);
-
-  useEffect(() => {
-    const checkUsers = () => {
-      const isConnected = getSupabaseConfig() !== null;
-      if (isConnected) {
-        setIsInitialSetup(false);
-        return;
-      }
-      try {
-        const users = JSON.parse(localStorage.getItem('prod_users')) || [];
-        setIsInitialSetup(users.length === 0);
-      } catch {
-        setIsInitialSetup(true);
-      }
-    };
-    checkUsers();
-  }, []);
-
-  /* ─── auth logic (unchanged) ─── */
+  /* ─── auth logic (Supabase Auth only) ─── */
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
@@ -146,102 +129,73 @@ export default function Login({ onLogin }) {
       return;
     }
 
-    const isConnected = getSupabaseConfig() !== null;
     const supabase = getSupabaseClient();
+    if (!supabase) {
+      setError("Database client is not initialized. Please verify environment variables.");
+      return;
+    }
 
-    if (isConnected && supabase) {
-      try {
-        const { data: { session }, error: authErr } = await supabase.auth.signInWithPassword({
-          email: email.trim(),
-          password: password
-        });
+    try {
+      const { data: { session }, error: authErr } = await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password: password
+      });
 
-        if (authErr) {
-          // Show a human-readable message for known Supabase auth errors directly
-          const msg = authErr.message || '';
-          if (msg.toLowerCase().includes('email not confirmed')) {
-            setError('Your email address has not been confirmed. Please check your inbox for a confirmation link, or ask your administrator to confirm your account in Supabase Authentication settings.');
-          } else if (msg.toLowerCase().includes('invalid login credentials') || msg.toLowerCase().includes('invalid credentials')) {
-            setError('Invalid email or password. Please try again.');
-          } else if (msg.toLowerCase().includes('too many requests')) {
-            setError('Too many login attempts. Please wait a few minutes and try again.');
-          } else {
-            setError(msg || 'Login failed. Please check your credentials.');
-          }
-          return;
+      if (authErr) {
+        const msg = authErr.message || '';
+        await addAuditLog(email.trim(), 'anonymous', null, 'Failed Login Attempt', `Error: ${msg}`);
+        if (msg.toLowerCase().includes('email not confirmed')) {
+          setError('Your email address has not been confirmed. Please check your inbox for a confirmation link, or ask your administrator to confirm your account in Supabase Authentication settings.');
+        } else if (msg.toLowerCase().includes('invalid login credentials') || msg.toLowerCase().includes('invalid credentials')) {
+          setError('Invalid email or password. Please try again.');
+        } else if (msg.toLowerCase().includes('too many requests')) {
+          setError('Too many login attempts. Please wait a few minutes and try again.');
+        } else {
+          setError(msg || 'Login failed. Please check your credentials.');
         }
-
-        if (session) {
-          const { data: profile, error: profileErr } = await supabase
-            .from('profiles')
-            .select('*')
-            .eq('id', session.user.id)
-            .single();
-
-          if (profileErr || !profile) {
-            setError('User profile details not found in database.');
-            await supabase.auth.signOut();
-            return;
-          }
-
-          if (!profile.active) {
-            setError('This account has been deactivated. Contact Super Admin.');
-            await supabase.auth.signOut();
-            return;
-          }
-
-          const matchedUser = {
-            id: profile.id,
-            email: profile.email,
-            name: profile.name,
-            role: profile.role === 'User' ? 'Operator' : profile.role,
-            plantId: profile.plant_id,
-            active: profile.active,
-            authProvider: 'supabase'
-          };
-
-          onLogin(matchedUser, rememberMe);
-          return;
-        }
-      } catch (err) {
-        console.error("Supabase Auth Error:", err);
-        setError("Network error authenticating with cloud database.");
         return;
       }
-    } else {
-      // Fallback: Authenticate against localStorage database only if Supabase is unconfigured/null
-      const users = JSON.parse(localStorage.getItem('prod_users')) || [];
 
-      if (users.length === 0) {
-        // First-time configuration: register this account as Super Admin automatically
-        const newAdmin = {
-          id: "super-admin-init",
-          email: email.trim().toLowerCase(),
-          password: password,
-          name: "Initial Administrator",
-          role: "Super Admin",
-          plantId: "all",
-          active: true
+      if (session) {
+        const { data: profile, error: profileErr } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', session.user.id)
+          .maybeSingle();
+
+        if (profileErr || !profile) {
+          setError('User profile details not found in database.');
+          await addAuditLog(email.trim(), 'anonymous', null, 'Failed Login Attempt', 'User profile details not found in database.');
+          await supabase.auth.signOut();
+          return;
+        }
+
+        if (!profile.active) {
+          setError('This account has been deactivated. Contact Super Admin.');
+          await addAuditLog(profile.email, profile.role, profile.plant_id, 'Failed Login Attempt', 'Account is deactivated.');
+          await supabase.auth.signOut();
+          return;
+        }
+
+        const matchedUser = {
+          id: profile.id,
+          email: profile.email,
+          name: profile.name,
+          role: profile.role === 'User' ? 'Operator' : profile.role,
+          plantId: profile.plant_id,
+          active: profile.active,
+          authProvider: 'supabase'
         };
-        users.push(newAdmin);
-        localStorage.setItem('prod_users', JSON.stringify(users));
-        onLogin({ ...newAdmin, authProvider: 'local' }, rememberMe);
+
+        await addAuditLog(matchedUser.email, matchedUser.role, matchedUser.plantId, 'Login', 'User logged in successfully.');
+        onLogin(matchedUser, rememberMe);
         return;
       }
-
-      const matchedUser = users.find(u => u.email.toLowerCase() === email.trim().toLowerCase() && u.password === password);
-
-      if (!matchedUser) {
-        setError('Invalid login credentials');
-        return;
-      }
-
-      if (!matchedUser.active) {
-        setError('This account has been deactivated. Contact Super Admin.');
-        return;
-      }
-
-      onLogin({ ...matchedUser, authProvider: 'local' }, rememberMe);
+    } catch (err) {
+      console.error("Supabase Auth Error:", err);
+      setError("Network error authenticating with cloud database.");
+      await addAuditLog(email.trim(), 'anonymous', null, 'Failed Login Attempt', `Network error: ${err.message}`);
+      return;
     }
   };
 
@@ -250,40 +204,31 @@ export default function Login({ onLogin }) {
     if (!forgotEmail) return;
 
     const supabase = getSupabaseClient();
-    if (supabase) {
-      try {
-        const { error } = await supabase.auth.resetPasswordForEmail(forgotEmail.trim(), {
-          redirectTo: window.location.origin
-        });
-
-        if (error) {
-          alert(`Password reset request failed: ${error.message}`);
-          return;
-        }
-
-        setForgotSent(true);
-        const { error: logErr } = await supabase.from('synchronization_logs').insert({
-          status_type: 'INFO',
-          log_message: `Dispatched cloud password reset request to ${forgotEmail}.`
-        });
-        if (logErr) console.error("Error inserting sync log:", logErr);
-        return;
-      } catch (err) {
-        console.error("Supabase Forgot Password Error:", err);
-      }
+    if (!supabase) {
+      alert("Database client is not initialized.");
+      return;
     }
 
-    setForgotSent(true);
-    setTimeout(() => {
-      const emailLogs = JSON.parse(localStorage.getItem('prod_email_logs')) || [];
-      emailLogs.unshift({
-        timestamp: new Date().toISOString(),
-        recipient: forgotEmail,
-        subject: "Production System Password Reset Request",
-        status: "SENT"
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(forgotEmail.trim(), {
+        redirectTo: window.location.origin
       });
-      localStorage.setItem('prod_email_logs', JSON.stringify(emailLogs));
-    }, 500);
+
+      if (error) {
+        alert(`Password reset request failed: ${error.message}`);
+        return;
+      }
+
+      setForgotSent(true);
+      const { error: logErr } = await supabase.from('synchronization_logs').insert({
+        status_type: 'INFO',
+        log_message: `Dispatched cloud password reset request to ${forgotEmail}.`
+      });
+      if (logErr) console.error("Error inserting sync log:", logErr);
+      return;
+    } catch (err) {
+      console.error("Supabase Forgot Password Error:", err);
+    }
   };
 
 
@@ -611,43 +556,54 @@ export default function Login({ onLogin }) {
               </p>
             </div>
 
-            {/* ── Initial Setup Banner ── */}
-            {isInitialSetup && (
-              <div style={{
-                background: 'rgba(14, 165, 233, 0.08)',
-                border: '1px solid rgba(14, 165, 233, 0.22)',
-                borderRadius: '8px',
-                padding: '11px 14px',
-                marginBottom: '20px',
-                fontSize: '0.84rem',
-                color: '#38BDF8',
-                fontWeight: 500,
+            {/* ── Success banner ── */}
+            {new URLSearchParams(window.location.search).get('reset') === 'success' && (
+              <div className="success-banner" style={{
                 display: 'flex',
-                alignItems: 'flex-start',
-                gap: '10px'
+                alignItems: 'center',
+                gap: '8px',
+                padding: '12px 14px',
+                background: 'rgba(16, 185, 129, 0.1)',
+                border: '1px solid rgba(16, 185, 129, 0.25)',
+                borderRadius: '8px',
+                color: '#A7F3D0',
+                fontSize: '0.86rem',
+                fontWeight: 500,
+                marginBottom: '18px'
               }}>
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width: '15px', height: '15px', flexShrink: 0, marginTop: '2px' }}>
-                  <circle cx="12" cy="12" r="10" />
-                  <line x1="12" y1="16" x2="12" y2="12" />
-                  <line x1="12" y1="8" x2="12.01" y2="8" />
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                  style={{ width: '16px', height: '16px', flexShrink: 0 }}>
+                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                  <polyline points="22 4 12 14.01 9 11.01" />
                 </svg>
-                <span>
-                  <strong>Initial Setup Mode:</strong> No users are currently registered. Sign in with any credentials to automatically register as the Super Administrator.
-                </span>
+                <span>Password updated successfully. Please sign in with your new password.</span>
               </div>
             )}
 
             {/* ── Error message ── */}
             {error && (
-              <div className="error-banner">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
-                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
-                  style={{ width: '15px', height: '15px', flexShrink: 0, marginTop: '1px' }}>
-                  <circle cx="12" cy="12" r="10" />
-                  <line x1="12" y1="8" x2="12" y2="12" />
-                  <line x1="12" y1="16" x2="12.01" y2="16" />
-                </svg>
-                {error}
+              <div className="error-banner" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '4px' }}>
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                    style={{ width: '15px', height: '15px', flexShrink: 0, marginTop: '2px' }}>
+                    <circle cx="12" cy="12" r="10" />
+                    <line x1="12" y1="8" x2="12" y2="12" />
+                    <line x1="12" y1="16" x2="12.01" y2="16" />
+                  </svg>
+                  <span style={{ fontSize: '0.86rem', fontWeight: 500 }}>{error}</span>
+                </div>
+                <div style={{
+                  fontSize: '0.7rem',
+                  opacity: 0.85,
+                  paddingTop: '4px',
+                  borderTop: '1px solid rgba(239, 68, 68, 0.15)',
+                  width: '100%',
+                  textAlign: 'left'
+                }}>
+                  Active Database Link: {getSupabaseConfig() ? `Cloud (${getSupabaseConfig().url})` : "Disconnected"}
+                </div>
               </div>
             )}
 
@@ -696,11 +652,7 @@ export default function Login({ onLogin }) {
                   </label>
                   <button
                     type="button"
-                    onClick={() => {
-                      setShowForgotModal(true);
-                      setForgotSent(false);
-                      setForgotEmail('');
-                    }}
+                    onClick={() => { window.location.href = '/auth/forgot-password'; }}
                     style={{
                       background: 'none',
                       border: 'none',
@@ -715,6 +667,7 @@ export default function Login({ onLogin }) {
                   >
                     Forgot Password?
                   </button>
+
                 </div>
 
                 <div className="input-wrap">

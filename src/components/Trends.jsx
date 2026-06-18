@@ -30,7 +30,7 @@ function toLocalInput(date) {
 
 
 export default function Trends() {
-  const { syncTrigger, dbConnectionStatus, localBuffer } = useSimulator();
+  const { refreshTrigger, dbConnectionStatus, localBuffer } = useSimulator();
 
   /* ── tag configs & selection ── */
   const [tagConfigs, setTagConfigs]       = useState([]);
@@ -82,7 +82,7 @@ export default function Trends() {
       }
     };
     load();
-  }, [syncTrigger]);
+  }, [refreshTrigger]);
 
   // Keep focusedTagIdx in sync with selectedTags
   useEffect(() => {
@@ -133,7 +133,7 @@ export default function Trends() {
       }
     };
     runDiagnostics();
-  }, [syncTrigger, selectedTags, timePreset, customStart, customEnd, dbConnectionStatus, localBuffer.length]);
+  }, [refreshTrigger, selectedTags, timePreset, customStart, customEnd, dbConnectionStatus, localBuffer.length]);
 
   /* ════════════════════════════════════════════
      Computed time range with Zoom and Pan state
@@ -185,7 +185,7 @@ export default function Trends() {
       }
     }, 0);
     return () => clearTimeout(timer);
-  }, [timePreset, customStart, customEnd, syncTrigger]);
+  }, [timePreset, customStart, customEnd, refreshTrigger]);
 
   const handleZoom = (factor) => {
     const tStart = Date.parse(chartStart);
@@ -316,7 +316,7 @@ export default function Trends() {
       }
     };
     fetch();
-  }, [selectedTags, tagMap, timeRange.startDate, timeRange.endDate, syncTrigger, timePreset]);
+  }, [selectedTags, tagMap, timeRange.startDate, timeRange.endDate, refreshTrigger, timePreset]);
 
   /* ════════════════════════════════════════════
      Filtered tag list for left panel

@@ -71,7 +71,7 @@ function ToggleSwitch({ id, checked, onChange }) {
 
 /* ═══════════════════════════════════════════════════════════════════ */
 export default function TagConfig() {
-  const { syncTrigger, dbConnectionStatus } = useSimulator();
+  const { refreshTrigger, dbConnectionStatus } = useSimulator();
   const [activeTab, setActiveTab]     = useState('tags');
   const [tagConfigs, setTagConfigs]   = useState([]);
   const [dashboardTags, setDashboardTags] = useState([]);
@@ -121,7 +121,7 @@ export default function TagConfig() {
       }
     };
     loadConfigData();
-  }, [syncTrigger]);
+  }, [refreshTrigger]);
 
   useEffect(() => {
     const checkTagStatuses = async () => {
@@ -183,7 +183,7 @@ export default function TagConfig() {
       setLastSyncTime(new Date());
     };
     checkTagStatuses();
-  }, [tagConfigs, syncTrigger]);
+  }, [tagConfigs, refreshTrigger]);
 
   /* ── Handlers ───────────────────────────────────────────────────── */
   const handleEditOpen = (tag) => {

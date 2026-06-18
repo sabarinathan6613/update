@@ -1,10 +1,10 @@
 // src/components/Reports.jsx
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { getHistorianData, getTagConfigs, getSettings, saveSettings, addEmailLog, getReportsList, saveReportRecord, deleteReportRecord } from '../utils/db';
+import { getHistorianData, getTagConfigs, getSettings, saveSettings, addEmailLog, getReportsList, saveReportRecord, deleteReportRecord, compileReportData, getRecipients } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
 export default function Reports({ user }) {
-  const { syncTrigger } = useSimulator();
+  const { refreshTrigger } = useSimulator();
 
   // Tab State: 'workspace', 'history', 'settings'
   const [activeTab, setActiveTab] = useState('workspace');
@@ -38,9 +38,13 @@ export default function Reports({ user }) {
   // Saved reports history state
   const [reportsList, setReportsList] = useState([]);
 
-  // Email simulation modal/input state
+  // Enhanced email recipients modal state
   const [showEmailPrompt, setShowEmailPrompt] = useState(false);
-  const [targetEmail, setTargetEmail] = useState('');
+  const [recipientsList, setRecipientsList] = useState([]);
+  const [selectedRecipients, setSelectedRecipients] = useState({}); // { [email]: 'to' | 'cc' | 'bcc' | 'none' }
+  const [customRecipients, setCustomRecipients] = useState([]); // Array of { email, type }
+  const [customEmail, setCustomEmail] = useState('');
+  const [customType, setCustomType] = useState('to');
   const [isSendingEmail, setIsSendingEmail] = useState(false);
   const [emailSuccessToast, setEmailSuccessToast] = useState(false);
 
@@ -56,13 +60,14 @@ export default function Reports({ user }) {
 
       const s = await getSettings();
       setSettings(s);
-      if (s.emailRecipients) {
-        setTargetEmail(s.emailRecipients);
-      }
 
       // Load saved reports list from Supabase
       const savedReports = await getReportsList();
       setReportsList(savedReports);
+
+      // Load recipients from Supabase
+      const recs = await getRecipients();
+      setRecipientsList(recs);
 
       if (!didInitRef.current) {
         // Default select tags configured as ReportsVisible
@@ -77,7 +82,7 @@ export default function Reports({ user }) {
       }
     };
     loadReportConfigs();
-  }, [syncTrigger]);
+  }, [refreshTrigger]);
 
   // Tag dictionary mapping
   const tagMap = useMemo(() => {
@@ -125,76 +130,6 @@ export default function Reports({ user }) {
     }
   };
 
-  // Compile report stats from DB records
-  const compileReportData = async (report) => {
-    const rawData = await getHistorianData({
-      tagIndexes: report.tags,
-      startDate: report.startDate,
-      endDate: report.endDate,
-      sort: 'asc'
-    });
-
-    const chronRows = rawData;
-
-    const tagSummaries = report.tags.map(tagIdx => {
-      const records = chronRows.filter(r => r.TagIndex === tagIdx);
-      const config = tagMap[tagIdx] || { TagName: `Tag ${tagIdx}`, Unit: '', DecimalPlaces: 2 };
-
-      if (records.length === 0) {
-        return {
-          tagIndex: tagIdx,
-          tagName: config.TagName,
-          unit: config.Unit,
-          decimalPlaces: config.DecimalPlaces ?? 2,
-          min: 0, max: 0, avg: 0, current: 0, count: 0, goodPct: 100, sparkPoints: []
-        };
-      }
-
-      let min = Infinity, max = -Infinity, sum = 0, goodCount = 0;
-      records.forEach(r => {
-        if (r.Val < min) min = r.Val;
-        if (r.Val > max) max = r.Val;
-        sum += r.Val;
-        if (r.Status === 192) goodCount++;
-      });
-
-      const sparkPoints = records.slice(-20).map(r => r.Val);
-
-      return {
-        tagIndex: tagIdx,
-        tagName: config.TagName,
-        unit: config.Unit,
-        decimalPlaces: config.DecimalPlaces ?? 2,
-        min, max,
-        avg: sum / records.length,
-        current: records[records.length - 1].Val,
-        count: records.length,
-        goodPct: (goodCount / records.length) * 100,
-        sparkPoints
-      };
-    });
-
-    const incidents = chronRows
-      .filter(r => r.Status !== 192 || r.Marker !== '')
-      .map(r => {
-        const config = tagMap[r.TagIndex] || { TagName: `Tag Index ${r.TagIndex}` };
-        return {
-          timestamp: r.DateAndTime,
-          tagIndex: r.TagIndex,
-          tagName: config.TagName,
-          val: r.Val,
-          status: r.Status,
-          marker: r.Marker || 'ANOMALY'
-        };
-      });
-
-    return {
-      rows: chronRows.slice(-300),
-      totalRowsCount: chronRows.length,
-      summaries: tagSummaries,
-      incidents: incidents.slice(0, 50)
-    };
-  };
 
   const handleFormTagToggle = (tagIdx) => {
     setSelectedReportTags(prev =>
@@ -266,6 +201,20 @@ export default function Reports({ user }) {
     }
   };
 
+  // Refresh the currently selected report if refreshTrigger changes (in the background)
+  useEffect(() => {
+    if (!selectedReport) return;
+    const refreshActiveReport = async () => {
+      try {
+        const freshData = await compileReportData(selectedReport.meta);
+        setSelectedReport(prev => prev ? { ...prev, data: freshData } : null);
+      } catch (err) {
+        console.error("Failed to refresh active report data:", err);
+      }
+    };
+    refreshActiveReport();
+  }, [refreshTrigger]);
+
   // Delete saved report
   const handleDeleteReport = async (reportId) => {
     if (!window.confirm('Are you sure you want to delete this saved report from history?')) return;
@@ -325,31 +274,129 @@ export default function Reports({ user }) {
 
   const handlePrint = () => window.print();
 
-  // Email simulation
+  // Email simulation helpers & handlers
+  const getReportCategory = (type) => {
+    const t = (type || '').toLowerCase();
+    if (t.includes('daily')) return 'Daily Reports';
+    if (t.includes('shift')) return 'Shift Reports';
+    if (t.includes('weekly')) return 'Weekly Reports';
+    if (t.includes('monthly')) return 'Monthly Reports';
+    if (t.includes('alarm') || t.includes('incident')) return 'Alarm Reports';
+    if (t.includes('historian') || t.includes('audit') || t.includes('process')) return 'Historian Reports';
+    return 'Historian Reports';
+  };
+
+  const validateEmail = (email) => {
+    return String(email)
+      .toLowerCase()
+      .match(
+        /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|.(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/
+      );
+  };
+
+  const handleOpenEmailPrompt = () => {
+    if (!selectedReport) return;
+    const category = getReportCategory(selectedReport.meta.type);
+    const initialSelection = {};
+    recipientsList.forEach(rec => {
+      if (rec.active) {
+        const subbedTypes = (rec.report_types || '').split(',').map(x => x.trim()).filter(Boolean);
+        if (subbedTypes.includes(category)) {
+          initialSelection[rec.email] = 'to';
+        } else {
+          initialSelection[rec.email] = 'none';
+        }
+      }
+    });
+    setSelectedRecipients(initialSelection);
+    setCustomRecipients([]);
+    setCustomEmail('');
+    setCustomType('to');
+    setShowEmailPrompt(true);
+  };
+
   const handleEmailReportSubmit = async (e) => {
     e.preventDefault();
-    if (!targetEmail) return;
+    const toList = [];
+    const ccList = [];
+    const bccList = [];
+
+    Object.entries(selectedRecipients).forEach(([email, role]) => {
+      if (role === 'to') toList.push(email);
+      else if (role === 'cc') ccList.push(email);
+      else if (role === 'bcc') bccList.push(email);
+    });
+
+    customRecipients.forEach(cr => {
+      if (cr.type === 'to') toList.push(cr.email);
+      else if (cr.type === 'cc') ccList.push(cr.email);
+      else if (cr.type === 'bcc') bccList.push(cr.email);
+    });
+
+    if (toList.length === 0) {
+      alert('Please select at least one recipient for the "To" field.');
+      return;
+    }
 
     setIsSendingEmail(true);
-
-    setTimeout(async () => {
-      try {
-        await addEmailLog({
-          recipient: targetEmail.trim(),
-          subject: `Skadomation Production Report: ${selectedReport.meta.name}`,
-          message: `Historian telemetry report compiled on ${new Date().toLocaleString()}. Contains ${selectedReport.meta.tags.length} monitored tags and ${selectedReport.data.totalRowsCount} data samples.`,
-          status: 'SENT'
-        });
-
-        setIsSendingEmail(false);
-        setShowEmailPrompt(false);
-        setEmailSuccessToast(true);
-        setTimeout(() => setEmailSuccessToast(false), 4000);
-      } catch (err) {
-        setIsSendingEmail(false);
-        alert(`Failed to dispatch email: ${err.message}`);
+    try {
+      const sets = await getSettings();
+      if (!sets.smtpHost || !sets.smtpUser || !sets.smtpPass) {
+        throw new Error('SMTP credentials are not configured. Please complete configuration in Settings page first.');
       }
-    }, 1200);
+
+      const response = await fetch('/api/send-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          smtpConfig: {
+            host: sets.smtpHost,
+            port: sets.smtpPort,
+            username: sets.smtpUser,
+            password: sets.smtpPass,
+            secure: sets.smtpSecure,
+            logoText: sets.templateLogoText || sets.logoText,
+            headerColor: sets.templateHeaderColor || sets.headerColor,
+            footerText: sets.templateFooterText || sets.footerColor
+          },
+          to: toList,
+          cc: ccList,
+          bcc: bccList,
+          subject: `Skadomation Production Report: ${selectedReport.meta.name}`,
+          message: `Dear Team,\n\nPlease find the compiled production report details attached below:\n\nReport Name: ${selectedReport.meta.name}\nReport Type: ${selectedReport.meta.type}\nShift Reference: ${selectedReport.meta.shift}\nGenerated At: ${new Date(selectedReport.meta.generatedAt).toLocaleString()}\n\nMonitored Tags: ${selectedReport.meta.tags.length}\nTotal Telemetry Records: ${selectedReport.data.totalRowsCount}\n\nReport compilation completed successfully. Formats: PDF, Excel.`,
+          reportData: {
+            meta: selectedReport.meta,
+            data: selectedReport.data
+          }
+        })
+      });
+
+      const result = await response.json();
+      if (!response.ok || result.error) {
+        throw new Error(result.error || 'Failed to dispatch report email.');
+      }
+
+      const recipientSummaryString = [
+        toList.length > 0 ? `To: ${toList.join(', ')}` : '',
+        ccList.length > 0 ? `CC: ${ccList.join(', ')}` : '',
+        bccList.length > 0 ? `BCC: ${bccList.join(', ')}` : ''
+      ].filter(Boolean).join(' | ');
+
+      await addEmailLog({
+        recipient: recipientSummaryString,
+        subject: `Skadomation Production Report: ${selectedReport.meta.name}`,
+        message: `Historian telemetry report compiled. Dispatched to ${toList.length + ccList.length + bccList.length} total recipients.`,
+        status: 'SENT'
+      });
+
+      setIsSendingEmail(false);
+      setShowEmailPrompt(false);
+      setEmailSuccessToast(true);
+      setTimeout(() => setEmailSuccessToast(false), 4000);
+    } catch (err) {
+      setIsSendingEmail(false);
+      alert(`SMTP Dispatch Failure: ${err.message}`);
+    }
   };
 
   // Settings tab save handler
@@ -411,6 +458,51 @@ export default function Reports({ user }) {
     transition: 'all 0.15s ease',
     outline: 'none'
   });
+
+  // Dynamic recipient count memo
+  const { toCount, ccCount, bccCount, totalSelectedCount } = useMemo(() => {
+    let toC = 0, ccC = 0, bccC = 0;
+    Object.values(selectedRecipients).forEach(role => {
+      if (role === 'to') toC++;
+      if (role === 'cc') ccC++;
+      if (role === 'bcc') bccC++;
+    });
+    customRecipients.forEach(cr => {
+      if (cr.type === 'to') toC++;
+      if (cr.type === 'cc') ccC++;
+      if (cr.type === 'bcc') bccC++;
+    });
+    return {
+      toCount: toC,
+      ccCount: ccC,
+      bccCount: bccC,
+      totalSelectedCount: toC + ccC + bccC
+    };
+  }, [selectedRecipients, customRecipients]);
+
+  const handleAddCustomRecipient = (e) => {
+    e.preventDefault();
+    const email = customEmail.trim();
+    if (!email) return;
+    if (!validateEmail(email)) {
+      alert('Please enter a valid email address.');
+      return;
+    }
+    const existsInCustom = customRecipients.some(cr => cr.email.toLowerCase() === email.toLowerCase());
+    const existsInDb = Object.keys(selectedRecipients).some(key => key.toLowerCase() === email.toLowerCase() && selectedRecipients[key] !== 'none');
+    
+    if (existsInCustom || existsInDb) {
+      alert('This email address is already added/selected.');
+      return;
+    }
+    
+    setCustomRecipients(prev => [...prev, { email, type: customType }]);
+    setCustomEmail('');
+  };
+
+  const handleRemoveCustomRecipient = (emailToRemove) => {
+    setCustomRecipients(prev => prev.filter(cr => cr.email !== emailToRemove));
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '0', height: '100%', minHeight: 0 }}>
@@ -610,10 +702,10 @@ export default function Reports({ user }) {
                     }}
                   >
                     {/* Document Header */}
-                    <div style={{ borderBottom: '2.5px solid #0F172A', paddingBottom: '16px', marginBottom: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                    <div style={{ borderBottom: `2.5px solid ${settings.templateHeaderColor || '#0F172A'}`, paddingBottom: '16px', marginBottom: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                       <div>
                         {settings.templateLogoText && (
-                          <div style={{ fontSize: '0.72rem', fontWeight: 800, color: '#2563EB', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '4px' }}>
+                          <div style={{ fontSize: '0.72rem', fontWeight: 800, color: settings.templateHeaderColor || '#2563EB', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '4px' }}>
                             {settings.templateLogoText}
                           </div>
                         )}
@@ -745,7 +837,7 @@ export default function Reports({ user }) {
                     )}
 
                     {/* Document Footer */}
-                    <div style={{ marginTop: '36px', paddingTop: '10px', borderTop: '1.5px solid #0F172A', textAlign: 'center', fontSize: '0.67rem', color: '#64748B' }}>
+                    <div style={{ marginTop: '36px', paddingTop: '10px', borderTop: `1.5px solid ${settings.templateHeaderColor || '#0F172A'}`, textAlign: 'center', fontSize: '0.67rem', color: '#64748B' }}>
                       {settings.templateFooterText || 'CONFIDENTIAL — AUTOMATED REPORT DISPATCHED BY SKADOMATION HISTORIAN MODULE.'}
                     </div>
                   </div>
@@ -762,7 +854,7 @@ export default function Reports({ user }) {
                       <button onClick={() => handleExportCSV(selectedReport.meta)} className="btn btn-secondary">
                         📥 Download CSV
                       </button>
-                      <button onClick={() => setShowEmailPrompt(true)} className="btn btn-primary">
+                      <button onClick={handleOpenEmailPrompt} className="btn btn-primary">
                         ✉️ Email Report
                       </button>
                     </div>
@@ -953,10 +1045,17 @@ export default function Reports({ user }) {
                     <input
                       type="checkbox"
                       checked={settings.smtpSecure}
-                      onChange={(e) => setSettings({ ...settings, smtpSecure: e.target.checked })}
+                      onChange={(e) => {
+                        const isSecure = e.target.checked;
+                        setSettings({
+                          ...settings,
+                          smtpSecure: isSecure,
+                          smtpPort: isSecure ? 465 : 587
+                        });
+                      }}
                       style={{ width: '15px', height: '15px', accentColor: 'var(--secondary)' }}
                     />
-                    Enable TLS Secure Encryption Connection Link
+                    Enable Direct SSL/TLS Encryption (Port 465) instead of STARTTLS (Port 587)
                   </label>
                 </div>
               </div>
@@ -977,25 +1076,148 @@ export default function Reports({ user }) {
       {/* ── Email dispatch simulation dialog ── */}
       {showEmailPrompt && selectedReport && (
         <div className="modal-overlay" style={{ zIndex: 1000, position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(5, 8, 17, 0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <div className="card" style={{ maxWidth: '440px', width: '100%', padding: '24px', position: 'relative' }}>
-            <h3 style={{ fontSize: '1rem', margin: '0 0 10px', color: 'var(--text)' }}>Email Historian Report</h3>
+          <div className="card" style={{ maxWidth: '580px', width: '95%', padding: '24px', position: 'relative', maxHeight: '90vh', overflowY: 'auto' }}>
+            <h3 style={{ fontSize: '1.1rem', margin: '0 0 10px', color: 'var(--text)' }}>Email Historian Report</h3>
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '18px', lineHeight: 1.5 }}>
               Send a copy of the compiled report <strong>{selectedReport.meta.name}</strong> as an email attachment.
             </p>
-            <form onSubmit={handleEmailReportSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-              <div className="form-group" style={{ marginBottom: 0 }}>
-                <label className="form-label" htmlFor="dispatch-email">Target Email Address</label>
+            
+            {/* Recipient selection list */}
+            <div style={{ marginBottom: '18px' }}>
+              <label className="form-label" style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px', display: 'block' }}>Configured Recipients</label>
+              
+              <div style={{ background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', maxHeight: '180px', overflowY: 'auto', padding: '8px' }}>
+                {recipientsList.length === 0 ? (
+                  <div style={{ padding: '12px', textAlign: 'center', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                    No recipients configured in Settings.
+                  </div>
+                ) : (
+                  recipientsList.map(rec => {
+                    const isSelected = selectedRecipients[rec.email] && selectedRecipients[rec.email] !== 'none';
+                    const currentRole = selectedRecipients[rec.email] || 'none';
+                    return (
+                      <div key={rec.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 8px', borderBottom: '1px solid var(--border-subtle)', gap: '10px', flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, minWidth: '180px' }}>
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={(e) => {
+                              setSelectedRecipients(prev => ({
+                                ...prev,
+                                [rec.email]: e.target.checked ? 'to' : 'none'
+                              }));
+                            }}
+                          />
+                          <div>
+                            <span style={{ fontSize: '0.82rem', fontWeight: 600, color: rec.active ? 'var(--text)' : 'var(--text-muted)' }}>{rec.name}</span>
+                            <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', display: 'block' }}>{rec.email}</span>
+                          </div>
+                        </div>
+                        
+                        <div style={{ display: 'flex', gap: '4px' }}>
+                          {['to', 'cc', 'bcc'].map(type => (
+                            <button
+                              key={type}
+                              type="button"
+                              disabled={!isSelected}
+                              onClick={() => {
+                                setSelectedRecipients(prev => ({
+                                  ...prev,
+                                  [rec.email]: type
+                                }));
+                              }}
+                              style={{
+                                padding: '2px 8px',
+                                fontSize: '0.7rem',
+                                fontWeight: 600,
+                                textTransform: 'uppercase',
+                                borderRadius: '3px',
+                                border: '1px solid',
+                                cursor: isSelected ? 'pointer' : 'default',
+                                background: currentRole === type ? 'var(--secondary)' : 'transparent',
+                                color: currentRole === type ? '#fff' : 'var(--text-muted)',
+                                borderColor: currentRole === type ? 'var(--secondary)' : 'var(--border)',
+                                opacity: isSelected ? 1 : 0.4
+                              }}
+                            >
+                              {type}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+
+            {/* Custom recipients builder */}
+            <div style={{ marginBottom: '18px' }}>
+              <label className="form-label" style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px', display: 'block' }}>Add Custom Recipient</label>
+              <div style={{ display: 'flex', gap: '8px' }}>
                 <input
-                  id="dispatch-email"
                   type="email"
                   className="form-control"
-                  placeholder="enter.recipient@plant.com"
-                  value={targetEmail}
-                  onChange={(e) => setTargetEmail(e.target.value)}
-                  required
+                  placeholder="custom.user@plant.com"
+                  value={customEmail}
+                  onChange={(e) => setCustomEmail(e.target.value)}
+                  style={{ flex: 1, height: '34px', fontSize: '0.8rem' }}
                 />
+                <select
+                  value={customType}
+                  onChange={(e) => setCustomType(e.target.value)}
+                  className="form-control"
+                  style={{ width: '80px', height: '34px', fontSize: '0.8rem', padding: '0 4px' }}
+                >
+                  <option value="to">To</option>
+                  <option value="cc">CC</option>
+                  <option value="bcc">BCC</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={handleAddCustomRecipient}
+                  className="btn btn-secondary"
+                  style={{ height: '34px', fontSize: '0.8rem', padding: '0 12px' }}
+                >
+                  ➕ Add
+                </button>
               </div>
-              <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
+              
+              {/* Custom recipients list */}
+              {customRecipients.length > 0 && (
+                <div style={{ marginTop: '8px', background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', padding: '6px 10px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  {customRecipients.map(cr => (
+                    <div key={cr.email} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.78rem' }}>
+                      <span style={{ color: 'var(--text)' }}>
+                        <strong style={{ color: 'var(--secondary)', marginRight: '6px', textTransform: 'uppercase' }}>[{cr.type}]</strong>
+                        {cr.email}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveCustomRecipient(cr.email)}
+                        style={{ border: 'none', background: 'transparent', color: 'var(--error)', cursor: 'pointer', fontSize: '0.9rem', padding: '0 4px' }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Recipient summary badge counts */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--surface-raised)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', padding: '10px 14px', marginBottom: '18px', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+              <span>Recipients Selected:</span>
+              <div style={{ display: 'flex', gap: '8px', fontWeight: 600 }}>
+                <span style={{ color: toCount > 0 ? 'var(--secondary)' : 'var(--text-dim)' }}>To: {toCount}</span>
+                <span style={{ color: ccCount > 0 ? 'var(--success)' : 'var(--text-dim)' }}>CC: {ccCount}</span>
+                <span style={{ color: bccCount > 0 ? 'var(--warning)' : 'var(--text-dim)' }}>BCC: {bccCount}</span>
+                <span style={{ borderLeft: '1px solid var(--border)', paddingLeft: '8px', color: 'var(--text)' }}>Total: {totalSelectedCount}</span>
+              </div>
+            </div>
+
+            <form onSubmit={handleEmailReportSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+              <div style={{ display: 'flex', gap: '10px' }}>
                 <button type="button" onClick={() => setShowEmailPrompt(false)} className="btn btn-secondary flex-1" style={{ height: '36px' }}>
                   Cancel
                 </button>

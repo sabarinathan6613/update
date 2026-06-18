@@ -4,7 +4,7 @@ import { getPlants, savePlant, getProductionHistory } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
 export default function Plants() {
-  const { syncTrigger } = useSimulator();
+  const { refreshTrigger } = useSimulator();
   const [plantsList, setPlantsList] = useState([]);
   const [historyData, setHistoryData] = useState([]);
   const [showModal, setShowModal] = useState(false);
@@ -31,7 +31,7 @@ export default function Plants() {
       loadPlantData();
     }, 0);
     return () => clearTimeout(timer);
-  }, [syncTrigger]);
+  }, [refreshTrigger]);
 
   // Aggregate stats for each plant dynamically
   const plantStatsList = useMemo(() => {

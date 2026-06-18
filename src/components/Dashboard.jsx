@@ -276,7 +276,7 @@ const getNowTime = () => Date.now();
 
 // ─── Main Dashboard Component ─────────────────────────────────────────────────
 export default function Dashboard({ onNavigate }) {
-  const { syncTrigger, dbConnectionStatus } = useSimulator();
+  const { refreshTrigger, dbConnectionStatus } = useSimulator();
 
   // ── State ────────────────────────────────────────────────────────────────
   const [tagConfigs, setTagConfigs]         = useState([]);
@@ -325,7 +325,7 @@ export default function Dashboard({ onNavigate }) {
       loadDashboardData();
     }, 0);
     return () => clearTimeout(timer);
-  }, [loadDashboardData, syncTrigger]);
+  }, [loadDashboardData, refreshTrigger]);
 
   // ── Active Tags Count ─────────────────────────────────────────────────────
   const activeTagsCount = useMemo(() => {

@@ -1,6 +1,6 @@
 // src/components/UserManagement.jsx
 import { useState, useEffect, useCallback } from 'react';
-import { getUsers, saveUser, deleteUser, getPlants } from '../utils/db';
+import { getUsers, saveUser, deleteUser, getPlants, getAuditLogs, deleteAuditLogs } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
 /* ─── Icons ─────────────────────────────────────────────────────────── */
@@ -84,13 +84,14 @@ function ConfirmDialog({ message, onConfirm, onCancel }) {
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 export default function UserManagement({ user }) {
-  const { currentPlantId, syncTrigger } = useSimulator();
+  const { currentPlantId } = useSimulator();
   const [activeTab, setActiveTab]       = useState('directory');
   const [usersList, setUsersList]       = useState([]);
   const [plantsList, setPlantsList]     = useState([]);
   const [loading, setLoading]           = useState(true);
   const [saving, setSaving]             = useState(false);
   const [saveError, setSaveError]       = useState('');
+  const [successMessage, setSuccessMessage] = useState('');
 
   /* ─── Modal state ────────────────────────────────────────────────── */
   const [showModal, setShowModal]       = useState(false);
@@ -106,6 +107,10 @@ export default function UserManagement({ user }) {
   const [auditLogs, setAuditLogs] = useState([]);
   const [dbError, setDbError] = useState(null);
 
+  const [auditSearch, setAuditSearch] = useState('');
+  const [auditActionFilter, setAuditActionFilter] = useState('all');
+  const [auditPlantFilter, setAuditPlantFilter] = useState('all');
+
   const isSuperAdmin = user?.role === 'Super Admin';
 
   /* ─── Load ───────────────────────────────────────────────────────── */
@@ -113,12 +118,17 @@ export default function UserManagement({ user }) {
     setLoading(true);
     setDbError(null);
     try {
-      const [plist, allUsers] = await Promise.all([getPlants(), getUsers()]);
+      const [plist, allUsers, allLogs] = await Promise.all([getPlants(), getUsers(), getAuditLogs()]);
       setPlantsList(plist || []);
       const visible = isSuperAdmin
         ? allUsers
         : allUsers.filter(u => u.plantId === user.plantId && u.role !== 'Super Admin');
       setUsersList(visible);
+
+      const visibleLogs = isSuperAdmin
+        ? allLogs
+        : allLogs.filter(log => log.plantId === user.plantId && log.role !== 'Super Admin');
+      setAuditLogs(visibleLogs);
     } catch (err) {
       console.error('loadUsers error:', err);
       if (err.message && err.message.toLowerCase().includes('relation') && err.message.toLowerCase().includes('does not exist')) {
@@ -133,7 +143,7 @@ export default function UserManagement({ user }) {
 
   useEffect(() => {
     loadUsers();
-  }, [loadUsers, currentPlantId, syncTrigger]);
+  }, [loadUsers]);
 
   /* ─── Open add/edit modal ────────────────────────────────────────── */
   const openAdd = () => {
@@ -144,6 +154,7 @@ export default function UserManagement({ user }) {
       active: true
     });
     setSaveError('');
+    setSuccessMessage('');
     setShowPassword(false);
     setShowModal(true);
   };
@@ -151,6 +162,7 @@ export default function UserManagement({ user }) {
   const openEdit = (target) => {
     setEditUserObj({ ...target, password: target.password || '' });
     setSaveError('');
+    setSuccessMessage('');
     setShowPassword(false);
     setShowModal(true);
   };
@@ -179,9 +191,15 @@ export default function UserManagement({ user }) {
 
     setSaving(true);
     try {
+      const isNew = !editUserObj.id;
       await saveUser(editUserObj);
-      addAudit(`${editUserObj.id ? 'Updated' : 'Created'} account for ${editUserObj.email}`);
+      addAudit(`${isNew ? 'Created' : 'Updated'} account for ${editUserObj.email}`);
       setShowModal(false);
+      if (isNew) {
+        setSuccessMessage(`User account created successfully. Email: ${editUserObj.email} | Password: ${editUserObj.password}`);
+      } else {
+        setSuccessMessage(`User account updated successfully.`);
+      }
       await loadUsers();
     } catch (err) {
       setSaveError(err.message || 'Failed to save user.');
@@ -243,6 +261,76 @@ export default function UserManagement({ user }) {
   const inactiveCount = usersList.length - activeCount;
   const adminCount    = usersList.filter(u => ['Super Admin','Plant Admin'].includes(u.role)).length;
 
+  // Audit trail statistics
+  const totalActions = auditLogs.length;
+  const loginHistoryCount = auditLogs.filter(l => l.action === 'Login' || l.action === 'Logout').length;
+  const failedLoginsCount = auditLogs.filter(l => l.action === 'Failed Login Attempt').length;
+  const userMgmtCount = auditLogs.filter(l => ['User Creation', 'User Modification', 'User Deletion'].includes(l.action)).length;
+
+  // Filter audit logs
+  const filteredLogs = auditLogs.filter(log => {
+    if (auditSearch.trim()) {
+      const q = auditSearch.toLowerCase();
+      const matchBy = (log.by || '').toLowerCase().includes(q);
+      const matchAction = (log.action || '').toLowerCase().includes(q);
+      const matchDetails = (log.details || '').toLowerCase().includes(q);
+      if (!matchBy && !matchAction && !matchDetails) return false;
+    }
+    
+    if (auditActionFilter !== 'all') {
+      if (auditActionFilter === 'login' && log.action !== 'Login' && log.action !== 'Logout') return false;
+      if (auditActionFilter === 'failed_login' && log.action !== 'Failed Login Attempt') return false;
+      if (auditActionFilter === 'user_mgmt' && !['User Creation', 'User Modification', 'User Deletion'].includes(log.action)) return false;
+      if (auditActionFilter === 'configs' && !['Tag Configuration Update', 'Email & System Configuration Update', 'Plant Configuration Update'].includes(log.action)) return false;
+      if (auditActionFilter === 'reports' && !['Report Generation', 'Report Deletion', 'Report Send', 'Scheduled Report Dispatch'].includes(log.action)) return false;
+      if (auditActionFilter === 'sync' && log.action !== 'Cloud Synchronization') return false;
+    }
+    
+    if (isSuperAdmin && auditPlantFilter !== 'all') {
+      if (log.plantId !== auditPlantFilter) return false;
+    }
+    
+    return true;
+  });
+
+  const handleExportAuditLogs = () => {
+    try {
+      const headers = ['Timestamp', 'Performed By', 'Role', 'Plant ID', 'Action', 'Details'];
+      const rows = filteredLogs.map(log => [
+        log.ts,
+        log.by,
+        log.role,
+        log.plantId || 'System',
+        log.action,
+        log.details
+      ]);
+      
+      const csvContent = "data:text/csv;charset=utf-8," 
+        + [headers.join(','), ...rows.map(e => e.map(val => `"${String(val).replace(/"/g, '""')}"`).join(","))].join("\n");
+      
+      const encodedUri = encodeURI(csvContent);
+      const link = document.createElement("a");
+      link.setAttribute("href", encodedUri);
+      link.setAttribute("download", `skadomation_audit_logs_${new Date().toISOString().split('T')[0]}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (err) {
+      alert('Failed to export logs: ' + err.message);
+    }
+  };
+
+  const handleDeleteAuditLogs = async () => {
+    if (!window.confirm('WARNING: Are you sure you want to permanently delete ALL audit logs from the database? This action cannot be undone.')) return;
+    try {
+      await deleteAuditLogs();
+      await addAuditLog(null, null, null, 'Audit Log Deletion', 'Cleared all audit log records from database.');
+      await loadUsers();
+    } catch (err) {
+      alert('Failed to delete logs: ' + err.message);
+    }
+  };
+
   /* ═══════════════════════════════════ RENDER ════════════════════════ */
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -284,6 +372,48 @@ export default function UserManagement({ user }) {
       {/* ══════════════════════ DIRECTORY TAB ══════════════════════════ */}
       {activeTab === 'directory' && (
         <>
+          {successMessage && (
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '12px',
+              padding: '12px 16px',
+              background: 'rgba(16, 185, 129, 0.1)',
+              border: '1px solid rgba(16, 185, 129, 0.25)',
+              borderRadius: '8px',
+              color: '#A7F3D0',
+              fontSize: '0.86rem',
+              fontWeight: 500,
+              marginBottom: '16px'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                  style={{ width: '16px', height: '16px', flexShrink: 0 }}>
+                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                  <polyline points="22 4 12 14.01 9 11.01" />
+                </svg>
+                <span>{successMessage}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSuccessMessage('')}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: '#A7F3D0',
+                  fontSize: '1.2rem',
+                  cursor: 'pointer',
+                  padding: 0,
+                  lineHeight: 1
+                }}
+              >
+                ×
+              </button>
+            </div>
+          )}
+
           {/* Stat strip */}
           <div className="grid-3" style={{ gap: '16px' }}>
             {[
@@ -415,53 +545,141 @@ export default function UserManagement({ user }) {
       {activeTab === 'audit' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
           {/* Stat strip */}
-          <div className="grid-3" style={{ gap: '16px' }}>
+          <div className="grid-4" style={{ gap: '16px' }}>
             <div className="card" style={{ padding: '16px 20px' }}>
-              <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '4px' }}>Active Users</div>
-              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--success)', lineHeight: 1 }}>{activeCount}</div>
+              <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '4px' }}>Total Actions</div>
+              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--accent)', lineHeight: 1 }}>{totalActions}</div>
             </div>
             <div className="card" style={{ padding: '16px 20px' }}>
-              <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '4px' }}>Suspended</div>
-              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: inactiveCount > 0 ? 'var(--error)' : 'var(--text-muted)', lineHeight: 1 }}>{inactiveCount}</div>
+              <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '4px' }}>Login History</div>
+              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--success)', lineHeight: 1 }}>{loginHistoryCount}</div>
             </div>
             <div className="card" style={{ padding: '16px 20px' }}>
-              <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '4px' }}>Session Actions</div>
-              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--accent)', lineHeight: 1 }}>{auditLogs.length}</div>
+              <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '4px' }}>Failed Logins</div>
+              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: failedLoginsCount > 0 ? 'var(--error)' : 'var(--text-muted)', lineHeight: 1 }}>{failedLoginsCount}</div>
+            </div>
+            <div className="card" style={{ padding: '16px 20px' }}>
+              <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '4px' }}>User Management</div>
+              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--warning)', lineHeight: 1 }}>{userMgmtCount}</div>
+            </div>
+          </div>
+
+          {/* Audit Controls & Filters */}
+          <div className="card" style={{ padding: '20px' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '16px', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', flex: 1, minWidth: '280px' }}>
+                {/* Search */}
+                <div style={{ flex: 1, minWidth: '180px' }}>
+                  <input
+                    type="text"
+                    className="form-control"
+                    placeholder="Search logs by user, action, details..."
+                    value={auditSearch}
+                    onChange={e => setAuditSearch(e.target.value)}
+                  />
+                </div>
+                
+                {/* Action Filter */}
+                <div style={{ minWidth: '150px' }}>
+                  <select
+                    className="form-control"
+                    value={auditActionFilter}
+                    onChange={e => setAuditActionFilter(e.target.value)}
+                  >
+                    <option value="all">All Actions</option>
+                    <option value="login">Logins & Logouts</option>
+                    <option value="failed_login">Failed Logins</option>
+                    <option value="user_mgmt">User Management</option>
+                    <option value="configs">Configurations</option>
+                    <option value="reports">Reports</option>
+                    <option value="sync">Data Syncs</option>
+                  </select>
+                </div>
+
+                {/* Plant Filter (Super Admin only) */}
+                {isSuperAdmin && (
+                  <div style={{ minWidth: '150px' }}>
+                    <select
+                      className="form-control"
+                      value={auditPlantFilter}
+                      onChange={e => setAuditPlantFilter(e.target.value)}
+                    >
+                      <option value="all">All Plants</option>
+                      {plantsList.map(p => (
+                        <option key={p.id} value={p.id}>{p.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+
+              {/* Action Buttons for Super Admin */}
+              {isSuperAdmin && (
+                <div style={{ display: 'flex', gap: '10px' }}>
+                  <button onClick={handleExportAuditLogs} className="btn btn-secondary" style={{ padding: '0 12px', height: '36px', fontSize: '0.8rem', cursor: 'pointer' }}>
+                    📥 Export CSV
+                  </button>
+                  <button onClick={handleDeleteAuditLogs} className="btn btn-secondary" style={{ padding: '0 12px', height: '36px', fontSize: '0.8rem', borderColor: 'rgba(239, 68, 68, 0.4)', color: '#EF4444', cursor: 'pointer' }}>
+                    🗑️ Clear Audit Trail
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 
           {/* Audit table */}
           <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
             <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border)', background: 'var(--surface-raised)', fontWeight: 700, fontSize: '0.875rem' }}>
-              🛡️ Session Audit Trail
+              🛡️ Database Audit Trail ({filteredLogs.length} matching)
             </div>
             <div className="table-responsive" style={{ border: 'none', borderRadius: 0 }}>
               <table className="table">
                 <thead>
                   <tr>
                     <th>Timestamp</th>
-                    <th>Performed By</th>
+                    <th>User</th>
+                    <th>Role</th>
+                    <th>Plant</th>
                     <th>Action</th>
+                    <th>Details</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {auditLogs.length === 0 ? (
+                  {filteredLogs.length === 0 ? (
                     <tr>
-                      <td colSpan={3}>
+                      <td colSpan={6}>
                         <div className="empty-state">
                           <div className="empty-state-icon"><ShieldIcon /></div>
                           <h4>No actions recorded</h4>
-                          <p>Actions taken in this session will appear here.</p>
+                          <p>No audit trail logs match your query filters.</p>
                         </div>
                       </td>
                     </tr>
-                  ) : auditLogs.map((log, idx) => (
-                    <tr key={idx}>
-                      <td className="font-mono" style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{log.ts}</td>
-                      <td style={{ fontSize: '0.82rem', color: 'var(--accent)' }}>{log.by}</td>
-                      <td style={{ fontSize: '0.85rem', color: 'var(--text)' }}>{log.action}</td>
-                    </tr>
-                  ))}
+                  ) : filteredLogs.map((log, idx) => {
+                    const plantObj = plantsList.find(p => p.id === log.plantId);
+                    const plantName = log.plantId === 'all' ? 'System-wide' : (plantObj ? plantObj.name : (log.plantId || 'System'));
+                    return (
+                      <tr key={log.id || idx}>
+                        <td className="font-mono" style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{log.ts}</td>
+                        <td style={{ fontSize: '0.82rem', color: 'var(--accent)', fontWeight: 600 }}>{log.by}</td>
+                        <td style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                          <span style={{
+                            fontSize: '0.7rem',
+                            padding: '2px 6px',
+                            borderRadius: '4px',
+                            background: log.role === 'Super Admin' ? 'rgba(14, 165, 233, 0.12)' : (log.role === 'Plant Admin' ? 'rgba(245, 158, 11, 0.12)' : 'rgba(16, 185, 129, 0.12)'),
+                            color: log.role === 'Super Admin' ? '#0EA5E9' : (log.role === 'Plant Admin' ? '#F59E0B' : '#10B981'),
+                            border: log.role === 'Super Admin' ? '1px solid rgba(14, 165, 233, 0.25)' : (log.role === 'Plant Admin' ? '1px solid rgba(245, 158, 11, 0.25)' : '1px solid rgba(16, 185, 129, 0.25)')
+                          }}>
+                            {log.role}
+                          </span>
+                        </td>
+                        <td style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{plantName}</td>
+                        <td style={{ fontSize: '0.82rem', color: 'var(--text)', fontWeight: 600 }}>{log.action}</td>
+                        <td style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{log.details}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -518,7 +736,34 @@ export default function UserManagement({ user }) {
                 </div>
 
                 <div className="form-group" style={{ marginBottom: 0 }}>
-                  <label className="form-label">Password *</label>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                    <label className="form-label" style={{ margin: 0 }}>Password *</label>
+                    {!editUserObj.id && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$';
+                          let pass = '';
+                          for (let i = 0; i < 10; i++) {
+                            pass += chars.charAt(Math.floor(Math.random() * chars.length));
+                          }
+                          setEditUserObj({ ...editUserObj, password: pass });
+                          setShowPassword(true);
+                        }}
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          color: 'var(--accent, #0EA5E9)',
+                          fontSize: '0.78rem',
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                          padding: 0
+                        }}
+                      >
+                        ⚡ Generate Password
+                      </button>
+                    )}
+                  </div>
                   <div style={{ position: 'relative' }}>
                     <input
                       type={showPassword ? 'text' : 'password'}

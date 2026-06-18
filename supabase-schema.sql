@@ -220,3 +220,30 @@ $$ LANGUAGE plpgsql;
 GRANT EXECUTE ON FUNCTION public.count_rows(text, text) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.discover_database_structure() TO anon, authenticated;
 
+-- 10. Automatically Create User Profile on Auth SignUp / Admin User Creation
+CREATE OR REPLACE FUNCTION public.handle_new_user_admin()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    INSERT INTO public.profiles (id, email, name, role, plant_id, active)
+    VALUES (
+        new.id,
+        new.email,
+        COALESCE(new.raw_user_meta_data->>'name', ''),
+        COALESCE(new.raw_user_meta_data->>'role', 'User'),
+        COALESCE(new.raw_user_meta_data->>'plant_id', 'plant-1'),
+        COALESCE((new.raw_user_meta_data->>'active')::boolean, true)
+    );
+    RETURN new;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created_admin ON auth.users;
+
+CREATE TRIGGER on_auth_user_created_admin
+AFTER INSERT ON auth.users
+FOR EACH ROW EXECUTE FUNCTION public.handle_new_user_admin();
+

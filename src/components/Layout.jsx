@@ -1,7 +1,7 @@
 // src/components/Layout.jsx
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useSimulator } from '../utils/SimulatorContext';
-import { getEmailLogs, getSyncLogs } from '../utils/db';
+import { getEmailLogs, getSyncLogs, invalidateCache } from '../utils/db';
 
 // ─── Inline SVG Icon Components ───────────────────────────────────────────────
 
@@ -157,6 +157,9 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
 
   const {
     syncTrigger,
+    setSyncTrigger,
+    refreshTrigger,
+    setRefreshTrigger,
     isNetworkOnline,
     forceSync,
     localBuffer,
@@ -173,6 +176,40 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
     return successLog ? successLog.time : 'N/A';
   }, [syncLogs]);
 
+  // ─── Manual Refresh State & Logic ──────────────────────────────────────────────
+  const [lastUpdated, setLastUpdated] = useState(() => new Date());
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  const handleManualRefresh = useCallback(async () => {
+    setIsRefreshing(true);
+    try {
+      console.log('[Manual Refresh] Purging client query cache and triggering page refresh...');
+      invalidateCache();
+      if (setRefreshTrigger) {
+        setRefreshTrigger(prev => prev + 1);
+      }
+      setLastUpdated(new Date());
+    } catch (err) {
+      console.error("Manual refresh reload failed:", err);
+    } finally {
+      setTimeout(() => setIsRefreshing(false), 600);
+    }
+  }, [setRefreshTrigger]);
+
+  // ─── 30-Minute Force Invalidation Timer (Background Cache Cleaning) ──────────
+  useEffect(() => {
+    const interval = setInterval(() => {
+      console.log('[Auto-Refresh] 30-minute interval reached. Purging cache...');
+      invalidateCache();
+    }, 30 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  const formatTime = (date) => {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  };
+
 
 
   const menuItems = [
@@ -183,7 +220,7 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
     { id: 'cloudSync', label: 'Cloud DB & Sync',     icon: <IconCloudSync />, roles: ['Super Admin'] },
     { id: 'tagConfig', label: 'Tag Configuration',   icon: <IconTagConfig />, roles: ['Super Admin', 'Plant Admin'] },
     { id: 'users',     label: 'User Management',     icon: <IconUsers />,     roles: ['Super Admin', 'Plant Admin'] },
-    { id: 'settings',  label: 'Settings',            icon: <IconSettings />,  roles: ['Super Admin'] },
+    { id: 'settings',  label: 'Settings',            icon: <IconSettings />,  roles: ['Super Admin', 'Plant Admin'] },
   ];
 
   const visibleMenuItems = menuItems.filter(item => item.roles.includes(user.role));
@@ -203,7 +240,7 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
       setNotifications(allNotifs);
     };
     loadLayoutData();
-  }, [syncTrigger]);
+  }, [refreshTrigger]);
 
   useEffect(() => {
     function handleClickOutside(event) {
@@ -860,6 +897,45 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
               </span>
             </div>
 
+            {/* 6. Intelligent Refresh Timing */}
+            {['dashboard', 'tagConfig', 'explorer', 'reports'].includes(activeTab) && (
+              <>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }} title="Last database refresh">
+                  <span style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+                    Last Updated
+                  </span>
+                  <span className="font-mono" style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--success)', marginTop: '2px' }}>
+                    {formatTime(lastUpdated)}
+                  </span>
+                </div>
+
+                <button
+                  onClick={handleManualRefresh}
+                  disabled={isRefreshing}
+                  className="btn btn-secondary"
+                  style={{
+                    padding: '6px 10px',
+                    fontSize: '0.78rem',
+                    borderRadius: 'var(--radius-sm)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '5px',
+                    border: '1px solid rgba(59, 130, 246, 0.3)',
+                    backgroundColor: 'rgba(59, 130, 246, 0.05)'
+                  }}
+                  title="Purge cache and refresh telemetry data now"
+                >
+                  <span style={{
+                    display: 'inline-flex',
+                    animation: isRefreshing ? 'spin 1s linear infinite' : 'none'
+                  }}>
+                    <IconRefresh />
+                  </span>
+                  Refresh Now
+                </button>
+              </>
+            )}
+
             {/* Quick Actions Dropdown */}
             <div style={{ position: 'relative' }} ref={quickActionsRef}>
               <button
@@ -968,6 +1044,12 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
         <main style={{ flex: 1 }}>
           {children}
         </main>
+        <style>{`
+          @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+          }
+        `}</style>
       </div>
     </div>
   );

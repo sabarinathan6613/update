@@ -1,8 +1,21 @@
 /* eslint-disable react-refresh/only-export-components */
 // src/utils/SimulatorContext.jsx
 import { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
-import { getHistorianData, addHistorianRecords, addSyncLog, getTagConfigs } from './db';
-import { getSupabaseClient } from './supabaseClient';
+import { getHistorianData, addHistorianRecords, addSyncLog, getTagConfigs, getPlants, getSettings } from './db';
+import { getSupabaseClient, getSupabaseConfig } from './supabaseClient';
+
+// ─── Promise Timeout Helper ────────────────────────────────────────────────────
+function withTimeout(promise, ms, name = 'Promise') {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Timeout: "${name}" took longer than ${ms}ms to resolve.`));
+    }, ms);
+    promise.then(
+      (res) => { clearTimeout(timer); resolve(res); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
 
 const SimulatorContext = createContext();
 
@@ -24,12 +37,21 @@ export function SimulatorProvider({ children }) {
   const [syncLogs, setSyncLogs] = useState([]);
 
   // Track currently selected plant (Legacy context compatibility, default plant-1)
-  const [currentPlantId, setCurrentPlantId] = useState(() => {
-    try {
-      const plants = JSON.parse(localStorage.getItem('prod_plants')) || [];
-      return plants.length > 0 ? plants[0].id : '';
-    } catch { return ''; }
-  });
+  const [currentPlantId, setCurrentPlantId] = useState('');
+
+  useEffect(() => {
+    const initPlant = async () => {
+      try {
+        const plants = await withTimeout(getPlants(), 5000, 'SimulatorContext.getPlants');
+        if (plants && plants.length > 0) {
+          setCurrentPlantId(plants[0].id);
+        }
+      } catch (e) {
+        console.error("Failed to load plants for simulator context:", e);
+      }
+    };
+    initPlant();
+  }, []);
 
   // Accumulated production counter for Tag 35 simulation
   // For notifying components to refresh their view
@@ -43,6 +65,7 @@ export function SimulatorProvider({ children }) {
   const syncTimerRef = useRef(null);
   const localBufferRef = useRef(localBuffer);
   const isNetworkOnlineRef = useRef(isNetworkOnline);
+  const isSyncingRef = useRef(false);
 
   useEffect(() => {
     localBufferRef.current = localBuffer;
@@ -62,11 +85,17 @@ export function SimulatorProvider({ children }) {
 
   // Synchronize Local Buffer to Cloud Database (prod_history)
   const triggerSync = useCallback(async () => {
+    if (isSyncingRef.current) {
+      console.log("[Sync] Sync already in progress, skipping overlapping execution.");
+      return;
+    }
+
     const buffer = localBufferRef.current;
     if (buffer.length === 0) {
       return; // Nothing to sync
     }
 
+    isSyncingRef.current = true;
     setSyncStatus("Syncing");
     
     // Check network availability
@@ -75,8 +104,11 @@ export function SimulatorProvider({ children }) {
         setSyncStatus("Failed");
         setFailedSyncAttempts(prev => prev + 1);
         logMsg(`Sync Failed. Cloud gateway link offline. Retaining +${buffer.length} rows in local SQL cache.`, true);
-        addSyncLog(`Sync Failed: Cloud Connection Offline. Local Historian Buffer: +${buffer.length} pending.`);
+        try {
+          addSyncLog(`Sync Failed: Cloud Connection Offline. Local Historian Buffer: +${buffer.length} pending.`);
+        } catch (e) { /* ignored */ }
         setSyncTrigger(prev => prev + 1);
+        isSyncingRef.current = false;
       }, 800);
       return;
     }
@@ -87,9 +119,13 @@ export function SimulatorProvider({ children }) {
     setTimeout(async () => {
       try {
         const recordBatchCount = buffer.length;
-        // Write to Cloud DB
-        await addHistorianRecords(buffer);
-        await addSyncLog(`Automated Sync: Uploaded +${recordBatchCount} historian telemetry rows to Cloud DB.`);
+        // Write to Cloud DB with timeout protection
+        await withTimeout(addHistorianRecords(buffer), 8000, 'SimulatorContext.addHistorianRecords');
+        try {
+          await withTimeout(addSyncLog(`Automated Sync: Uploaded +${recordBatchCount} historian telemetry rows to Cloud DB.`), 5000, 'SimulatorContext.addSyncLog');
+        } catch (e) {
+          console.warn("Failed to write sync log:", e);
+        }
 
         // Log to simulator console
         logMsg(`SUCCESS: Flushed local SCADA buffer. Sync completed for +${recordBatchCount} tags.`);
@@ -107,8 +143,12 @@ export function SimulatorProvider({ children }) {
         setSyncStatus("Failed");
         setFailedSyncAttempts(prev => prev + 1);
         logMsg(`Sync Exception: ${err.message}`, true);
-        addSyncLog(`Sync Exception: ${err.message}`, "ERROR");
+        try {
+          await withTimeout(addSyncLog(`Sync Exception: ${err.message}`, "ERROR"), 5000, 'SimulatorContext.addSyncLog.error');
+        } catch (e) { /* ignored */ }
         setSyncTrigger(prev => prev + 1);
+      } finally {
+        isSyncingRef.current = false;
       }
     }, 1000);
   }, [logMsg]);
@@ -116,22 +156,33 @@ export function SimulatorProvider({ children }) {
   // Seed total synced records count and storage size from existing db
   useEffect(() => {
     const fetchSyncStats = async () => {
-      const history = await getHistorianData();
-      setTotalSyncedRecords(history.length);
-      const size = history.length * 0.125; // ~125 bytes per historian row
-      setCloudStorageUsageKb(parseFloat(size.toFixed(2)));
+      try {
+        const history = await withTimeout(getHistorianData(), 5000, 'SimulatorContext.getHistorianData');
+        setTotalSyncedRecords(history?.length || 0);
+        const size = (history?.length || 0) * 0.125; // ~125 bytes per historian row
+        setCloudStorageUsageKb(parseFloat(size.toFixed(2)));
+      } catch (e) {
+        console.error("Failed to load historian data for stats:", e);
+      }
     };
     fetchSyncStats();
   }, [syncTrigger]);
 
   // Poll configuration changes and check connection status
   useEffect(() => {
-    const checkConfigAndConnection = () => {
+    const checkConfigAndConnection = async () => {
       try {
-        const settings = JSON.parse(localStorage.getItem('prod_settings')) || {};
-        const url = (settings.supabaseUrl || '').trim();
-        const anonKey = (settings.supabaseAnonKey || '').trim();
-        const table = (settings.selectedTable || '').trim();
+        const config = getSupabaseConfig();
+        const url = config ? (config.url || '').trim() : '';
+        const anonKey = config ? (config.anonKey || '').trim() : '';
+        
+        let table = '';
+        try {
+          const settings = await withTimeout(getSettings(), 5000, 'SimulatorContext.getSettings');
+          table = (settings?.selectedTable || '').trim();
+        } catch (err) {
+          console.warn("Failed to fetch settings from Supabase in simulator context check:", err);
+        }
 
         if (url !== dbConfig.url || anonKey !== dbConfig.anonKey || table !== dbConfig.table) {
           console.log("Supabase config change detected, updating database config state.");
@@ -259,8 +310,8 @@ export function SimulatorProvider({ children }) {
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
-        const configs = await getTagConfigs();
-        if (configs.length === 0) return;
+        const configs = await withTimeout(getTagConfigs(), 5000, 'SimulatorContext.getTagConfigs');
+        if (!configs || configs.length === 0) return;
 
         const now = new Date().toISOString();
         const millitm = new Date().getMilliseconds();
@@ -348,6 +399,8 @@ export function SimulatorProvider({ children }) {
     triggerSync();
   };
 
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
+
   return (
     <SimulatorContext.Provider value={{
       localBuffer,
@@ -356,6 +409,9 @@ export function SimulatorProvider({ children }) {
       currentPlantId,
       setCurrentPlantId,
       syncTrigger,
+      setSyncTrigger,
+      refreshTrigger,
+      setRefreshTrigger,
       forceSync,
       
       // Sync states

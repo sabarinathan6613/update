@@ -4,7 +4,7 @@ import { getPlants, getHistorianData, getTagConfigs } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
 export default function Alarms() {
-  const { currentPlantId, syncTrigger } = useSimulator();
+  const { currentPlantId, refreshTrigger } = useSimulator();
   const [activeTab, setActiveTab] = useState('active'); // active, history, analytics
   const [historyData, setHistoryData] = useState([]);
   const [plantsList, setPlantsList] = useState([]);
@@ -68,7 +68,7 @@ export default function Alarms() {
       }
     };
     loadAlarmData();
-  }, [currentPlantId, syncTrigger, acknowledgedIds]);
+  }, [currentPlantId, refreshTrigger, acknowledgedIds]);
 
   // Filter alarms based on current active plant selection in Layout
   const filteredActiveAlarms = useMemo(() => {
