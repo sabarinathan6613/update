@@ -144,11 +144,29 @@ export async function deleteUser(userId) {
     if (data) userEmail = data.email;
   } catch { /* ignored */ }
 
-  const { error } = await supabase.from('profiles').delete().eq('id', userId);
-  if (error) {
-    console.error("Supabase profiles delete error:", error);
-    throw new Error(`Supabase profiles delete failed: ${error.message}`);
+  // 1. First delete from auth.users (authentication system) using the admin API
+  const adminClient = getSupabaseAdminClient();
+  if (adminClient) {
+    try {
+      const { error: authError } = await adminClient.auth.admin.deleteUser(userId);
+      if (authError) {
+        console.warn("Supabase auth delete error (will fallback to direct profile delete):", authError);
+        // Fallback: try deleting from profiles directly in case it didn't cascade
+        await supabase.from('profiles').delete().eq('id', userId);
+      }
+    } catch (err) {
+      console.warn("Supabase auth delete exception:", err);
+      await supabase.from('profiles').delete().eq('id', userId);
+    }
+  } else {
+    // 2. Direct profiles delete if admin client is not available (e.g. VITE_SUPABASE_SERVICE_ROLE_KEY not configured)
+    const { error } = await supabase.from('profiles').delete().eq('id', userId);
+    if (error) {
+      console.error("Supabase profiles delete error:", error);
+      throw new Error(`Supabase profiles delete failed: ${error.message}`);
+    }
   }
+
   await addAuditLog(null, null, null, 'User Deletion', `Deleted user: ${userEmail}`);
 }
 
