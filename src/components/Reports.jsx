@@ -1,27 +1,31 @@
 // src/components/Reports.jsx
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { getHistorianData, getTagConfigs, getSettings, saveSettings, addEmailLog, getReportsList, saveReportRecord, deleteReportRecord, compileReportData, getRecipients } from '../utils/db';
+import { getTagConfigs, getReportTemplates, addEmailLog, getReportsList, saveReportRecord, deleteReportRecord, compileReportData, getRecipients } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
+
+function formatTemplateString(str, report) {
+  if (!str) return '';
+  return str
+    .replace(/\{\{reportName\}\}/g, report.name || '')
+    .replace(/\{\{reportType\}\}/g, report.type || '')
+    .replace(/\{\{shift\}\}/g, report.shift || 'Email Delivery Log')
+    .replace(/\{\{dateRange\}\}/g, report.dateInfo || '')
+    .replace(/\{\{generatedAt\}\}/g, new Date(report.generatedAt || Date.now()).toLocaleString());
+}
 
 export default function Reports({ user }) {
   const { refreshTrigger } = useSimulator();
+  const isReadOnly = user?.role === 'Admin';
 
-  // Tab State: 'workspace', 'history', 'settings'
+  // Tab State: 'workspace', 'history'
   const [activeTab, setActiveTab] = useState('workspace');
 
   // Configuration state
   const [tagConfigs, setTagConfigs] = useState([]);
-  const [settings, setSettings] = useState({
-    smtpHost: '',
-    smtpPort: 587,
-    smtpUser: '',
-    smtpPass: '',
-    smtpSecure: true,
-    templateLogoText: '',
-    templateHeaderColor: '#0A0F1E',
-    templateFooterText: '',
-    emailRecipients: ''
-  });
+  const [templatesList, setTemplatesList] = useState([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [emailSubject, setEmailSubject] = useState('');
+  const [emailMessage, setEmailMessage] = useState('');
 
   // Report Builder Form State
   const [reportTitle, setReportTitle] = useState('');
@@ -34,6 +38,10 @@ export default function Reports({ user }) {
 
   // Active compiled report in workspace preview
   const [selectedReport, setSelectedReport] = useState(null);
+  const selectedReportRef = useRef(selectedReport);
+  useEffect(() => {
+    selectedReportRef.current = selectedReport;
+  }, [selectedReport]);
 
   // Saved reports history state
   const [reportsList, setReportsList] = useState([]);
@@ -49,7 +57,13 @@ export default function Reports({ user }) {
   const [emailSuccessToast, setEmailSuccessToast] = useState(false);
 
   const didInitRef = useRef(false);
-  const isConfigAllowed = ['Super Admin', 'Plant Admin'].includes(user?.role || '');
+
+  const activeTemplate = useMemo(() => {
+    if (!selectedReport) return null;
+    return templatesList.find(t => t.report_type === selectedReport.meta.type && t.is_default) ||
+           templatesList.find(t => t.report_type === selectedReport.meta.type) ||
+           null;
+  }, [templatesList, selectedReport]);
 
   // Load configuration and initialize inputs
   useEffect(() => {
@@ -58,8 +72,8 @@ export default function Reports({ user }) {
       const sortedConfigs = configs.sort((a, b) => a.TagIndex - b.TagIndex);
       setTagConfigs(sortedConfigs);
 
-      const s = await getSettings();
-      setSettings(s);
+      const templates = await getReportTemplates();
+      setTemplatesList(templates);
 
       // Load saved reports list from Supabase
       const savedReports = await getReportsList();
@@ -203,10 +217,10 @@ export default function Reports({ user }) {
 
   // Refresh the currently selected report if refreshTrigger changes (in the background)
   useEffect(() => {
-    if (!selectedReport) return;
+    if (!selectedReportRef.current) return;
     const refreshActiveReport = async () => {
       try {
-        const freshData = await compileReportData(selectedReport.meta);
+        const freshData = await compileReportData(selectedReportRef.current.meta);
         setSelectedReport(prev => prev ? { ...prev, data: freshData } : null);
       } catch (err) {
         console.error("Failed to refresh active report data:", err);
@@ -255,11 +269,18 @@ export default function Reports({ user }) {
       csvContent += `"${inc.timestamp}",${inc.tagIndex},"${inc.tagName}",${inc.val},${inc.status},"${inc.marker}"\r\n`;
     });
 
-    csvContent += '\r\nCHRONOLOGICAL TELEMETRY EVENT LOG (TOP 300)\r\n';
-    csvContent += 'Timestamp,Millitm,TagIndex,TagName,Value,Status,Marker\r\n';
-    compiled.data.rows.forEach(r => {
-      const config = tagMap[r.TagIndex] || { TagName: `Tag ${r.TagIndex}` };
-      csvContent += `"${r.DateAndTime}",${r.Millitm},${r.TagIndex},"${config.TagName}",${r.Val},${r.Status},"${r.Marker || ''}"\r\n`;
+    csvContent += `\r\nTAG STATISTICAL ANALYSIS\r\n`;
+    csvContent += 'TagIndex,TagName,Unit,Min,Max,Average,StdDeviation,Samples,Quality%,FirstSample,LastSample\r\n';
+    compiled.data.summaries.forEach(s => {
+      const dp = s.decimalPlaces;
+      csvContent += `${s.tagIndex},"${s.tagName}","${s.unit || ''}",${s.min != null ? s.min.toFixed(dp) : ''},${s.max != null ? s.max.toFixed(dp) : ''},${s.avg != null ? s.avg.toFixed(dp) : ''},${s.stdDev != null ? s.stdDev.toFixed(dp) : ''},${s.count},${s.goodPct != null ? s.goodPct.toFixed(1) : ''},"${s.firstSampleTime || ''}","${s.lastSampleTime || ''}"\r\n`;
+    });
+
+    csvContent += `\r\nRAW HISTORIAN DATA (ALL ${(compiled.data.allRows || compiled.data.rows).length} RECORDS)\r\n`;
+    csvContent += 'Timestamp,Millitm,TagIndex,TagName,Value,StatusCode,StatusLabel,Marker\r\n';
+    (compiled.data.allRows || compiled.data.rows).forEach(r => {
+      const statusLabel = r.Status === 192 ? 'Good' : r.Status === 0 ? 'Bad' : `Status(${r.Status})`;
+      csvContent += `"${r.DateAndTime}",${r.Millitm},${r.TagIndex},"${r.TagName || ''}",${r.Val},${r.Status},"${statusLabel}","${r.Marker || ''}"\r\n`;
     });
 
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -312,7 +333,32 @@ export default function Reports({ user }) {
     setCustomRecipients([]);
     setCustomEmail('');
     setCustomType('to');
+
+    // Find default template matching this report type
+    const defaultTemp = templatesList.find(t => t.report_type === selectedReport.meta.type && t.is_default);
+    if (defaultTemp) {
+      setSelectedTemplateId(defaultTemp.id);
+      setEmailSubject(formatTemplateString(defaultTemp.subject, selectedReport.meta));
+      setEmailMessage(formatTemplateString(defaultTemp.email_body, selectedReport.meta));
+    } else {
+      setSelectedTemplateId('');
+      setEmailSubject(`Skadomation Production Report: ${selectedReport.meta.name}`);
+      setEmailMessage(`Dear Team,\n\nPlease find the compiled production report details attached below:\n\nReport Name: ${selectedReport.meta.name}\nReport Type: ${selectedReport.meta.type}\nGenerated At: ${new Date(selectedReport.meta.generatedAt).toLocaleString()}\n\nMonitored Tags: ${selectedReport.meta.tags.length}\nTotal Telemetry Records: ${selectedReport.data.totalRowsCount}\n\nReport compilation completed successfully. Formats: PDF, Excel.`);
+    }
+
     setShowEmailPrompt(true);
+  };
+
+  const handleTemplateChange = (templateId) => {
+    setSelectedTemplateId(templateId);
+    const temp = templatesList.find(t => t.id === templateId);
+    if (temp) {
+      setEmailSubject(formatTemplateString(temp.subject, selectedReport.meta));
+      setEmailMessage(formatTemplateString(temp.email_body, selectedReport.meta));
+    } else {
+      setEmailSubject(`Skadomation Production Report: ${selectedReport.meta.name}`);
+      setEmailMessage(`Dear Team,\n\nPlease find the compiled production report details attached below:\n\nReport Name: ${selectedReport.meta.name}\nReport Type: ${selectedReport.meta.type}\nGenerated At: ${new Date(selectedReport.meta.generatedAt).toLocaleString()}\n\nMonitored Tags: ${selectedReport.meta.tags.length}\nTotal Telemetry Records: ${selectedReport.data.totalRowsCount}\n\nReport compilation completed successfully. Formats: PDF, Excel.`);
+    }
   };
 
   const handleEmailReportSubmit = async (e) => {
@@ -340,34 +386,31 @@ export default function Reports({ user }) {
 
     setIsSendingEmail(true);
     try {
-      const sets = await getSettings();
-      if (!sets.smtpHost || !sets.smtpUser || !sets.smtpPass) {
-        throw new Error('SMTP credentials are not configured. Please complete configuration in Settings page first.');
-      }
+      const activeTemplate = templatesList.find(t => t.id === selectedTemplateId);
 
       const response = await fetch('/api/send-email', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          smtpConfig: {
-            host: sets.smtpHost,
-            port: sets.smtpPort,
-            username: sets.smtpUser,
-            password: sets.smtpPass,
-            secure: sets.smtpSecure,
-            logoText: sets.templateLogoText || sets.logoText,
-            headerColor: sets.templateHeaderColor || sets.headerColor,
-            footerText: sets.templateFooterText || sets.footerColor
-          },
+          smtpConfig: null, // Endpoint queries active configuration in database
+          templateConfig: activeTemplate ? {
+            logoText: activeTemplate.logo_text,
+            headerColor: activeTemplate.header_color,
+            footerText: activeTemplate.footer_text
+          } : null,
           to: toList,
           cc: ccList,
           bcc: bccList,
-          subject: `Skadomation Production Report: ${selectedReport.meta.name}`,
-          message: `Dear Team,\n\nPlease find the compiled production report details attached below:\n\nReport Name: ${selectedReport.meta.name}\nReport Type: ${selectedReport.meta.type}\nShift Reference: ${selectedReport.meta.shift}\nGenerated At: ${new Date(selectedReport.meta.generatedAt).toLocaleString()}\n\nMonitored Tags: ${selectedReport.meta.tags.length}\nTotal Telemetry Records: ${selectedReport.data.totalRowsCount}\n\nReport compilation completed successfully. Formats: PDF, Excel.`,
-          reportData: {
-            meta: selectedReport.meta,
-            data: selectedReport.data
-          }
+          subject: emailSubject,
+          message: emailMessage,
+          reportData: (() => {
+            // Strip allRows (full dataset) before sending to avoid hitting Vercel's
+            // 4.5MB serverless body limit. The PDF appendix uses `rows` (last 10k)
+            // and the Excel sheet falls back to `rows` when allRows is absent.
+            const dataCopy = { ...selectedReport.data };
+            delete dataCopy.allRows;
+            return { meta: selectedReport.meta, data: dataCopy };
+          })()
         })
       });
 
@@ -384,7 +427,7 @@ export default function Reports({ user }) {
 
       await addEmailLog({
         recipient: recipientSummaryString,
-        subject: `Skadomation Production Report: ${selectedReport.meta.name}`,
+        subject: emailSubject,
         message: `Historian telemetry report compiled. Dispatched to ${toList.length + ccList.length + bccList.length} total recipients.`,
         status: 'SENT'
       });
@@ -397,25 +440,6 @@ export default function Reports({ user }) {
       setIsSendingEmail(false);
       alert(`SMTP Dispatch Failure: ${err.message}`);
     }
-  };
-
-  // Settings tab save handler
-  const handleSaveSettings = async (e) => {
-    e.preventDefault();
-    const current = await getSettings();
-    await saveSettings({
-      ...current,
-      smtpHost: settings.smtpHost.trim(),
-      smtpPort: parseInt(settings.smtpPort) || 587,
-      smtpUser: settings.smtpUser.trim(),
-      smtpPass: settings.smtpPass,
-      smtpSecure: settings.smtpSecure,
-      templateLogoText: settings.templateLogoText.trim(),
-      templateHeaderColor: settings.templateHeaderColor,
-      templateFooterText: settings.templateFooterText.trim(),
-      emailRecipients: settings.emailRecipients.trim()
-    });
-    alert("Template & delivery configurations updated successfully.");
   };
 
   // Sparkline SVG renderer
@@ -515,11 +539,6 @@ export default function Reports({ user }) {
         <button onClick={() => setActiveTab('history')} style={tabStyle(activeTab === 'history')}>
           📜 Saved Reports
         </button>
-        {isConfigAllowed && (
-          <button onClick={() => setActiveTab('settings')} style={tabStyle(activeTab === 'settings')}>
-            ⚙️ Template & Delivery Settings
-          </button>
-        )}
       </div>
 
       {/* ── Tab Contents ── */}
@@ -532,7 +551,7 @@ export default function Reports({ user }) {
             {/* Panel 1: Top Input parameters */}
             <div className="card" style={{ padding: '16px 20px' }} data-testid="top-parameters">
               <span className="section-label">Report Parameters</span>
-              <form onSubmit={handleGenerate} style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.5fr 1.3fr auto', gap: '20px', alignItems: 'end' }}>
+              <form onSubmit={handleGenerate} className="reports-form-grid">
                 {/* Column 1: Title & Type */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -617,7 +636,7 @@ export default function Reports({ user }) {
                     </button>
                   </div>
                   <div style={{
-                    maxHeight: '82px',
+                    maxHeight: '120px',
                     overflowY: 'auto',
                     border: '1px solid var(--border)',
                     borderRadius: 'var(--radius-sm)',
@@ -702,11 +721,15 @@ export default function Reports({ user }) {
                     }}
                   >
                     {/* Document Header */}
-                    <div style={{ borderBottom: `2.5px solid ${settings.templateHeaderColor || '#0F172A'}`, paddingBottom: '16px', marginBottom: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                    <div style={{ borderBottom: `2.5px solid ${activeTemplate?.header_color || '#0F172A'}`, paddingBottom: '16px', marginBottom: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                       <div>
-                        {settings.templateLogoText && (
-                          <div style={{ fontSize: '0.72rem', fontWeight: 800, color: settings.templateHeaderColor || '#2563EB', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '4px' }}>
-                            {settings.templateLogoText}
+                        {activeTemplate?.logo_text ? (
+                          <div style={{ fontSize: '0.72rem', fontWeight: 800, color: activeTemplate.header_color || '#2563EB', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '4px' }}>
+                            {activeTemplate.logo_text}
+                          </div>
+                        ) : (
+                          <div style={{ fontSize: '0.72rem', fontWeight: 800, color: '#2563EB', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '4px' }}>
+                            Skadomation System
                           </div>
                         )}
                         <h2 style={{ fontSize: '1.25rem', margin: '0 0 4px', color: '#0F172A', fontWeight: 800 }}>
@@ -734,64 +757,113 @@ export default function Reports({ user }) {
                       </div>
                     ) : (
                       <>
-                        {/* Statistics summaries */}
-                        <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '8px', borderBottom: '1px solid #CBD5E1', paddingBottom: '3px' }}>
-                          Parameter Summary Table
+                        {/* ── EXECUTIVE SUMMARY KPI CARDS ── */}
+                        <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '10px', borderBottom: '2px solid #1E3A5F', paddingBottom: '4px' }}>
+                          Executive Summary
                         </h4>
-                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem', marginBottom: '24px' }}>
+                        <div className="reports-stats-grid">
+                          {[
+                            { label: 'Total Records', value: selectedReport.data.totalRowsCount.toLocaleString(), color: '#1E40AF' },
+                            { label: 'Total Tags', value: String(selectedReport.data.summaries.length), color: '#065F46' },
+                            { label: 'Avg / Day', value: (selectedReport.data.avgRecordsPerDay || 0).toLocaleString(), color: '#7C3AED' },
+                            { label: 'Period (Days)', value: String(selectedReport.data.daysInRange || '—'), color: '#92400E' },
+                          ].map((kpi) => (
+                            <div key={kpi.label} style={{ background: '#F8FAFC', border: `1px solid #E2E8F0`, borderTop: `3px solid ${kpi.color}`, borderRadius: '6px', padding: '12px 14px' }}>
+                              <div style={{ fontSize: '0.62rem', fontWeight: 700, textTransform: 'uppercase', color: '#64748B', letterSpacing: '0.06em', marginBottom: '4px' }}>{kpi.label}</div>
+                              <div style={{ fontSize: '1.3rem', fontWeight: 800, color: kpi.color }}>{kpi.value}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* ── TAG SUMMARY TABLE ── */}
+                        <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '8px', borderBottom: '2px solid #1E3A5F', paddingBottom: '4px' }}>
+                          Tag Summary Table
+                        </h4>
+                        <table className="table responsive-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem', marginBottom: '24px' }}>
                           <thead>
-                            <tr style={{ backgroundColor: '#F1F5F9', borderBottom: '1.5px solid #0F172A' }}>
-                              {['Index', 'Tag Name', 'Unit', 'Current', 'Min', 'Max', 'Average', 'Samples', 'Quality', 'Trend'].map(h => (
-                                <th key={h} style={{ padding: '6px 8px', textAlign: ['Current', 'Min', 'Max', 'Average', 'Samples'].includes(h) ? 'right' : 'left', color: '#0F172A', fontWeight: 700 }}>{h}</th>
+                            <tr style={{ backgroundColor: '#1E3A5F', color: '#FFFFFF' }}>
+                              {['Idx', 'Tag Name', 'Unit', 'Min', 'Max', 'Average', 'Last Value', 'Records', 'Quality', 'Trend'].map(h => (
+                                <th key={h} style={{ padding: '7px 8px', textAlign: ['Min', 'Max', 'Average', 'Last Value', 'Records'].includes(h) ? 'right' : 'left', fontWeight: 700, fontSize: '0.68rem' }}>{h}</th>
                               ))}
                             </tr>
                           </thead>
                           <tbody>
                             {selectedReport.data.summaries.map((s, idx) => (
-                              <tr key={idx} style={{ borderBottom: '1px solid #E2E8F0' }}>
-                                <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontWeight: 600 }}>{s.tagIndex}</td>
-                                <td style={{ padding: '6px 8px', fontWeight: 500 }}>{s.tagName}</td>
-                                <td style={{ padding: '6px 8px', color: '#64748B' }}>{s.unit || '—'}</td>
-                                <td style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 700 }}>{s.count > 0 ? s.current.toFixed(s.decimalPlaces) : '—'}</td>
-                                <td style={{ padding: '6px 8px', textAlign: 'right', color: '#475569' }}>{s.count > 0 ? s.min.toFixed(s.decimalPlaces) : '—'}</td>
-                                <td style={{ padding: '6px 8px', textAlign: 'right', color: '#475569' }}>{s.count > 0 ? s.max.toFixed(s.decimalPlaces) : '—'}</td>
-                                <td style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 500 }}>{s.count > 0 ? s.avg.toFixed(s.decimalPlaces) : '—'}</td>
-                                <td style={{ padding: '6px 8px', textAlign: 'right', color: '#475569' }}>{s.count}</td>
-                                <td style={{ padding: '6px 8px', fontWeight: 700, color: s.goodPct > 98 ? '#16A34A' : '#D97706' }}>{s.goodPct.toFixed(1)}%</td>
-                                <td style={{ padding: '2px 8px', textAlign: 'center' }}>{generateReportSparkline(s.sparkPoints)}</td>
+                              <tr key={idx} style={{ borderBottom: '1px solid #E2E8F0', background: idx % 2 === 0 ? '#FFFFFF' : '#F0F4FA' }}>
+                                <td data-label="Idx" style={{ padding: '6px 8px', fontFamily: 'monospace', fontWeight: 700, fontSize: '0.68rem' }}>{s.tagIndex}</td>
+                                <td data-label="Tag Name" style={{ padding: '6px 8px', fontWeight: 600 }}>{s.tagName}</td>
+                                <td data-label="Unit" style={{ padding: '6px 8px', color: '#64748B' }}>{s.unit || '—'}</td>
+                                <td data-label="Min" style={{ padding: '6px 8px', textAlign: 'right', color: '#475569' }}>{s.min != null ? s.min.toFixed(s.decimalPlaces) : '—'}</td>
+                                <td data-label="Max" style={{ padding: '6px 8px', textAlign: 'right', color: '#475569' }}>{s.max != null ? s.max.toFixed(s.decimalPlaces) : '—'}</td>
+                                <td data-label="Average" style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 600 }}>{s.avg != null ? s.avg.toFixed(s.decimalPlaces) : '—'}</td>
+                                <td data-label="Last Value" style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 700, color: '#1E3A5F' }}>{s.current != null ? s.current.toFixed(s.decimalPlaces) : '—'}</td>
+                                <td data-label="Records" style={{ padding: '6px 8px', textAlign: 'right', color: '#475569' }}>{s.count.toLocaleString()}</td>
+                                <td data-label="Quality" style={{ padding: '6px 8px', fontWeight: 700, color: s.goodPct != null && s.goodPct > 98 ? '#16A34A' : '#D97706' }}>{s.goodPct != null ? s.goodPct.toFixed(1) + '%' : '—'}</td>
+                                <td data-label="Trend" style={{ padding: '2px 8px', textAlign: 'center' }}>{generateReportSparkline(s.sparkPoints)}</td>
                               </tr>
                             ))}
                           </tbody>
                         </table>
 
-                        {/* Incidents Table */}
-                        <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '8px', borderBottom: '1px solid #CBD5E1', paddingBottom: '3px' }}>
-                          Quality Dropped &amp; Fault Log
+                        {/* ── STATISTICAL ANALYSIS ── */}
+                        <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '10px', borderBottom: '2px solid #1E3A5F', paddingBottom: '4px' }}>
+                          Statistical Analysis
+                        </h4>
+                        <div style={{ marginBottom: '24px' }}>
+                          {selectedReport.data.summaries.map((s, si) => (
+                            <div key={si} style={{ marginBottom: '12px', border: '1px solid #E2E8F0', borderRadius: '6px', overflow: 'hidden' }}>
+                              <div style={{ background: '#3B82F6', color: '#FFFFFF', padding: '6px 12px', fontSize: '0.72rem', fontWeight: 700 }}>
+                                T{s.tagIndex} — {s.tagName} {s.unit ? `[${s.unit}]` : ''}
+                              </div>
+                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', background: si % 2 === 0 ? '#F8FAFC' : '#FFFFFF' }}>
+                                {[
+                                  ['Minimum', s.min != null ? s.min.toFixed(s.decimalPlaces) : '—'],
+                                  ['Maximum', s.max != null ? s.max.toFixed(s.decimalPlaces) : '—'],
+                                  ['Average', s.avg != null ? s.avg.toFixed(s.decimalPlaces) : '—'],
+                                  ['Std Deviation', s.stdDev != null ? s.stdDev.toFixed(s.decimalPlaces) : '—'],
+                                  ['Total Samples', s.count.toLocaleString()],
+                                  ['Quality Index', s.goodPct != null ? s.goodPct.toFixed(1) + '%' : '—'],
+                                  ['First Sample', s.firstSampleTime ? new Date(s.firstSampleTime).toLocaleString() : '—'],
+                                  ['Last Sample', s.lastSampleTime ? new Date(s.lastSampleTime).toLocaleString() : '—'],
+                                ].map(([label, val], ii) => (
+                                  <div key={ii} style={{ padding: '8px 12px', borderRight: ii % 4 !== 3 ? '1px solid #E2E8F0' : 'none', borderTop: ii >= 4 ? '1px solid #E2E8F0' : 'none' }}>
+                                    <div style={{ fontSize: '0.6rem', fontWeight: 700, textTransform: 'uppercase', color: '#64748B', letterSpacing: '0.05em', marginBottom: '2px' }}>{label}</div>
+                                    <div style={{ fontSize: '0.82rem', fontWeight: 700, color: '#0F172A', fontFamily: 'monospace' }}>{val}</div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* ── INCIDENTS LOG ── */}
+                        <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '8px', borderBottom: '2px solid #1E3A5F', paddingBottom: '4px' }}>
+                          Quality &amp; Fault Events
                         </h4>
                         {selectedReport.data.incidents.length === 0 ? (
-                          <p style={{ fontSize: '0.76rem', fontStyle: 'italic', color: '#64748B', marginBottom: '24px' }}>
-                            Zero anomalies or system failures recorded in this reporting range.
-                          </p>
+                          <div style={{ background: '#F0FDF4', border: '1px solid #86EFAC', borderRadius: '6px', padding: '10px 14px', fontSize: '0.76rem', color: '#15803D', marginBottom: '24px' }}>
+                            ✅ Zero anomalies or system failures recorded in this reporting range.
+                          </div>
                         ) : (
-                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem', marginBottom: '24px' }}>
+                          <table className="responsive-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem', marginBottom: '24px' }}>
                             <thead>
-                              <tr style={{ backgroundColor: '#FEF9F1', borderBottom: '1px solid #D97706' }}>
-                                {['Timestamp', 'Tag Reference', 'Value', 'Quality Status', 'Message Flag'].map(h => (
-                                  <th key={h} style={{ padding: '6px 8px', textAlign: h === 'Value' ? 'right' : 'left', color: '#0F172A', fontWeight: 700 }}>{h}</th>
+                              <tr style={{ backgroundColor: '#1E3A5F', color: '#FFFFFF' }}>
+                                {['Timestamp', 'Tag Reference', 'Value', 'Quality Status', 'Event Flag'].map(h => (
+                                  <th key={h} style={{ padding: '7px 8px', textAlign: h === 'Value' ? 'right' : 'left', fontWeight: 700, fontSize: '0.68rem' }}>{h}</th>
                                 ))}
                               </tr>
                             </thead>
                             <tbody>
                               {selectedReport.data.incidents.map((inc, iIdx) => (
-                                <tr key={iIdx} style={{ borderBottom: '1px solid #E2E8F0' }}>
-                                  <td style={{ padding: '5px 8px', fontFamily: 'monospace' }}>{new Date(inc.timestamp).toLocaleString()}</td>
-                                  <td style={{ padding: '5px 8px' }}>Tag {inc.tagIndex}: {inc.tagName}</td>
-                                  <td style={{ padding: '5px 8px', textAlign: 'right', fontWeight: 700, color: '#DC2626' }}>{inc.val}</td>
-                                  <td style={{ padding: '5px 8px', color: inc.status === 192 ? '#16A34A' : '#DC2626', fontWeight: 600 }}>
+                                <tr key={iIdx} style={{ borderBottom: '1px solid #E2E8F0', background: iIdx % 2 === 0 ? '#FFFFFF' : '#FEF9F1' }}>
+                                  <td data-label="Timestamp" style={{ padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.68rem' }}>{new Date(inc.timestamp).toLocaleString()}</td>
+                                  <td data-label="Tag Reference" style={{ padding: '5px 8px' }}>T{inc.tagIndex}: {inc.tagName}</td>
+                                  <td data-label="Value" style={{ padding: '5px 8px', textAlign: 'right', fontWeight: 700, color: '#DC2626' }}>{inc.val}</td>
+                                  <td data-label="Quality Status" style={{ padding: '5px 8px', color: inc.status === 192 ? '#16A34A' : '#DC2626', fontWeight: 600 }}>
                                     {inc.status === 192 ? 'Good' : `Bad (${inc.status})`}
                                   </td>
-                                  <td style={{ padding: '5px 8px' }}>
-                                    <span style={{ backgroundColor: '#FEE2E2', color: '#991B1B', padding: '1px 5px', borderRadius: '3px', fontWeight: 700, fontSize: '0.66rem' }}>
+                                  <td data-label="Event Flag" style={{ padding: '5px 8px' }}>
+                                    <span style={{ backgroundColor: '#FEE2E2', color: '#991B1B', padding: '2px 6px', borderRadius: '4px', fontWeight: 700, fontSize: '0.65rem' }}>
                                       {inc.marker}
                                     </span>
                                   </td>
@@ -801,32 +873,36 @@ export default function Reports({ user }) {
                           </table>
                         )}
 
-                        {/* Chronological Table */}
-                        <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '8px', borderBottom: '1px solid #CBD5E1', paddingBottom: '3px' }}>
-                          Telemetry Event Stream <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: '#64748B' }}>(limit 300 rows)</span>
+                        {/* ── RAW HISTORIAN DATA APPENDIX ── */}
+                        <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '8px', borderBottom: '2px solid #1E3A5F', paddingBottom: '4px' }}>
+                          Raw Historian Data Appendix{' '}
+                          <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: '#64748B', fontSize: '0.68rem' }}>
+                            ({selectedReport.data.rows.length.toLocaleString()} records shown{selectedReport.data.totalRowsCount > 10000 ? ` of ${selectedReport.data.totalRowsCount.toLocaleString()} total — full dataset in Excel export` : ''})
+                          </span>
                         </h4>
-                        <div style={{ maxHeight: '180px', overflowY: 'auto', border: '1px solid #E2E8F0', borderRadius: '4px' }} className="no-scroll-print">
-                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem' }}>
-                            <thead style={{ position: 'sticky', top: 0, background: '#F1F5F9', borderBottom: '1px solid #CBD5E1' }}>
+                        <div style={{ maxHeight: '300px', overflowY: 'auto', border: '1px solid #E2E8F0', borderRadius: '6px' }} className="no-scroll-print">
+                          <table className="responsive-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.68rem' }}>
+                            <thead style={{ position: 'sticky', top: 0, background: '#1E3A5F' }}>
                               <tr>
-                                {['Timestamp', 'Index', 'Tag Name', 'Value', 'Quality', 'Flag'].map(h => (
-                                  <th key={h} style={{ padding: '5px 8px', textAlign: h === 'Value' ? 'right' : 'left', color: '#0F172A', fontWeight: 700 }}>{h}</th>
+                                {['DateAndTime', 'Idx', 'Tag Name', 'Value', 'Status', 'Marker'].map(h => (
+                                  <th key={h} style={{ padding: '6px 8px', textAlign: h === 'Value' ? 'right' : 'left', color: '#FFFFFF', fontWeight: 700, fontSize: '0.66rem' }}>{h}</th>
                                 ))}
                               </tr>
                             </thead>
                             <tbody>
                               {selectedReport.data.rows.map((row, rIdx) => {
-                                const cfg = tagMap[row.TagIndex] || { TagName: `Tag ${row.TagIndex}`, DecimalPlaces: 2 };
+                                const cfg = tagMap[row.TagIndex] || { TagName: row.TagName || `Tag ${row.TagIndex}`, DecimalPlaces: 2 };
+                                const statusGood = row.Status === 192;
                                 return (
-                                  <tr key={rIdx} style={{ borderBottom: '1px solid #F1F5F9', background: rIdx % 2 === 0 ? '#FFFFFF' : '#F8FAFC' }}>
-                                    <td style={{ padding: '4px 8px', fontFamily: 'monospace' }}>{new Date(row.DateAndTime).toLocaleString()}</td>
-                                    <td style={{ padding: '4px 8px', fontFamily: 'monospace', fontWeight: 600 }}>{row.TagIndex}</td>
-                                    <td style={{ padding: '4px 8px' }}>{cfg.TagName}</td>
-                                    <td style={{ padding: '4px 8px', textAlign: 'right', fontWeight: 700 }}>{row.Val.toFixed(cfg.DecimalPlaces)}</td>
-                                    <td style={{ padding: '4px 8px', color: row.Status === 192 ? '#16A34A' : '#DC2626', fontWeight: 500 }}>
-                                      {row.Status === 192 ? 'Good' : 'Bad'}
+                                  <tr key={rIdx} style={{ borderBottom: '1px solid #F1F5F9', background: rIdx % 2 === 0 ? '#FFFFFF' : '#F0F4FA' }}>
+                                    <td data-label="DateAndTime" style={{ padding: '4px 8px', fontFamily: 'monospace', fontSize: '0.66rem' }}>{new Date(row.DateAndTime).toLocaleString()}</td>
+                                    <td data-label="Idx" style={{ padding: '4px 8px', fontFamily: 'monospace', fontWeight: 700, color: '#1E3A5F' }}>{row.TagIndex}</td>
+                                    <td data-label="Tag Name" style={{ padding: '4px 8px' }}>{row.TagName || cfg.TagName}</td>
+                                    <td data-label="Value" style={{ padding: '4px 8px', textAlign: 'right', fontWeight: 700 }}>{row.Val != null ? Number(row.Val).toFixed(cfg.DecimalPlaces) : '—'}</td>
+                                    <td data-label="Status" style={{ padding: '4px 8px', color: statusGood ? '#16A34A' : '#DC2626', fontWeight: 600 }}>
+                                      {statusGood ? 'Good' : `Bad(${row.Status})`}
                                     </td>
-                                    <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: '#64748B' }}>{row.Marker || '—'}</td>
+                                    <td data-label="Marker" style={{ padding: '4px 8px', fontFamily: 'monospace', color: '#64748B' }}>{row.Marker || '—'}</td>
                                   </tr>
                                 );
                               })}
@@ -837,26 +913,31 @@ export default function Reports({ user }) {
                     )}
 
                     {/* Document Footer */}
-                    <div style={{ marginTop: '36px', paddingTop: '10px', borderTop: `1.5px solid ${settings.templateHeaderColor || '#0F172A'}`, textAlign: 'center', fontSize: '0.67rem', color: '#64748B' }}>
-                      {settings.templateFooterText || 'CONFIDENTIAL — AUTOMATED REPORT DISPATCHED BY SKADOMATION HISTORIAN MODULE.'}
+                    <div style={{ marginTop: '36px', paddingTop: '10px', borderTop: `1.5px solid ${activeTemplate?.header_color || '#0F172A'}`, textAlign: 'center', fontSize: '0.67rem', color: '#64748B' }}>
+                      {activeTemplate?.footer_text || 'CONFIDENTIAL — AUTOMATED REPORT DISPATCHED BY SKADOMATION HISTORIAN MODULE.'}
                     </div>
                   </div>
 
                   {/* Panel 3: Bottom Action buttons */}
-                  <div className="card" style={{ marginTop: '16px', padding: '12px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                      Ready to distribute: <strong>{selectedReport.meta.name}</strong>
-                    </span>
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                      <button onClick={handlePrint} className="btn btn-secondary">
-                        🖨️ Export PDF / Print
+                  <div className="card" style={{ marginTop: '16px', padding: '12px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                      <strong style={{ color: 'var(--text)' }}>{selectedReport.meta.name}</strong>
+                      <span style={{ marginLeft: '12px', background: 'rgba(59,130,246,0.12)', color: '#3B82F6', padding: '2px 8px', borderRadius: '4px', fontSize: '0.7rem', fontWeight: 700 }}>
+                        {selectedReport.data.totalRowsCount.toLocaleString()} records · {selectedReport.data.summaries.length} tags
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      <button onClick={handlePrint} className="btn btn-secondary" style={{ fontSize: '0.8rem' }}>
+                        🖨️ Print / PDF
                       </button>
-                      <button onClick={() => handleExportCSV(selectedReport.meta)} className="btn btn-secondary">
-                        📥 Download CSV
+                      <button onClick={() => handleExportCSV(selectedReport.meta)} className="btn btn-secondary" style={{ fontSize: '0.8rem' }}>
+                        📥 CSV (Full)
                       </button>
-                      <button onClick={handleOpenEmailPrompt} className="btn btn-primary">
-                        ✉️ Email Report
-                      </button>
+                      {!isReadOnly && (
+                        <button onClick={handleOpenEmailPrompt} className="btn btn-primary" style={{ fontSize: '0.8rem' }}>
+                          ✉️ Email Report
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -870,7 +951,7 @@ export default function Reports({ user }) {
           <div className="card" style={{ padding: '24px' }}>
             <span className="section-label">Report Compilation History</span>
             <div className="table-responsive">
-              <table className="table">
+              <table className="table responsive-table">
                 <thead>
                   <tr>
                     <th>Report Name</th>
@@ -890,11 +971,11 @@ export default function Reports({ user }) {
                   ) : (
                     reportsList.map((item) => (
                       <tr key={item.id}>
-                        <td className="font-semibold" style={{ color: 'var(--text)' }}>{item.name}</td>
-                        <td style={{ fontSize: '0.82rem' }}>{item.type || 'Historian Shift Summary'}</td>
-                        <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{item.dateInfo}</td>
-                        <td className="font-mono text-xs">{item.generatedAt}</td>
-                        <td style={{ textAlign: 'right' }}>
+                        <td data-label="Report Name" className="font-semibold" style={{ color: 'var(--text)' }}>{item.name}</td>
+                        <td data-label="Report Type" style={{ fontSize: '0.82rem' }}>{item.type || 'Historian Shift Summary'}</td>
+                        <td data-label="Date boundary scope" style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{item.dateInfo}</td>
+                        <td data-label="Compiled Timestamp" className="font-mono text-xs">{item.generatedAt}</td>
+                        <td data-label="Actions" style={{ textAlign: 'right' }}>
                           <div style={{ display: 'inline-flex', gap: '6px' }}>
                             <button onClick={() => handleViewReport(item)} className="btn btn-secondary btn-sm">
                               👁️ View Workspace
@@ -902,9 +983,11 @@ export default function Reports({ user }) {
                             <button onClick={() => handleExportCSV(item)} className="btn btn-secondary btn-sm">
                               📥 CSV
                             </button>
-                            <button onClick={() => handleDeleteReport(item.id)} className="btn btn-danger btn-sm">
-                              🗑️
-                            </button>
+                            {!isReadOnly && (
+                              <button onClick={() => handleDeleteReport(item.id)} className="btn btn-danger btn-sm">
+                                🗑️
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
@@ -916,160 +999,7 @@ export default function Reports({ user }) {
           </div>
         )}
 
-        {/* TAB 3: Template & Delivery Settings */}
-        {activeTab === 'settings' && isConfigAllowed && (
-          <div className="card" style={{ padding: '28px', maxWidth: '800px', margin: '0 auto' }}>
-            <span className="section-label">Template & Delivery Configurations</span>
-            <form onSubmit={handleSaveSettings} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              
-              {/* Delivery Configurations */}
-              <div>
-                <h4 style={{ fontSize: '0.88rem', color: 'var(--text)', marginBottom: '12px', borderBottom: '1px solid var(--border)', paddingBottom: '6px' }}>
-                  📧 Report Delivery & Recipients
-                </h4>
-                <div className="form-group">
-                  <label className="form-label" htmlFor="email-recipients">Default Recipients (comma-separated)</label>
-                  <input
-                    id="email-recipients"
-                    className="form-control"
-                    placeholder="recipient1@plant.com, recipient2@plant.com"
-                    value={settings.emailRecipients}
-                    onChange={(e) => setSettings({ ...settings, emailRecipients: e.target.value })}
-                  />
-                  <span className="form-hint">These recipients will receive the compiled documents by default upon dispatch triggers.</span>
-                </div>
-              </div>
-
-              {/* Template Configurations */}
-              <div>
-                <h4 style={{ fontSize: '0.88rem', color: 'var(--text)', marginBottom: '12px', borderBottom: '1px solid var(--border)', paddingBottom: '6px' }}>
-                  📄 PDF Template Logo & Footer
-                </h4>
-                <div className="form-row">
-                  <div className="form-group">
-                    <label className="form-label" htmlFor="logo-text">Company / Plant Logo Header</label>
-                    <input
-                      id="logo-text"
-                      className="form-control"
-                      placeholder="DETROIT INDUSTRIAL HISTORIAN INC"
-                      value={settings.templateLogoText}
-                      onChange={(e) => setSettings({ ...settings, templateLogoText: e.target.value })}
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label" htmlFor="header-color">PDF Theme Color</label>
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                      <input
-                        id="header-color"
-                        type="color"
-                        className="form-control"
-                        value={settings.templateHeaderColor || '#0A0F1E'}
-                        onChange={(e) => setSettings({ ...settings, templateHeaderColor: e.target.value })}
-                        style={{ width: '48px', padding: '0 2px', height: '42px', cursor: 'pointer' }}
-                      />
-                      <input
-                        className="form-control"
-                        value={settings.templateHeaderColor || '#0A0F1E'}
-                        onChange={(e) => setSettings({ ...settings, templateHeaderColor: e.target.value })}
-                        style={{ fontFamily: 'monospace' }}
-                      />
-                    </div>
-                  </div>
-                </div>
-                <div className="form-group">
-                  <label className="form-label" htmlFor="footer-text">PDF Footer Compliance Text</label>
-                  <textarea
-                    id="footer-text"
-                    className="form-control"
-                    placeholder="This report contains confidential process logs. System compliance code..."
-                    value={settings.templateFooterText}
-                    onChange={(e) => setSettings({ ...settings, templateFooterText: e.target.value })}
-                    style={{ minHeight: '60px' }}
-                  />
-                </div>
-              </div>
-
-              {/* SMTP Configurations */}
-              <div>
-                <h4 style={{ fontSize: '0.88rem', color: 'var(--text)', marginBottom: '12px', borderBottom: '1px solid var(--border)', paddingBottom: '6px' }}>
-                  ⚙️ Global SMTP Mail Server Config
-                </h4>
-                <div className="form-row">
-                  <div className="form-group" style={{ flex: 2 }}>
-                    <label className="form-label" htmlFor="smtp-host">SMTP Relay Host</label>
-                    <input
-                      id="smtp-host"
-                      className="form-control"
-                      placeholder="smtp.industrialcloud.com"
-                      value={settings.smtpHost}
-                      onChange={(e) => setSettings({ ...settings, smtpHost: e.target.value })}
-                    />
-                  </div>
-                  <div className="form-group" style={{ flex: 1 }}>
-                    <label className="form-label" htmlFor="smtp-port">Relay Port</label>
-                    <input
-                      id="smtp-port"
-                      type="number"
-                      className="form-control"
-                      placeholder="587"
-                      value={settings.smtpPort}
-                      onChange={(e) => setSettings({ ...settings, smtpPort: e.target.value })}
-                    />
-                  </div>
-                </div>
-                <div className="form-row">
-                  <div className="form-group">
-                    <label className="form-label" htmlFor="smtp-user">Auth Username</label>
-                    <input
-                      id="smtp-user"
-                      className="form-control"
-                      placeholder="alerts@industrialcloud.com"
-                      value={settings.smtpUser}
-                      onChange={(e) => setSettings({ ...settings, smtpUser: e.target.value })}
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label" htmlFor="smtp-pass">Auth Password</label>
-                    <input
-                      id="smtp-pass"
-                      type="password"
-                      className="form-control"
-                      placeholder="••••••••••••"
-                      value={settings.smtpPass}
-                      onChange={(e) => setSettings({ ...settings, smtpPass: e.target.value })}
-                    />
-                  </div>
-                </div>
-                <div className="form-group">
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '4px' }}>
-                    <input
-                      type="checkbox"
-                      checked={settings.smtpSecure}
-                      onChange={(e) => {
-                        const isSecure = e.target.checked;
-                        setSettings({
-                          ...settings,
-                          smtpSecure: isSecure,
-                          smtpPort: isSecure ? 465 : 587
-                        });
-                      }}
-                      style={{ width: '15px', height: '15px', accentColor: 'var(--secondary)' }}
-                    />
-                    Enable Direct SSL/TLS Encryption (Port 465) instead of STARTTLS (Port 587)
-                  </label>
-                </div>
-              </div>
-
-              {/* Submit Action */}
-              <div style={{ marginTop: '8px' }}>
-                <button type="submit" className="btn btn-primary" style={{ width: '100%', height: '42px' }}>
-                  💾 Save Template & Delivery Settings
-                </button>
-              </div>
-
-            </form>
-          </div>
-        )}
+        {/* Tab 3 Settings panel removed in favor of Settings Module redesign */}
 
       </div>
 
@@ -1081,6 +1011,49 @@ export default function Reports({ user }) {
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '18px', lineHeight: 1.5 }}>
               Send a copy of the compiled report <strong>{selectedReport.meta.name}</strong> as an email attachment.
             </p>
+
+            {/* Select Template dropdown */}
+            <div style={{ marginBottom: '18px' }} className="form-group">
+              <label className="form-label" htmlFor="select-template">Select Email Template</label>
+              <select
+                id="select-template"
+                className="form-control"
+                value={selectedTemplateId}
+                onChange={(e) => handleTemplateChange(e.target.value)}
+                style={{ height: '36px', fontSize: '0.82rem' }}
+              >
+                <option value="">-- System Default --</option>
+                {templatesList.map(t => (
+                  <option key={t.id} value={t.id}>
+                    {t.name} {t.is_default ? '(Default)' : ''} ({t.report_type})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Email Subject input */}
+            <div style={{ marginBottom: '18px' }} className="form-group">
+              <label className="form-label" htmlFor="email-subject">Email Subject</label>
+              <input
+                id="email-subject"
+                className="form-control"
+                value={emailSubject}
+                onChange={(e) => setEmailSubject(e.target.value)}
+                style={{ height: '36px', fontSize: '0.82rem' }}
+              />
+            </div>
+
+            {/* Email Message input */}
+            <div style={{ marginBottom: '18px' }} className="form-group">
+              <label className="form-label" htmlFor="email-message">Email Body Message</label>
+              <textarea
+                id="email-message"
+                className="form-control"
+                value={emailMessage}
+                onChange={(e) => setEmailMessage(e.target.value)}
+                style={{ minHeight: '100px', fontSize: '0.82rem', lineHeight: 1.5 }}
+              />
+            </div>
             
             {/* Recipient selection list */}
             <div style={{ marginBottom: '18px' }}>
@@ -1234,8 +1207,8 @@ export default function Reports({ user }) {
       {emailSuccessToast && (
         <div style={{
           position: 'fixed',
-          bottom: '24px',
-          right: '24px',
+          bottom: '80px',
+          right: '28px',
           backgroundColor: 'var(--success-bg)',
           border: '1px solid var(--success-border)',
           borderRadius: 'var(--radius-sm)',

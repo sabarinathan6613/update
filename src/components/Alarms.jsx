@@ -166,7 +166,7 @@ export default function Alarms() {
           <p className="text-xs text-muted" style={{ marginBottom: '16px' }}>Current unacknowledged stops or parameter deviations requiring supervisor verification.</p>
 
           <div className="table-responsive">
-            <table className="table">
+            <table className="table responsive-table">
               <thead>
                 <tr>
                   <th>Severity</th>
@@ -186,7 +186,7 @@ export default function Alarms() {
                 ) : (
                   filteredActiveAlarms.map((alarm, idx) => (
                     <tr key={idx} style={{ animation: 'pulse-red 2s infinite' }}>
-                      <td>
+                      <td data-label="Severity">
                         <span className={`badge ${
                           alarm.severity === 'CRITICAL' ? 'severity-critical' : 
                           alarm.severity === 'WARNING' ? 'severity-warning' : 'severity-info'
@@ -194,10 +194,10 @@ export default function Alarms() {
                           ⚠️ {alarm.severity}
                         </span>
                       </td>
-                      <td className="font-mono text-xs" style={{ color: 'var(--text)' }}>{alarm.time}</td>
-                      <td className="font-semibold" style={{ color: 'var(--text)' }}>{alarm.reason}</td>
-                      <td>{plantsList.find(p => p.id === alarm.plantId)?.name}</td>
-                      <td>
+                      <td data-label="Incident Trigger Time" className="font-mono text-xs" style={{ color: 'var(--text)' }}>{alarm.time}</td>
+                      <td data-label="Alarm Tag / Message" className="font-semibold" style={{ color: 'var(--text)' }}>{alarm.reason}</td>
+                      <td data-label="Plant Location Node">{plantsList.find(p => p.id === alarm.plantId)?.name}</td>
+                      <td data-label="Action Trigger">
                         <button onClick={() => handleAcknowledge(alarm.id)} className="btn btn-primary text-xs" style={{ padding: '4px 8px' }}>
                           ✓ Acknowledge
                         </button>
@@ -218,7 +218,7 @@ export default function Alarms() {
           <p className="text-xs text-muted" style={{ marginBottom: '16px' }}>Audited history of downtime incidents, register codes, and resolutions.</p>
 
           <div className="table-responsive">
-            <table className="table">
+            <table className="table responsive-table">
               <thead>
                 <tr>
                   <th>Incident Time</th>
@@ -238,15 +238,15 @@ export default function Alarms() {
                 ) : (
                   filteredHistoryAlarms.map((alarm, idx) => (
                     <tr key={idx}>
-                      <td className="font-mono text-xs">{alarm.timestamp.replace('T', ' ').substring(0, 16)}</td>
-                      <td>
+                      <td data-label="Incident Time" className="font-mono text-xs">{alarm.timestamp.replace('T', ' ').substring(0, 16)}</td>
+                      <td data-label="Severity">
                         <span className={`badge ${alarm.severity === 'CRITICAL' ? 'severity-critical' : 'severity-warning'}`}>
                           {alarm.severity}
                         </span>
                       </td>
-                      <td className="font-semibold" style={{ color: 'var(--text)' }}>{alarm.reason}</td>
-                      <td>{alarm.shift}</td>
-                      <td className="font-mono text-xs">-{alarm.duration} mins</td>
+                      <td data-label="Downtime Alarm Description" className="font-semibold" style={{ color: 'var(--text)' }}>{alarm.reason}</td>
+                      <td data-label="Active Shift">{alarm.shift}</td>
+                      <td data-label="Duration (Mins)" className="font-mono text-xs">-{alarm.duration} mins</td>
                     </tr>
                   ))
                 )}

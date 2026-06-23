@@ -55,10 +55,9 @@ export function getSupabaseAdminClient() {
   const config = getSupabaseConfig();
   if (!config) return null;
 
-  // Read service role key from env or fallback to provided service role key for local dev
+  // Read service role key from env
   const serviceKey = (
-    import.meta.env.VITE_SUPABASE_SERVICE_ROLE_KEY || 
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRkd2NlbnBhZnJwd2huenN3bG91Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTE1NDM4MSwiZXhwIjoyMDk2NzMwMzgxfQ.rq73IckDa6_vA3RQJuDg7AAcGI32stC6ILhKVilRHz0'
+    import.meta.env.VITE_SUPABASE_SERVICE_ROLE_KEY || ''
   ).trim();
 
   if (!serviceKey) return null;

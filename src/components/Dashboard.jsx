@@ -1,6 +1,6 @@
 // src/components/Dashboard.jsx
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { getHistorianData, getTagConfigs, getSettings } from '../utils/db';
+import { getHistorianData, getTagConfigs } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -166,16 +166,7 @@ function KpiCard({ kpi, accentColor }) {
       )}
 
       {/* Statistics Grid (Min, Max, Avg, Records) */}
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(4, 1fr)',
-        gap: '8px',
-        padding: '10px',
-        background: 'var(--surface-raised)',
-        borderRadius: 'var(--radius-sm)',
-        border: '1px solid var(--border-subtle)',
-        textAlign: 'center'
-      }}>
+      <div className="tag-stats-grid">
         <div style={{ borderRight: '1px solid var(--border-subtle)' }}>
           <div style={{ fontSize: '0.62rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.03em' }}>Min</div>
           <div className="font-mono" style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)', marginTop: '2px' }}>
@@ -282,7 +273,6 @@ export default function Dashboard({ onNavigate }) {
   const [tagConfigs, setTagConfigs]         = useState([]);
   const [historianRecords, setHistorianRecords] = useState([]);
   const [loading, setLoading]               = useState(true);
-  const [settings, setSettings]             = useState({});
   const [totalRecordsCount, setTotalRecordsCount] = useState(0);
   const [latestIngestionTime, setLatestIngestionTime] = useState(null);
 
@@ -309,10 +299,6 @@ export default function Dashboard({ onNavigate }) {
       // Filter historian records to only include dashboard tags
       const filteredRecords = allData.filter(r => dashboardTagIndexes.includes(r.TagIndex));
       setHistorianRecords(filteredRecords);
-
-      // 3. Fetch settings
-      const sysSettings = await getSettings();
-      setSettings(sysSettings);
     } catch (err) {
       console.error('Failed to load dashboard data:', err);
     } finally {
@@ -340,12 +326,6 @@ export default function Dashboard({ onNavigate }) {
     return activeIndexes.size;
   }, [historianRecords]);
 
-  // ── Tag Map ───────────────────────────────────────────────────────────────
-  const tagMap = useMemo(() => {
-    const map = {};
-    tagConfigs.forEach(c => { map[c.TagIndex] = c; });
-    return map;
-  }, [tagConfigs]);
 
   // ── dashboardTags (visible tag indexes) ───────────────────────────────────
   const dashboardTagIndexes = useMemo(() => {

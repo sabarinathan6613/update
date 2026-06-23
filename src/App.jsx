@@ -13,7 +13,7 @@ import CloudSync from './components/CloudSync';
 import Explorer from './components/Explorer';
 import TagConfig from './components/TagConfig';
 import ForgotPassword from './components/ForgotPassword';
-import { getSettings, getTagConfigs, addAuditLog } from './utils/db';
+import { getSettings, getTagConfigs, addAuditLog, invalidateCache } from './utils/db';
 
 // ─── Path-based routing ────────────────────────────────────────────────────────
 // Check the URL pathname and render the matching standalone auth page.
@@ -206,6 +206,7 @@ function AppContent() {
 
   const handleLogout = useCallback(async () => {
     const u = userRef.current;
+    invalidateCache();
     if (u) {
       await addAuditLog(u.email, u.role, u.plantId, 'Logout', 'User logged out.');
     }
@@ -238,7 +239,8 @@ function AppContent() {
     const supabase = getSupabaseClient();
     if (!supabase) {
       addLog('[Bootstrap] Error: Database config missing or client could not be initialized.');
-      setStartupError('Database connection variables are missing or invalid.');
+      initialCheckDoneRef.current = true;
+      setLoading(false);
       return;
     }
 
@@ -247,7 +249,7 @@ function AppContent() {
       addLog('[Bootstrap] Step 1/4: Validating user session...');
       const { data: { session }, error: sessionErr } = await withTimeout(
         supabase.auth.getSession(),
-        5000,
+        15000,
         'supabase.auth.getSession'
       );
       if (sessionErr) throw sessionErr;
@@ -261,7 +263,7 @@ function AppContent() {
             .select('*')
             .eq('id', session.user.id)
             .maybeSingle(),
-          5000,
+          15000,
           'profiles.lookup'
         );
         if (profileErr) throw profileErr;
@@ -280,12 +282,12 @@ function AppContent() {
 
       // Step 3: Settings loading
       addLog('[Bootstrap] Step 3/4: Loading system configuration settings...');
-      const settings = await withTimeout(getSettings({ forceRefresh: true }), 5000, 'db.getSettings');
+      const settings = await withTimeout(getSettings({ forceRefresh: true }), 15000, 'db.getSettings');
       addLog(`[Bootstrap] Settings loaded successfully. Target table: ${settings?.selectedTable || 'None'}`);
 
       // Step 4: Tag config loading
       addLog('[Bootstrap] Step 4/4: Loading tag configurations...');
-      const tags = await withTimeout(getTagConfigs({ forceRefresh: true }), 5000, 'db.getTagConfigs');
+      const tags = await withTimeout(getTagConfigs({ forceRefresh: true }), 15000, 'db.getTagConfigs');
       addLog(`[Bootstrap] Loaded ${tags?.length || 0} tag configurations.`);
 
       addLog('[Bootstrap] Initialization completed successfully.');
@@ -302,8 +304,56 @@ function AppContent() {
   // Run initial bootstrap on mount
   useEffect(() => {
     if (getAuthRoute()) return;
-    bootstrapApp();
+    const timer = setTimeout(() => {
+      bootstrapApp();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [bootstrapApp]);
+
+  // Global browser error auditing hook
+  useEffect(() => {
+    const handleGlobalError = (event) => {
+      const msg = event.message || (event.error && event.error.message) || 'Unknown JS Error';
+      const file = event.filename || '';
+      const line = event.lineno || '';
+      const col = event.colno || '';
+      const browser = navigator.userAgent;
+      
+      console.error('[Global Error Caught]:', msg, 'at', file, 'line', line, 'col', col);
+      const u = userRef.current;
+      addAuditLog(
+        u?.email || 'anonymous',
+        u?.role || 'anonymous',
+        u?.plantId || 'all',
+        'Browser Error',
+        `JS Error: ${msg} in ${file}:${line}:${col}. Browser: ${browser}`
+      ).catch(() => {});
+    };
+
+    const handleUnhandledRejection = (event) => {
+      const reason = event.reason;
+      const msg = reason?.message || reason || 'Unhandled Promise Rejection';
+      const browser = navigator.userAgent;
+      
+      console.error('[Unhandled Promise Rejection]:', msg);
+      const u = userRef.current;
+      addAuditLog(
+        u?.email || 'anonymous',
+        u?.role || 'anonymous',
+        u?.plantId || 'all',
+        'Promise Rejection',
+        `Unhandled rejection: ${msg}. Browser: ${browser}`
+      ).catch(() => {});
+    };
+
+    window.addEventListener('error', handleGlobalError);
+    window.addEventListener('unhandledrejection', handleUnhandledRejection);
+
+    return () => {
+      window.removeEventListener('error', handleGlobalError);
+      window.removeEventListener('unhandledrejection', handleUnhandledRejection);
+    };
+  }, []);
 
   // Auth state listener
   useEffect(() => {
@@ -321,7 +371,7 @@ function AppContent() {
               .select('*')
               .eq('id', session.user.id)
               .maybeSingle(),
-            5000,
+            15000,
             'onAuthStateChange.profiles.lookup'
           );
           if (profileErr) throw profileErr;
@@ -360,7 +410,7 @@ function AppContent() {
       try {
         const { data: { session }, error: sessionErr } = await withTimeout(
           supabase.auth.getSession(),
-          5000,
+          15000,
           'sessionChecker.getSession'
         );
         if (sessionErr) throw sessionErr;
@@ -375,7 +425,7 @@ function AppContent() {
             .select('id, active')
             .eq('id', session.user.id)
             .maybeSingle(),
-          5000,
+          15000,
           'sessionChecker.profileLookup'
         );
 
@@ -393,7 +443,33 @@ function AppContent() {
     return () => clearInterval(sessionChecker);
   }, [triggerSessionExpiration]);
 
+  // Minute-by-minute scheduler poller
+  useEffect(() => {
+    if (!user) return;
+
+    const runSchedulerCheck = async () => {
+      try {
+        console.log('[Client Poller] Triggering scheduled reports engine...');
+        const response = await fetch('/api/run-scheduler', { method: 'POST' });
+        const result = await response.json();
+        console.log('[Client Poller] Scheduler engine response:', result);
+      } catch (err) {
+        console.warn('[Client Poller] Scheduler trigger failed:', err.message || err);
+      }
+    };
+
+    // Delay first run slightly to let settings load
+    const initialTimeout = setTimeout(runSchedulerCheck, 5000);
+    const schedulerInterval = setInterval(runSchedulerCheck, 60000);
+
+    return () => {
+      clearTimeout(initialTimeout);
+      clearInterval(schedulerInterval);
+    };
+  }, [user]);
+
   const handleLogin = (authenticatedUser) => {
+    invalidateCache();
     setUser(authenticatedUser);
     setActiveTab('dashboard');
   };
@@ -522,10 +598,14 @@ function AppContent() {
   // ── Render pages ──────────────────────────────────────────────────────────
   const renderPage = () => {
     const role = user?.role || 'Operator';
-    const superAdmin = role === 'Super Admin';
-    const adminOrAbove = ['Super Admin', 'Plant Admin'].includes(role);
+    const isSuperAdmin = role === 'Super Admin';
+    const isAdmin = role === 'Admin';
+    const adminOrAbove = ['Super Admin', 'Plant Admin', 'Admin'].includes(role);
 
-    if (['explorer', 'cloudSync', 'settings'].includes(activeTab) && !superAdmin) {
+    if (['explorer', 'cloudSync'].includes(activeTab) && !isSuperAdmin && !isAdmin) {
+      return <Dashboard user={user} onNavigate={setActiveTab} />;
+    }
+    if (activeTab === 'settings' && !adminOrAbove) {
       return <Dashboard user={user} onNavigate={setActiveTab} />;
     }
     if (['tagConfig', 'users'].includes(activeTab) && !adminOrAbove) {
@@ -536,8 +616,8 @@ function AppContent() {
       case 'trends':    return <Trends />;
       case 'reports':   return <Reports user={user} />;
       case 'explorer':  return <Explorer />;
-      case 'cloudSync': return <CloudSync />;
-      case 'tagConfig': return <TagConfig />;
+      case 'cloudSync': return <CloudSync user={user} />;
+      case 'tagConfig': return <TagConfig user={user} />;
       case 'users':     return <UserManagement user={user} />;
       case 'settings':  return <Settings user={user} />;
       default:          return <Dashboard user={user} />;

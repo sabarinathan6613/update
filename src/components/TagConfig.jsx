@@ -1,5 +1,5 @@
 // src/components/TagConfig.jsx
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { getTagConfigs, saveTagConfigs, getSettings, saveSettings, getHistorianData } from '../utils/db';
 import { getSupabaseClient, getSupabaseConfig } from '../utils/supabaseClient';
 import { useSimulator } from '../utils/SimulatorContext';
@@ -60,18 +60,19 @@ const SavingSpinner = () => (
 );
 
 /* ─── ToggleSwitch helper ─────────────────────────────────────────── */
-function ToggleSwitch({ id, checked, onChange }) {
+function ToggleSwitch({ id, checked, onChange, disabled }) {
   return (
-    <label className="toggle-switch" htmlFor={id}>
-      <input id={id} type="checkbox" checked={checked} onChange={onChange} />
+    <label className="toggle-switch" htmlFor={id} style={{ opacity: disabled ? 0.55 : 1, cursor: disabled ? 'not-allowed' : 'pointer' }}>
+      <input id={id} type="checkbox" checked={checked} onChange={disabled ? undefined : onChange} disabled={disabled} />
       <span className="toggle-track" />
     </label>
   );
 }
 
 /* ═══════════════════════════════════════════════════════════════════ */
-export default function TagConfig() {
+export default function TagConfig({ user }) {
   const { refreshTrigger, dbConnectionStatus } = useSimulator();
+  const isReadOnly = user?.role === 'Admin';
   const [activeTab, setActiveTab]     = useState('tags');
   const [tagConfigs, setTagConfigs]   = useState([]);
   const [dashboardTags, setDashboardTags] = useState([]);
@@ -208,6 +209,7 @@ export default function TagConfig() {
 
   const handleSaveTag = async (e) => {
     e.preventDefault();
+    if (isReadOnly) return;
     if (editingTag.isNew) {
       const indexNum = parseInt(editingTag.TagIndex);
       if (isNaN(indexNum)) { alert('Tag Index must be a valid number.'); return; }
@@ -255,6 +257,7 @@ export default function TagConfig() {
   };
 
   const handleToggleVisibility = async (tagIndex, field) => {
+    if (isReadOnly) return;
     const originalConfigs = [...tagConfigs];
     const toggledTag = tagConfigs.find(t => t.TagIndex === tagIndex);
     if (!toggledTag) return;
@@ -308,6 +311,7 @@ export default function TagConfig() {
   };
 
   const handleDeleteTag = async (tagIndex) => {
+    if (isReadOnly) return;
     if (!window.confirm(`Are you sure you want to delete the configuration for Tag Index ${tagIndex}?`)) return;
     const updatedConfigs = tagConfigs.filter(t => t.TagIndex !== tagIndex);
     setTagConfigs(updatedConfigs);
@@ -335,6 +339,7 @@ export default function TagConfig() {
   };
 
   const handleSaveDashboardKpis = async () => {
+    if (isReadOnly) return;
     const currentSettings = await getSettings();
     await saveSettings({ ...currentSettings, dashboardTags });
     setSaveStatusMsg({
@@ -563,13 +568,15 @@ export default function TagConfig() {
                   {dbConnectionStatus}
                 </span>
               </div>
-              <button
-                onClick={handleAddNewOpen}
-                className="btn btn-primary"
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', flexShrink: 0 }}
-              >
-                <PlusIcon /> Add Tag
-              </button>
+              {!isReadOnly && (
+                <button
+                  onClick={handleAddNewOpen}
+                  className="btn btn-primary"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', flexShrink: 0 }}
+                >
+                  <PlusIcon /> Add Tag
+                </button>
+              )}
             </div>
           </div>
 
@@ -726,13 +733,15 @@ export default function TagConfig() {
                     Add your first tag to begin mapping historian data channels.
                   </p>
                 </div>
-                <button
-                  onClick={handleAddNewOpen}
-                  className="btn btn-primary"
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', marginTop: '4px' }}
-                >
-                  <PlusIcon /> Add First Tag
-                </button>
+                {!isReadOnly && (
+                  <button
+                    onClick={handleAddNewOpen}
+                    className="btn btn-primary"
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', marginTop: '4px' }}
+                  >
+                    <PlusIcon /> Add First Tag
+                  </button>
+                )}
               </div>
             ) : (
               /* Data table */
@@ -915,6 +924,7 @@ export default function TagConfig() {
                               id={`tbl-dash-${tag.TagIndex}`}
                               checked={tag.DashboardVisible}
                               onChange={() => handleToggleVisibility(tag.TagIndex, 'DashboardVisible')}
+                              disabled={isReadOnly}
                             />
                           )}
                         </td>
@@ -928,6 +938,7 @@ export default function TagConfig() {
                               id={`tbl-trend-${tag.TagIndex}`}
                               checked={tag.TrendsVisible}
                               onChange={() => handleToggleVisibility(tag.TagIndex, 'TrendsVisible')}
+                              disabled={isReadOnly}
                             />
                           )}
                         </td>
@@ -941,6 +952,7 @@ export default function TagConfig() {
                               id={`tbl-rep-${tag.TagIndex}`}
                               checked={tag.ReportsVisible}
                               onChange={() => handleToggleVisibility(tag.TagIndex, 'ReportsVisible')}
+                              disabled={isReadOnly}
                             />
                           )}
                         </td>
@@ -978,25 +990,29 @@ export default function TagConfig() {
                               )}
                             </button>
 
-                            <button
-                              onClick={() => handleEditOpen(tag)}
-                              title="Edit tag configuration"
-                              style={iconBtnBase}
-                              onMouseEnter={e => { e.currentTarget.style.color = 'var(--secondary)'; e.currentTarget.style.borderColor = 'rgba(59,130,246,0.4)'; e.currentTarget.style.background = 'rgba(59,130,246,0.08)'; }}
-                              onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.background = 'transparent'; }}
-                            >
-                              <EditIcon />
-                            </button>
+                            {!isReadOnly && (
+                              <>
+                                <button
+                                  onClick={() => handleEditOpen(tag)}
+                                  title="Edit tag configuration"
+                                  style={iconBtnBase}
+                                  onMouseEnter={e => { e.currentTarget.style.color = 'var(--secondary)'; e.currentTarget.style.borderColor = 'rgba(59,130,246,0.4)'; e.currentTarget.style.background = 'rgba(59,130,246,0.08)'; }}
+                                  onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.background = 'transparent'; }}
+                                >
+                                  <EditIcon />
+                                </button>
 
-                            <button
-                              onClick={() => handleDeleteTag(tag.TagIndex)}
-                              title="Delete tag configuration"
-                              style={iconBtnBase}
-                              onMouseEnter={e => { e.currentTarget.style.color = 'var(--error)'; e.currentTarget.style.borderColor = 'rgba(239,68,68,0.35)'; e.currentTarget.style.background = 'rgba(239,68,68,0.08)'; }}
-                              onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.background = 'transparent'; }}
-                            >
-                              <TrashIcon />
-                            </button>
+                                <button
+                                  onClick={() => handleDeleteTag(tag.TagIndex)}
+                                  title="Delete tag configuration"
+                                  style={iconBtnBase}
+                                  onMouseEnter={e => { e.currentTarget.style.color = 'var(--error)'; e.currentTarget.style.borderColor = 'rgba(239,68,68,0.35)'; e.currentTarget.style.background = 'rgba(239,68,68,0.08)'; }}
+                                  onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.background = 'transparent'; }}
+                                >
+                                  <TrashIcon />
+                                </button>
+                              </>
+                            )}
                           </div>
                         </td>
                       </tr>
@@ -1025,9 +1041,11 @@ export default function TagConfig() {
                 Select up to 5 dashboard-visible tags to display as KPI cards.
               </p>
             </div>
-            <button onClick={handleSaveDashboardKpis} className="btn btn-primary" style={{ flexShrink: 0 }}>
-              💾 Save KPI Selection
-            </button>
+            {!isReadOnly && (
+              <button onClick={handleSaveDashboardKpis} className="btn btn-primary" style={{ flexShrink: 0 }}>
+                💾 Save KPI Selection
+              </button>
+            )}
           </div>
 
           <div className="card" style={{ padding: '24px' }}>

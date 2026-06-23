@@ -1,7 +1,7 @@
 // src/components/Layout.jsx
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useSimulator } from '../utils/SimulatorContext';
-import { getEmailLogs, getSyncLogs, invalidateCache } from '../utils/db';
+import { invalidateCache } from '../utils/db';
 
 // ─── Inline SVG Icon Components ───────────────────────────────────────────────
 
@@ -98,18 +98,7 @@ const IconSearch = () => (
   </svg>
 );
 
-const IconBell = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" width="16" height="16">
-    <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
-    <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
-  </svg>
-);
 
-const IconZap = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" width="14" height="14">
-    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-  </svg>
-);
 
 const IconRefresh = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" width="13" height="13">
@@ -147,28 +136,19 @@ const NAV_SECTIONS = [
 export default function Layout({ user, onLogout, activeTab, setActiveTab, children }) {
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [showNotifications, setShowNotifications] = useState(false);
-  const [showQuickActions, setShowQuickActions] = useState(false);
   const [globalSearch, setGlobalSearch] = useState('');
   const [showGlobalResults, setShowGlobalResults] = useState(false);
 
-  const quickActionsRef = useRef(null);
   const globalSearchRef = useRef(null);
 
   const {
-    syncTrigger,
-    setSyncTrigger,
-    refreshTrigger,
     setRefreshTrigger,
     isNetworkOnline,
-    forceSync,
     localBuffer,
     totalSyncedRecords,
     syncLogs,
     dbConnectionStatus
   } = useSimulator();
-
-  const [notifications, setNotifications] = useState([]);
 
   // Extract last successful sync time from logs
   const lastSyncTime = useMemo(() => {
@@ -213,40 +193,20 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
 
 
   const menuItems = [
-    { id: 'dashboard', label: 'Dashboard',           icon: <IconDashboard />, roles: ['Super Admin', 'Plant Admin', 'Operator'] },
-    { id: 'trends',    label: 'Trends & Charts',     icon: <IconTrends />,    roles: ['Super Admin', 'Plant Admin', 'Operator'] },
-    { id: 'reports',   label: 'Production Reports',  icon: <IconReports />,   roles: ['Super Admin', 'Plant Admin', 'Operator'] },
-    { id: 'explorer',  label: 'Database Explorer',   icon: <IconExplorer />,  roles: ['Super Admin'] },
-    { id: 'cloudSync', label: 'Cloud DB & Sync',     icon: <IconCloudSync />, roles: ['Super Admin'] },
-    { id: 'tagConfig', label: 'Tag Configuration',   icon: <IconTagConfig />, roles: ['Super Admin', 'Plant Admin'] },
-    { id: 'users',     label: 'User Management',     icon: <IconUsers />,     roles: ['Super Admin', 'Plant Admin'] },
-    { id: 'settings',  label: 'Settings',            icon: <IconSettings />,  roles: ['Super Admin', 'Plant Admin'] },
+    { id: 'dashboard', label: 'Dashboard',           icon: <IconDashboard />, roles: ['Super Admin', 'Admin', 'Plant Admin', 'Operator'] },
+    { id: 'trends',    label: 'Trends & Charts',     icon: <IconTrends />,    roles: ['Super Admin', 'Admin', 'Plant Admin', 'Operator'] },
+    { id: 'reports',   label: 'Production Reports',  icon: <IconReports />,   roles: ['Super Admin', 'Admin', 'Plant Admin', 'Operator'] },
+    { id: 'explorer',  label: 'Database Explorer',   icon: <IconExplorer />,  roles: ['Super Admin', 'Admin'] },
+    { id: 'cloudSync', label: 'Cloud DB & Sync',     icon: <IconCloudSync />, roles: ['Super Admin', 'Admin'] },
+    { id: 'tagConfig', label: 'Tag Configuration',   icon: <IconTagConfig />, roles: ['Super Admin', 'Admin', 'Plant Admin'] },
+    { id: 'users',     label: 'User Management',     icon: <IconUsers />,     roles: ['Super Admin', 'Admin', 'Plant Admin'] },
+    { id: 'settings',  label: 'Settings',            icon: <IconSettings />,  roles: ['Super Admin', 'Admin', 'Plant Admin'] },
   ];
 
   const visibleMenuItems = menuItems.filter(item => item.roles.includes(user.role));
 
   useEffect(() => {
-    const loadLayoutData = async () => {
-      const sLogs = await getSyncLogs();
-      const eLogs = await getEmailLogs();
-      const syncLogsSliced = sLogs.slice(0, 3);
-      const emailLogsSliced = eLogs.slice(0, 3);
-
-      const allNotifs = [
-        ...syncLogsSliced.map(l => ({ ...l, type: 'sync',  title: 'Data Synchronized', timestamp: l.timestamp })),
-        ...emailLogsSliced.map(e => ({ ...e, type: 'email', title: 'Email Sent',        timestamp: e.timestamp }))
-      ].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)).slice(0, 6);
-
-      setNotifications(allNotifs);
-    };
-    loadLayoutData();
-  }, [refreshTrigger]);
-
-  useEffect(() => {
     function handleClickOutside(event) {
-      if (quickActionsRef.current && !quickActionsRef.current.contains(event.target)) {
-        setShowQuickActions(false);
-      }
       if (globalSearchRef.current && !globalSearchRef.current.contains(event.target)) {
         setShowGlobalResults(false);
       }
@@ -283,21 +243,7 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
 
   // ── Styles ────────────────────────────────────────────────────────────────
 
-  const sidebarStyles = {
-    position: 'fixed',
-    top: 0,
-    left: 0,
-    height: '100vh',
-    width: isCollapsed ? '64px' : '220px',
-    display: 'flex',
-    flexDirection: 'column',
-    background: 'linear-gradient(180deg, var(--surface) 0%, var(--surface-raised) 100%)',
-    borderRight: '1px solid var(--border)',
-    transition: 'width 0.22s cubic-bezier(0.4,0,0.2,1)',
-    zIndex: 100,
-    overflow: 'hidden',
-    boxShadow: '2px 0 10px rgba(0,0,0,0.05)',
-  };
+  const sidebarStyles = {};
 
   const sectionLabelStyles = {
     padding: isCollapsed ? '10px 0 4px' : '12px 16px 4px',
@@ -346,6 +292,25 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
 
   return (
     <div className="app-container">
+
+      {/* Sidebar Backdrop Overlay for Mobile */}
+      {isSidebarOpen && (
+        <div 
+          className="sidebar-overlay"
+          onClick={() => setIsSidebarOpen(false)}
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.5)',
+            backdropFilter: 'blur(2px)',
+            zIndex: 99,
+            transition: 'opacity 0.2s ease',
+          }}
+        />
+      )}
 
       {/* ═══ SIDEBAR ══════════════════════════════════════════════════════════ */}
       <div
@@ -691,21 +656,16 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
       {/* ═══ MAIN CONTENT ═════════════════════════════════════════════════════ */}
       <div
         className={`main-content ${isCollapsed ? 'expanded' : ''}`}
-        style={{ marginLeft: isCollapsed ? '64px' : '220px', transition: 'margin-left 0.22s cubic-bezier(0.4,0,0.2,1)' }}
+        style={{
+          ...(activeTab === 'trends' ? {
+            height: '100vh',
+            maxHeight: '100vh',
+            overflow: 'hidden',
+          } : {})
+        }}
       >
         {/* ── HEADER BAR ───────────────────────────────────────────────────── */}
-        <header className="card" style={{
-          padding: '10px 20px',
-          marginBottom: '20px',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          flexDirection: 'row',
-          borderRadius: 'var(--radius-sm)',
-          boxShadow: 'var(--shadow-sm)',
-          zIndex: 90,
-          gap: '12px',
-        }}>
+        <header className="card app-header">
 
           {/* Left: Mobile toggle + Breadcrumb */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '14px', minWidth: 0 }}>
@@ -717,8 +677,11 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
                 border: 'none',
                 cursor: 'pointer',
                 color: 'var(--text-muted)',
-                display: 'none',
-                padding: '4px',
+                padding: '12px',
+                margin: '-8px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
               }}
             >
               <IconMenu />
@@ -827,11 +790,11 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
           </div>
 
           {/* Right: Sync Monitor Indicators + Actions + Bell */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '18px', marginLeft: 'auto', flexShrink: 0 }}>
+          <div className="header-status-indicators" style={{ display: 'flex', alignItems: 'center', gap: '18px', marginLeft: 'auto', flexWrap: 'wrap' }}>
 
             {/* 1. Cloud Status */}
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }} title="Cloud Gateway Connection Status">
-              <span style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+            <div className="header-status-item" title="Cloud Gateway Connection Status">
+              <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
                 Cloud Status
               </span>
               <div style={{ display: 'flex', alignItems: 'center', gap: '5px', marginTop: '2px' }}>
@@ -848,8 +811,8 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
             </div>
 
             {/* 2. Database Status */}
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }} title="Historian Database Health">
-              <span style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+            <div className="header-status-item" title="Historian Database Health">
+              <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
                 Database Status
               </span>
               <div style={{ display: 'flex', alignItems: 'center', gap: '5px', marginTop: '2px' }}>
@@ -868,8 +831,8 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
             </div>
 
             {/* 3. Last Sync */}
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }} title="Last Successful Synchronization">
-              <span style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+            <div className="header-status-item optional" title="Last Successful Synchronization">
+              <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
                 Last Sync
               </span>
               <span className="font-mono" style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text)', marginTop: '2px' }}>
@@ -878,8 +841,8 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
             </div>
 
             {/* 4. Queue Buffer */}
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }} title="Queued records in local SQL spool buffer">
-              <span style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+            <div className="header-status-item optional" title="Queued records in local SQL spool buffer">
+              <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
                 Queue Buffer
               </span>
               <span className="font-mono" style={{ fontSize: '0.72rem', fontWeight: 700, marginTop: '2px', color: localBuffer.length > 0 ? 'var(--warning)' : 'var(--text-muted)' }}>
@@ -888,8 +851,8 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
             </div>
 
             {/* 5. Total Records */}
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }} title="Total telemetry records in database">
-              <span style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+            <div className="header-status-item optional" title="Total telemetry records in database">
+              <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
                 Total Records
               </span>
               <span className="font-mono" style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--secondary)', marginTop: '2px' }}>
@@ -900,8 +863,8 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
             {/* 6. Intelligent Refresh Timing */}
             {['dashboard', 'tagConfig', 'explorer', 'reports'].includes(activeTab) && (
               <>
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }} title="Last database refresh">
-                  <span style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+                <div className="header-status-item optional" title="Last database refresh">
+                  <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
                     Last Updated
                   </span>
                   <span className="font-mono" style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--success)', marginTop: '2px' }}>
@@ -936,112 +899,20 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
               </>
             )}
 
-            {/* Quick Actions Dropdown */}
-            <div style={{ position: 'relative' }} ref={quickActionsRef}>
-              <button
-                onClick={() => setShowQuickActions(!showQuickActions)}
-                className="btn btn-secondary"
-                style={{ padding: '6px 10px', fontSize: '0.78rem', borderRadius: 'var(--radius-sm)', display: 'flex', alignItems: 'center', gap: '5px' }}
-              >
-                <IconZap /> Actions
-              </button>
-              {showQuickActions && (
-                <div className="quick-action-menu">
-                  <button className="quick-action-item" onClick={() => { forceSync(); setShowQuickActions(false); }}>
-                    <IconRefresh /> Trigger Sync Now
-                  </button>
-                  <button className="quick-action-item" onClick={() => { setActiveTab('cloudSync'); setShowQuickActions(false); }}>
-                    <IconCloudSync /> DB Config Wizard
-                  </button>
-                  <button className="quick-action-item" onClick={() => { setActiveTab('tagConfig'); setShowQuickActions(false); }}>
-                    <IconTagConfig /> Configure Tags
-                  </button>
-                  <button className="quick-action-item" onClick={() => { window.print(); setShowQuickActions(false); }}>
-                    🖨️ Print PDF Report
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Notification Bell */}
-            <div style={{ position: 'relative' }}>
-              <button
-                onClick={() => setShowNotifications(!showNotifications)}
-                className="btn btn-secondary"
-                style={{ padding: '6px 10px', position: 'relative', display: 'flex', alignItems: 'center' }}
-              >
-                <IconBell />
-                {notifications.length > 0 && (
-                  <span style={{
-                    position: 'absolute',
-                    top: '-2px',
-                    right: '-2px',
-                    width: '7px',
-                    height: '7px',
-                    backgroundColor: 'var(--error)',
-                    borderRadius: '50%',
-                    border: '1.5px solid var(--surface)',
-                  }} />
-                )}
-              </button>
-
-              {showNotifications && (
-                <div className="card" style={{
-                  position: 'absolute',
-                  top: '42px',
-                  right: '0',
-                  width: '300px',
-                  zIndex: 200,
-                  padding: '12px',
-                  boxShadow: 'var(--shadow-lg)',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: '8px',
-                }}>
-                  <div className="flex justify-between items-center" style={{ borderBottom: '1px solid var(--border)', paddingBottom: '6px' }}>
-                    <span className="font-semibold text-xs text-muted">SYSTEM MESSAGES ({notifications.length})</span>
-                    <button
-                      onClick={() => setShowNotifications(false)}
-                      style={{ background: 'transparent', border: 'none', fontSize: '0.75rem', cursor: 'pointer', color: 'var(--text-muted)' }}
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '220px', overflowY: 'auto' }}>
-                    {notifications.length === 0 ? (
-                      <span className="text-xs text-muted" style={{ padding: '10px 0', textAlign: 'center' }}>
-                        No recent events.
-                      </span>
-                    ) : (
-                      notifications.map((notif, idx) => (
-                        <div key={idx} style={{
-                          padding: '6px 8px',
-                          backgroundColor: 'var(--background)',
-                          borderRadius: 'var(--radius-sm)',
-                          borderLeft: `3px solid ${notif.type === 'sync' ? 'var(--secondary)' : 'var(--success)'}`,
-                        }}>
-                          <div className="flex justify-between items-center">
-                            <span className="font-semibold text-xs" style={{ color: 'var(--text)' }}>{notif.title}</span>
-                            <span style={{ color: 'var(--text-muted)', fontSize: '0.62rem' }}>
-                              {new Date(notif.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                            </span>
-                          </div>
-                          <p style={{ margin: '1px 0 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '0.72rem' }}>
-                            {notif.message || `To: ${notif.recipient}`}
-                          </p>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
 
           </div>
         </header>
 
         {/* Content */}
-        <main style={{ flex: 1 }}>
+        <main style={{
+          flex: 1,
+          ...(activeTab === 'trends' ? {
+            minHeight: 0,
+            overflow: 'hidden',
+            display: 'flex',
+            flexDirection: 'column',
+          } : {})
+        }}>
           {children}
         </main>
         <style>{`

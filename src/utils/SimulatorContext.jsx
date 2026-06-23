@@ -106,7 +106,7 @@ export function SimulatorProvider({ children }) {
         logMsg(`Sync Failed. Cloud gateway link offline. Retaining +${buffer.length} rows in local SQL cache.`, true);
         try {
           addSyncLog(`Sync Failed: Cloud Connection Offline. Local Historian Buffer: +${buffer.length} pending.`);
-        } catch (e) { /* ignored */ }
+        } catch { /* ignored */ }
         setSyncTrigger(prev => prev + 1);
         isSyncingRef.current = false;
       }, 800);
@@ -145,7 +145,7 @@ export function SimulatorProvider({ children }) {
         logMsg(`Sync Exception: ${err.message}`, true);
         try {
           await withTimeout(addSyncLog(`Sync Exception: ${err.message}`, "ERROR"), 5000, 'SimulatorContext.addSyncLog.error');
-        } catch (e) { /* ignored */ }
+        } catch { /* ignored */ }
         setSyncTrigger(prev => prev + 1);
       } finally {
         isSyncingRef.current = false;

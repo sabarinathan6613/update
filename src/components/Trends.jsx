@@ -47,6 +47,10 @@ export default function Trends() {
 
   /* ── data ── */
   const [historianData, setHistorianData] = useState([]);
+  const historianDataRef                  = useRef(historianData);
+  useEffect(() => {
+    historianDataRef.current = historianData;
+  }, [historianData]);
   const [loading, setLoading]             = useState(false);
 
   /* ── diagnostics ── */
@@ -86,13 +90,18 @@ export default function Trends() {
 
   // Keep focusedTagIdx in sync with selectedTags
   useEffect(() => {
-    if (selectedTags.length > 0) {
-      if (focusedTagIdx === null || !selectedTags.includes(focusedTagIdx)) {
-        setFocusedTagIdx(selectedTags[0]);
+    const timer = setTimeout(() => {
+      if (selectedTags.length > 0) {
+        if (focusedTagIdx === null || !selectedTags.includes(focusedTagIdx)) {
+          setFocusedTagIdx(selectedTags[0]);
+        }
+      } else {
+        if (focusedTagIdx !== null) {
+          setFocusedTagIdx(null);
+        }
       }
-    } else {
-      setFocusedTagIdx(null);
-    }
+    }, 0);
+    return () => clearTimeout(timer);
   }, [selectedTags, focusedTagIdx]);
 
   // Temporary diagnostics loop to log query status to server
@@ -270,7 +279,7 @@ export default function Trends() {
       // Silent updates for background sync updates to prevent flickering
       const tagsChanged = JSON.stringify(selectedTags) !== JSON.stringify(lastQueryRef.current.selectedTags);
       const presetChanged = timePreset !== lastQueryRef.current.timePreset;
-      const needsLoader = historianData.length === 0 || tagsChanged || presetChanged;
+      const needsLoader = historianDataRef.current.length === 0 || tagsChanged || presetChanged;
 
       if (needsLoader) {
         setLoading(true);
@@ -427,13 +436,11 @@ export default function Trends() {
     selectedTags.forEach(idx => {
       let yMin = Infinity;
       let yMax = -Infinity;
-      let hasData = false;
       const records = tagSeriesData[idx] || [];
 
       records.forEach(r => {
         if (r.Val < yMin) yMin = r.Val;
         if (r.Val > yMax) yMax = r.Val;
-        hasData = true;
       });
 
       if (yMin === Infinity) {
@@ -592,84 +599,83 @@ export default function Trends() {
   ];
 
   return (
-    <div style={{
-      display: 'flex',
-      height: '100%',
-      gap: '0',
-      overflow: 'hidden',
-      minHeight: 0,
-    }}>
+    <div className="trends-container">
 
       {/* ═══════════════════════════════════════
           LEFT PANEL – Tag Directory
       ═══════════════════════════════════════ */}
-      <div style={{
-        width: '280px',
-        flexShrink: 0,
-        display: 'flex',
-        flexDirection: 'column',
-        borderRight: '1px solid var(--border)',
-        backgroundColor: 'var(--surface)',
-        overflow: 'hidden',
-      }}>
+      <div className="trends-left-panel">
 
-        {/* Panel header */}
+        {/* Sticky Header & Search Wrapper */}
         <div style={{
-          padding: '12px 16px 10px',
+          position: 'sticky',
+          top: 0,
+          zIndex: 10,
+          backgroundColor: 'var(--surface)',
           borderBottom: '1px solid var(--border)',
-          flexShrink: 0,
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '8px'
         }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--secondary)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-              </svg>
-              <span style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--text)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
-                Tag Directory
-              </span>
+          {/* Panel header */}
+          <div style={{
+            padding: '12px 16px 10px',
+            borderBottom: '1px solid var(--border)',
+            flexShrink: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '8px'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--secondary)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+                </svg>
+                <span style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--text)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+                  Tag Directory
+                </span>
+              </div>
+              {/* Compare Mode Toggle Switch */}
+              <label className="toggle-switch" style={{ fontSize: '0.72rem', fontWeight: 600, color: 'var(--text-muted)' }}>
+                <input 
+                  type="checkbox" 
+                  checked={compareMode}
+                  onChange={(e) => handleCompareModeToggle(e.target.checked)} 
+                />
+                <div className="toggle-track"></div>
+                <span>Compare</span>
+              </label>
             </div>
-            {/* Compare Mode Toggle Switch */}
-            <label className="toggle-switch" style={{ fontSize: '0.72rem', fontWeight: 600, color: 'var(--text-muted)' }}>
-              <input 
-                type="checkbox" 
-                checked={compareMode}
-                onChange={(e) => handleCompareModeToggle(e.target.checked)} 
-              />
-              <div className="toggle-track"></div>
-              <span>Compare</span>
-            </label>
+            <p style={{ margin: 0, fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+              {visibleTagsTotal} tag{visibleTagsTotal !== 1 ? 's' : ''} available · {selectedTags.length} selected
+            </p>
           </div>
-          <p style={{ margin: 0, fontSize: '0.68rem', color: 'var(--text-muted)' }}>
-            {visibleTagsTotal} tag{visibleTagsTotal !== 1 ? 's' : ''} available · {selectedTags.length} selected
-          </p>
-        </div>
 
-        {/* Search */}
-        <div style={{ padding: '10px 12px', flexShrink: 0, borderBottom: '1px solid var(--border)' }}>
-          <div style={{ position: 'relative' }}>
-            <svg
-              width="13" height="13" viewBox="0 0 24 24" fill="none"
-              stroke="var(--text-muted)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
-              style={{ position: 'absolute', left: '9px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}
-            >
-              <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
-            </svg>
-            <input
-              type="text"
-              className="form-control"
-              placeholder="Search tags..."
-              value={tagSearchQuery}
-              onChange={e => setTagSearchQuery(e.target.value)}
-              style={{ paddingLeft: '28px', fontSize: '0.76rem', height: '32px' }}
-            />
+          {/* Search */}
+          <div style={{ padding: '10px 12px', flexShrink: 0 }}>
+            <div style={{ position: 'relative' }}>
+              <svg
+                width="13" height="13" viewBox="0 0 24 24" fill="none"
+                stroke="var(--text-muted)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                style={{ position: 'absolute', left: '9px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}
+              >
+                <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+              <input
+                type="text"
+                className="form-control"
+                placeholder="Search tags..."
+                value={tagSearchQuery}
+                onChange={e => setTagSearchQuery(e.target.value)}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck="false"
+                style={{ paddingLeft: '28px', fontSize: '0.76rem', height: '32px' }}
+              />
+            </div>
           </div>
         </div>
 
         {/* Tag list */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '6px 8px' }}>
+        <div style={{ padding: '6px 8px' }}>
           {visibleTagsTotal === 0 ? (
             <div style={{ padding: '32px 16px', textAlign: 'center' }}>
               <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" strokeWidth="1.5" style={{ marginBottom: '10px', opacity: 0.4 }}>
@@ -781,13 +787,7 @@ export default function Trends() {
       {/* ═══════════════════════════════════════
           RIGHT PANEL – Chart Area
       ═══════════════════════════════════════ */}
-      <div style={{
-        flex: 1,
-        display: 'flex',
-        flexDirection: 'column',
-        overflow: 'hidden',
-        minWidth: 0,
-      }}>
+      <div className="trends-right-panel">
 
         {/* ── Time range controls ── */}
         <div style={{
@@ -1022,233 +1022,246 @@ export default function Trends() {
           </div>
         )}
 
-        {/* ── Chart canvas ── */}
-        <div style={{ flex: 1, overflow: 'auto', padding: '16px 20px 20px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+        {/* ── Chart & Statistics Container ── */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '16px', padding: '16px 20px 20px', minHeight: 0, overflow: 'hidden' }}>
 
+          {/* Chart Wrapper */}
           <div
-            style={{ position: 'relative', width: '100%', cursor: 'crosshair' }}
-            onMouseMove={handleMouseMove}
-            onMouseLeave={() => setHoveredData(null)}
-            ref={chartRef}
+            style={{ 
+              position: 'relative', 
+              width: '100%', 
+              cursor: 'crosshair', 
+              flex: 1.2, 
+              minHeight: '200px',
+              display: 'flex',
+              flexDirection: 'column'
+            }}
           >
-            {/* ── Loading state ── */}
-            {loading ? (
-              <ChartPlaceholder height={svgHeight}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                  <div style={{
-                    width: '24px', height: '24px', borderRadius: '50%',
-                    border: '2px solid rgba(0,229,255,0.15)',
-                    borderTopColor: 'var(--secondary)',
-                    animation: 'spin 0.75s linear infinite',
-                  }} />
-                  <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontFamily: 'var(--mono)', letterSpacing: '0.08em' }}>
-                    RETRIEVING HISTORIAN ARCHIVES…
-                  </span>
-                </div>
-              </ChartPlaceholder>
-
-            /* ── No tag selected ── */
-            ) : selectedTags.length === 0 ? (
-              <ChartPlaceholder height={svgHeight}>
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" strokeWidth="1.2" style={{ marginBottom: '12px' }}>
-                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-                </svg>
-                <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.6 }}>
-                  {visibleTagsTotal === 0
-                    ? 'No tags configured for trends.\nConfigure tags in Tag Configuration.'
-                    : 'Select a tag from the directory\nto view its trend.'}
-                </p>
-              </ChartPlaceholder>
-
-            /* ── No data found ── */
-            ) : historianData.length === 0 ? (
-              <ChartPlaceholder height={svgHeight}>
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" strokeWidth="1.2" style={{ marginBottom: '12px' }}>
-                  <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" />
-                  <polyline points="13 2 13 9 20 9" />
-                </svg>
-                <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.6 }}>
-                  No historian records found for selected tag and date range.
-                </p>
-              </ChartPlaceholder>
-
-            /* ── SVG Chart ── */
-            ) : (
-              <>
-                <svg
-                  viewBox={`0 0 ${svgWidth} ${svgHeight}`}
-                  style={{ width: '100%', height: 'auto', overflow: 'visible', display: 'block' }}
-                >
-                  {/* Chart background */}
-                  <rect x={paddingLeft} y={paddingTop} width={drawWidth} height={drawHeight}
-                    fill="var(--surface-raised)" rx="2" />
-
-                  {/* Y-axis focused tag scale label */}
-                  {focusedTagIdx !== null && (
-                    <text
-                      x={paddingLeft}
-                      y={paddingTop - 7}
-                      fill={TAG_COLORS[selectedTags.indexOf(focusedTagIdx) % TAG_COLORS.length] || 'var(--text-muted)'}
-                      fontSize="9"
-                      fontWeight="bold"
-                      textAnchor="start"
-                    >
-                      Scale: {tagMap[focusedTagIdx]?.TagName || `Tag ${focusedTagIdx}`} ({tagMap[focusedTagIdx]?.Unit || 'No Unit'})
-                    </text>
-                  )}
-
-                  {/* Y grid lines & labels */}
-                  {gridTicks.yTicks.map((tick, i) => (
-                    <g key={`y-${i}`}>
-                      <line
-                        x1={paddingLeft} y1={tick.y}
-                        x2={paddingLeft + drawWidth} y2={tick.y}
-                        stroke={i === 0 ? 'var(--border)' : 'var(--border-subtle)'}
-                        strokeWidth="1"
-                      />
-                      <text
-                        x={paddingLeft - 7} y={tick.y + 3.5}
-                        fill="var(--text-muted)" fontSize="8.5"
-                        fontFamily="var(--mono)" textAnchor="end"
-                      >
-                        {tick.val.toFixed(1)}
-                      </text>
-                    </g>
-                  ))}
-
-                  {/* X grid lines & labels */}
-                  {gridTicks.xTicks.map((tick, i) => (
-                    <g key={`x-${i}`}>
-                      <line
-                        x1={tick.x} y1={paddingTop}
-                        x2={tick.x} y2={paddingTop + drawHeight}
-                        stroke="var(--border-subtle)" strokeWidth="1"
-                      />
-                      <text
-                        x={tick.x} y={paddingTop + drawHeight + 16}
-                        fill="var(--text-muted)" fontSize="8"
-                        textAnchor="middle"
-                      >
-                        {tick.label}
-                      </text>
-                    </g>
-                  ))}
-
-                  {/* Tag series paths */}
-                  {selectedTags.map((tagIdx, i) => {
-                    const pts   = tagSeriesPoints[tagIdx] || [];
-                    if (pts.length < 2) return null;
-                    const color = TAG_COLORS[i % TAG_COLORS.length];
-                    const pathD = pts.map((p, j) => `${j === 0 ? 'M' : 'L'}${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
-                    const gradId = `tg-grad-${tagIdx}`;
-
-                    return (
-                      <g key={tagIdx}>
-                        <defs>
-                          <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="0%"   stopColor={color} stopOpacity={i === 0 ? '0.18' : '0.06'} />
-                            <stop offset="100%" stopColor={color} stopOpacity="0" />
-                          </linearGradient>
-                        </defs>
-                        {/* Area fill */}
-                        <path
-                          d={`${pathD} L${pts[pts.length-1].x.toFixed(2)},${(paddingTop+drawHeight).toFixed(2)} L${pts[0].x.toFixed(2)},${(paddingTop+drawHeight).toFixed(2)} Z`}
-                          fill={`url(#${gradId})`}
-                        />
-                        {/* Line */}
-                        <path
-                          d={pathD}
-                          fill="none"
-                          stroke={color}
-                          strokeWidth={i === 0 ? '2.2' : '1.8'}
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          style={{ filter: `drop-shadow(0 0 3px ${color}55)` }}
-                        />
-                      </g>
-                    );
-                  })}
-
-                  {/* Crosshair vertical line */}
-                  {hoveredData && (
-                    <line
-                      x1={hoveredData.x} y1={paddingTop}
-                      x2={hoveredData.x} y2={paddingTop + drawHeight}
-                      stroke="rgba(0,229,255,0.5)"
-                      strokeWidth="1"
-                      strokeDasharray="3 3"
-                    />
-                  )}
-
-                  {/* Axis border */}
-                  <rect
-                    x={paddingLeft} y={paddingTop}
-                    width={drawWidth} height={drawHeight}
-                    fill="none"
-                    stroke="var(--border)"
-                    strokeWidth="1"
-                    rx="2"
-                  />
-                </svg>
-
-                {/* Tooltip */}
-                {hoveredData && hoveredData.values.length > 0 && (
-                  <div style={{
-                    position: 'absolute',
-                    top: '24px',
-                    left: hoveredData.x > svgWidth * 0.6
-                      ? `calc(${(hoveredData.x / svgWidth * 100).toFixed(1)}% - 215px)`
-                      : `calc(${(hoveredData.x / svgWidth * 100).toFixed(1)}% + 14px)`,
-                    backgroundColor: 'var(--surface)',
-                    border: '1px solid var(--border)',
-                    borderRadius: '8px',
-                    boxShadow: 'var(--shadow-md)',
-                    padding: '10px 14px',
-                    zIndex: 20,
-                    minWidth: '200px',
-                    pointerEvents: 'none',
-                    backdropFilter: 'blur(8px)',
-                  }}>
+            <div
+              style={{ position: 'relative', width: '100%', cursor: 'crosshair', flex: 1, minHeight: 0 }}
+              onMouseMove={handleMouseMove}
+              onMouseLeave={() => setHoveredData(null)}
+              ref={chartRef}
+            >
+              {/* ── Loading state ── */}
+              {loading ? (
+                <ChartPlaceholder>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                     <div style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '6px',
-                      borderBottom: '1px solid var(--border-subtle)',
-                      paddingBottom: '7px',
-                      marginBottom: '8px',
-                    }}>
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="var(--secondary)" strokeWidth="2">
-                        <circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" />
-                      </svg>
-                      <span style={{ fontSize: '0.68rem', fontFamily: 'var(--mono)', color: 'var(--secondary)', letterSpacing: '0.04em' }}>
-                        {new Date(hoveredData.timestamp).toLocaleString([], {
-                          month: 'short', day: '2-digit',
-                          hour: '2-digit', minute: '2-digit', second: '2-digit',
-                        })}
-                      </span>
-                    </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-                      {hoveredData.values.map((v, i) => (
-                        <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
-                          <span style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.71rem', color: 'var(--text-muted)', minWidth: 0 }}>
-                            <span style={{ width: '7px', height: '7px', borderRadius: '50%', backgroundColor: v.color, flexShrink: 0, boxShadow: `0 0 4px ${v.color}` }} />
-                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.name}</span>
-                          </span>
-                          <span style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: '0.73rem', color: v.color, whiteSpace: 'nowrap' }}>
-                            {v.val.toFixed(2)}{v.unit ? ` ${v.unit}` : ''}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
+                      width: '24px', height: '24px', borderRadius: '50%',
+                      border: '2px solid rgba(0,229,255,0.15)',
+                      borderTopColor: 'var(--secondary)',
+                      animation: 'spin 0.75s linear infinite',
+                    }} />
+                    <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontFamily: 'var(--mono)', letterSpacing: '0.08em' }}>
+                      RETRIEVING HISTORIAN ARCHIVES…
+                    </span>
                   </div>
-                )}
-              </>
-            )}
+                </ChartPlaceholder>
+
+              /* ── No tag selected ── */
+              ) : selectedTags.length === 0 ? (
+                <ChartPlaceholder>
+                  <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" strokeWidth="1.2" style={{ marginBottom: '12px' }}>
+                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+                  </svg>
+                  <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.6 }}>
+                    {visibleTagsTotal === 0
+                      ? 'No tags configured for trends.\nConfigure tags in Tag Configuration.'
+                      : 'Select a tag from the directory\nto view its trend.'}
+                  </p>
+                </ChartPlaceholder>
+
+              /* ── No data found ── */
+              ) : historianData.length === 0 ? (
+                <ChartPlaceholder>
+                  <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" strokeWidth="1.2" style={{ marginBottom: '12px' }}>
+                    <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" />
+                    <polyline points="13 2 13 9 20 9" />
+                  </svg>
+                  <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.6 }}>
+                    No historian records found for selected tag and date range.
+                  </p>
+                </ChartPlaceholder>
+
+              /* ── SVG Chart ── */
+              ) : (
+                <>
+                  <svg
+                    viewBox={`0 0 ${svgWidth} ${svgHeight}`}
+                    style={{ width: '100%', height: '100%', overflow: 'visible', display: 'block' }}
+                  >
+                    {/* Chart background */}
+                    <rect x={paddingLeft} y={paddingTop} width={drawWidth} height={drawHeight}
+                      fill="var(--surface-raised)" rx="2" />
+
+                    {/* Y-axis focused tag scale label */}
+                    {focusedTagIdx !== null && (
+                      <text
+                        x={paddingLeft}
+                        y={paddingTop - 7}
+                        fill={TAG_COLORS[selectedTags.indexOf(focusedTagIdx) % TAG_COLORS.length] || 'var(--text-muted)'}
+                        fontSize="9"
+                        fontWeight="bold"
+                        textAnchor="start"
+                      >
+                        Scale: {tagMap[focusedTagIdx]?.TagName || `Tag ${focusedTagIdx}`} ({tagMap[focusedTagIdx]?.Unit || 'No Unit'})
+                      </text>
+                    )}
+
+                    {/* Y grid lines & labels */}
+                    {gridTicks.yTicks.map((tick, i) => (
+                      <g key={`y-${i}`}>
+                        <line
+                          x1={paddingLeft} y1={tick.y}
+                          x2={paddingLeft + drawWidth} y2={tick.y}
+                          stroke={i === 0 ? 'var(--border)' : 'var(--border-subtle)'}
+                          strokeWidth="1"
+                        />
+                        <text
+                          x={paddingLeft - 7} y={tick.y + 3.5}
+                          fill="var(--text-muted)" fontSize="8.5"
+                          fontFamily="var(--mono)" textAnchor="end"
+                        >
+                          {tick.val.toFixed(1)}
+                        </text>
+                      </g>
+                    ))}
+
+                    {/* X grid lines & labels */}
+                    {gridTicks.xTicks.map((tick, i) => (
+                      <g key={`x-${i}`}>
+                        <line
+                          x1={tick.x} y1={paddingTop}
+                          x2={tick.x} y2={paddingTop + drawHeight}
+                          stroke="var(--border-subtle)" strokeWidth="1"
+                        />
+                        <text
+                          x={tick.x} y={paddingTop + drawHeight + 16}
+                          fill="var(--text-muted)" fontSize="8"
+                          textAnchor="middle"
+                        >
+                          {tick.label}
+                        </text>
+                      </g>
+                    ))}
+
+                    {/* Tag series paths */}
+                    {selectedTags.map((tagIdx, i) => {
+                      const pts   = tagSeriesPoints[tagIdx] || [];
+                      if (pts.length < 2) return null;
+                      const color = TAG_COLORS[i % TAG_COLORS.length];
+                      const pathD = pts.map((p, j) => `${j === 0 ? 'M' : 'L'}${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
+                      const gradId = `tg-grad-${tagIdx}`;
+
+                      return (
+                        <g key={tagIdx}>
+                          <defs>
+                            <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="0%"   stopColor={color} stopOpacity={i === 0 ? '0.18' : '0.06'} />
+                              <stop offset="100%" stopColor={color} stopOpacity="0" />
+                            </linearGradient>
+                          </defs>
+                          {/* Area fill */}
+                          <path
+                            d={`${pathD} L${pts[pts.length-1].x.toFixed(2)},${(paddingTop+drawHeight).toFixed(2)} L${pts[0].x.toFixed(2)},${(paddingTop+drawHeight).toFixed(2)} Z`}
+                            fill={`url(#${gradId})`}
+                          />
+                          {/* Line */}
+                          <path
+                            d={pathD}
+                            fill="none"
+                            stroke={color}
+                            strokeWidth={i === 0 ? '2.2' : '1.8'}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            style={{ filter: `drop-shadow(0 0 3px ${color}55)` }}
+                          />
+                        </g>
+                      );
+                    })}
+
+                    {/* Crosshair vertical line */}
+                    {hoveredData && (
+                      <line
+                        x1={hoveredData.x} y1={paddingTop}
+                        x2={hoveredData.x} y2={paddingTop + drawHeight}
+                        stroke="rgba(0,229,255,0.5)"
+                        strokeWidth="1"
+                        strokeDasharray="3 3"
+                      />
+                    )}
+
+                    {/* Axis border */}
+                    <rect
+                      x={paddingLeft} y={paddingTop}
+                      width={drawWidth} height={drawHeight}
+                      fill="none"
+                      stroke="var(--border)"
+                      strokeWidth="1"
+                      rx="2"
+                    />
+                  </svg>
+
+                  {/* Tooltip */}
+                  {hoveredData && hoveredData.values.length > 0 && (
+                    <div style={{
+                      position: 'absolute',
+                      top: '24px',
+                      left: hoveredData.x > svgWidth * 0.6
+                        ? `calc(${(hoveredData.x / svgWidth * 100).toFixed(1)}% - 215px)`
+                        : `calc(${(hoveredData.x / svgWidth * 100).toFixed(1)}% + 14px)`,
+                      backgroundColor: 'var(--surface)',
+                      border: '1px solid var(--border)',
+                      borderRadius: '8px',
+                      boxShadow: 'var(--shadow-md)',
+                      padding: '10px 14px',
+                      zIndex: 20,
+                      minWidth: '200px',
+                      pointerEvents: 'none',
+                      backdropFilter: 'blur(8px)',
+                    }}>
+                      <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        borderBottom: '1px solid var(--border-subtle)',
+                        paddingBottom: '7px',
+                        marginBottom: '8px',
+                      }}>
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="var(--secondary)" strokeWidth="2">
+                          <circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" />
+                        </svg>
+                        <span style={{ fontSize: '0.68rem', fontFamily: 'var(--mono)', color: 'var(--secondary)', letterSpacing: '0.04em' }}>
+                          {new Date(hoveredData.timestamp).toLocaleString([], {
+                            month: 'short', day: '2-digit',
+                            hour: '2-digit', minute: '2-digit', second: '2-digit',
+                          })}
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                        {hoveredData.values.map((v, i) => (
+                          <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.71rem', color: 'var(--text-muted)', minWidth: 0 }}>
+                              <span style={{ width: '7px', height: '7px', borderRadius: '50%', backgroundColor: v.color, flexShrink: 0, boxShadow: `0 0 4px ${v.color}` }} />
+                              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v.name}</span>
+                            </span>
+                            <span style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: '0.73rem', color: v.color, whiteSpace: 'nowrap' }}>
+                              {v.val.toFixed(2)}{v.unit ? ` ${v.unit}` : ''}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           </div>
 
           {/* ── Statistics table ── */}
           {selectedTags.length > 0 && historianData.length > 0 && (
-            <div className="card" style={{ padding: '0', overflow: 'hidden' }}>
+            <div className="card" style={{ flex: 0.8, minHeight: '130px', display: 'flex', flexDirection: 'column', padding: '0', overflow: 'hidden' }}>
               {/* Table header */}
               <div style={{
                 padding: '10px 16px',
@@ -1257,6 +1270,7 @@ export default function Trends() {
                 alignItems: 'center',
                 gap: '8px',
                 backgroundColor: 'var(--surface-raised)',
+                flexShrink: 0
               }}>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" strokeWidth="2">
                   <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
@@ -1267,8 +1281,8 @@ export default function Trends() {
                 </span>
               </div>
 
-              <div className="table-responsive">
-                <table className="table" style={{ margin: 0 }}>
+              <div className="table-responsive" style={{ flex: 1, overflowY: 'auto' }}>
+                <table className="table responsive-table" style={{ margin: 0 }}>
                   <thead>
                     <tr>
                       <th style={{ paddingLeft: '16px' }}>Tag</th>
@@ -1301,32 +1315,32 @@ export default function Trends() {
                             transition: 'background-color 0.15s, border-left-color 0.15s'
                           }}
                         >
-                          <td style={{ paddingLeft: '12px' }}>
+                          <td data-label="Tag" style={{ paddingLeft: '12px' }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '7px' }}>
                               <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: color, flexShrink: 0, boxShadow: `0 0 5px ${color}88` }} />
                               <span className="font-mono" style={{ fontSize: '0.72rem', color, fontWeight: 700 }}>T{tagIdx}</span>
                             </div>
                           </td>
-                          <td style={{ color: 'var(--text)', fontWeight: 500 }}>{cfg.TagName}</td>
-                          <td className="font-mono font-semibold" style={{ textAlign: 'right', color: 'var(--text)' }}>
+                          <td data-label="Parameter" style={{ color: 'var(--text)', fontWeight: 500 }}>{cfg.TagName}</td>
+                          <td data-label="Current" className="font-mono font-semibold" style={{ textAlign: 'right', color: 'var(--text)' }}>
                             {stats.count > 0 ? `${stats.current.toFixed(dp)} ${cfg.Unit || ''}` : '—'}
                           </td>
-                          <td className="font-mono text-xs text-muted" style={{ textAlign: 'right' }}>
+                          <td data-label="Min" className="font-mono text-xs text-muted" style={{ textAlign: 'right' }}>
                             {stats.count > 0 ? stats.min.toFixed(dp) : '—'}
                           </td>
-                          <td className="font-mono text-xs text-muted" style={{ textAlign: 'right' }}>
+                          <td data-label="Max" className="font-mono text-xs text-muted" style={{ textAlign: 'right' }}>
                             {stats.count > 0 ? stats.max.toFixed(dp) : '—'}
                           </td>
-                          <td className="font-mono text-xs" style={{ textAlign: 'right', color: 'var(--text)' }}>
+                          <td data-label="Average" className="font-mono text-xs" style={{ textAlign: 'right', color: 'var(--text)' }}>
                             {stats.count > 0 ? stats.avg.toFixed(dp) : '—'}
                           </td>
-                          <td className="font-mono text-xs text-muted" style={{ textAlign: 'right' }}>
+                          <td data-label="Samples" className="font-mono text-xs text-muted" style={{ textAlign: 'right' }}>
                             {stats.count.toLocaleString()}
                           </td>
-                          <td className="font-mono text-xs text-muted" style={{ textAlign: 'right' }}>
+                          <td data-label="Last Update" className="font-mono text-xs text-muted" style={{ textAlign: 'right' }}>
                             {stats.lastUpdated}
                           </td>
-                          <td>
+                          <td data-label="Quality">
                             <span className={`badge ${stats.goodPct > 98 ? 'badge-success' : stats.goodPct > 90 ? 'badge-warning' : 'badge-danger'}`}
                               style={{ fontSize: '0.63rem' }}>
                               {stats.goodPct.toFixed(1)}% Good
@@ -1350,10 +1364,11 @@ export default function Trends() {
    Sub-components
 ═══════════════════════════════ */
 
-function ChartPlaceholder({ height, children }) {
+function ChartPlaceholder({ children }) {
   return (
     <div style={{
-      height: `${height}px`,
+      height: '100%',
+      width: '100%',
       display: 'flex',
       flexDirection: 'column',
       alignItems: 'center',

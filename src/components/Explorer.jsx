@@ -1,7 +1,8 @@
 // src/components/Explorer.jsx
-import { useState, useEffect, useMemo } from 'react';
-import { getHistorianData, getTagConfigs, getSettings } from '../utils/db';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { getHistorianData, getTagConfigs, getSettings, discoverDatabaseStructure, getDatabaseTableStats } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
+import { getSupabaseClient } from '../utils/supabaseClient';
 
 /* ─────────────────────────────────────────────
    Inline styles (scoped to this component)
@@ -446,12 +447,12 @@ const S = {
    Schema column definitions (static metadata)
    ───────────────────────────────────────────── */
 const SCHEMA_COLUMNS = [
-  { name: 'DateAndTime', type: 'TIMESTAMP', pk: true,  color: '#00f0ff' },
-  { name: 'Millitm',    type: 'INT',       pk: false, color: '#a78bfa' },
-  { name: 'TagIndex',   type: 'INT',       pk: true,  color: '#00f0ff' },
-  { name: 'Val',        type: 'FLOAT8',    pk: false, color: '#6ee7b7' },
-  { name: 'Status',     type: 'INT',       pk: false, color: '#fcd34d' },
-  { name: 'Marker',     type: 'VARCHAR',   pk: false, color: '#f9a8d4' },
+  { name: 'DateAndTime', type: 'TIMESTAMP', isPk: true,  color: '#00f0ff' },
+  { name: 'Millitm',    type: 'INT',       isPk: false, color: '#a78bfa' },
+  { name: 'TagIndex',   type: 'INT',       isPk: true,  color: '#00f0ff' },
+  { name: 'Val',        type: 'FLOAT8',    isPk: false, color: '#6ee7b7' },
+  { name: 'Status',     type: 'INT',       isPk: false, color: '#fcd34d' },
+  { name: 'Marker',     type: 'VARCHAR',   isPk: false, color: '#f9a8d4' },
 ];
 
 /* ─────────────────────────────────────────────
@@ -473,8 +474,14 @@ export default function Explorer() {
   const [tagConfigs, setTagConfigs]   = useState([]);
   const [dbTable, setDbTable]         = useState('Database');
   const [discoveredTables, setDiscoveredTables] = useState([]);
+  const discoveredTablesRef = useRef(discoveredTables);
+  useEffect(() => {
+    discoveredTablesRef.current = discoveredTables;
+  }, [discoveredTables]);
   const [settings, setSettings]       = useState(null);
   const [loading, setLoading]         = useState(true);
+  const [dbStats, setDbStats]         = useState(null);
+  const [loadingStats, setLoadingStats] = useState(false);
 
   const [selectedTag, setSelectedTag]         = useState('all');
   const [selectedStatus, setSelectedStatus]   = useState('all');
@@ -490,7 +497,7 @@ export default function Explorer() {
   const [sortDirection, setSortDirection]     = useState('desc');
   const itemsPerPage = 50;
 
-  // ── Load config ────────────────────────────
+  // ── Load config & discover structure dynamically ──
   useEffect(() => {
     const loadConfigAndTable = async () => {
       const configs = await getTagConfigs();
@@ -502,9 +509,13 @@ export default function Explorer() {
       const activeTbl = s.selectedTable || 'Database';
       setDbTable(activeTbl);
       
-      if (s.discoveredDbStructure && s.discoveredDbStructure.public && s.discoveredDbStructure.public.tables) {
-        setDiscoveredTables(s.discoveredDbStructure.public.tables);
+      console.info("[Explorer] Running database auto-discovery scan...");
+      const dbStructure = await discoverDatabaseStructure();
+      if (dbStructure && dbStructure.public && dbStructure.public.tables) {
+        console.info(`[Explorer] Discovery complete. Found ${dbStructure.public.tables.length} public tables.`);
+        setDiscoveredTables(dbStructure.public.tables);
       } else {
+        console.warn("[Explorer] Dynamic schema discovery returned empty. Falling back to default schema config.");
         setDiscoveredTables([{
           name: activeTbl,
           schema: 'public',
@@ -516,6 +527,81 @@ export default function Explorer() {
     };
     loadConfigAndTable();
   }, [refreshTrigger]);
+
+  // Update selected table count and metadata dynamically when active table changes
+  const hasNoDiscoveredTables = discoveredTables.length === 0;
+  useEffect(() => {
+    if (!dbTable) return;
+    const updateSelectedTableMetadata = async () => {
+      const supabase = getSupabaseClient();
+      if (!supabase) return;
+      try {
+        // 1. Get live count
+        const { count, error: countErr } = await supabase
+          .from(dbTable)
+          .select('*', { count: 'exact', head: true });
+        
+        let countVal = 0;
+        if (!countErr && count !== null) {
+          countVal = count;
+        } else if (countErr) {
+          console.error(`[Explorer] Row count query failed for '${dbTable}':`, countErr);
+        }
+
+        // 2. Get latest timestamp
+        let lastTimestamp = null;
+        const currentTblObj = discoveredTablesRef.current.find(t => t.name === dbTable);
+        const cols = currentTblObj ? currentTblObj.columns : [];
+        const tsCol = cols.find(c => ['DateAndTime', 'timestamp', 'created_at', 'generated_at', 'last_modified', 'updated_at'].includes(c.name))?.name;
+        
+        if (tsCol) {
+          const { data: latestRow, error: tsErr } = await supabase
+            .from(dbTable)
+            .select(tsCol)
+            .order(tsCol, { ascending: false })
+            .limit(1);
+          
+          if (tsErr) {
+            console.error(`[Explorer] Last record timestamp query failed for '${dbTable}' on column '${tsCol}':`, tsErr);
+          } else if (latestRow && latestRow.length > 0) {
+            lastTimestamp = latestRow[0][tsCol];
+          }
+        }
+
+        setDiscoveredTables(prev => prev.map(t => 
+          t.name === dbTable ? { ...t, recordCount: countVal, lastRecordTimestamp: lastTimestamp } : t
+        ));
+      } catch (err) {
+        console.error(`[Explorer] Exception fetching live metadata for '${dbTable}':`, err);
+      }
+    };
+    updateSelectedTableMetadata();
+  }, [dbTable, refreshTrigger, hasNoDiscoveredTables]);
+
+  // Fetch detailed TagIndex statistics when Database table is selected
+  useEffect(() => {
+    if (dbTable !== 'Database') {
+      const timer = setTimeout(() => {
+        setDbStats(null);
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+    const timer = setTimeout(() => {
+      const fetchStats = async () => {
+        setLoadingStats(true);
+        try {
+          const stats = await getDatabaseTableStats();
+          setDbStats(stats);
+        } catch (err) {
+          console.error("[Explorer] Failed to fetch Database table stats:", err);
+        } finally {
+          setLoadingStats(false);
+        }
+      };
+      fetchStats();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [dbTable, refreshTrigger]);
 
   const activeTableObj = useMemo(() => {
     return discoveredTables.find(t => t.name === dbTable);
@@ -659,7 +745,10 @@ export default function Explorer() {
     return isNaN(d.getTime()) ? raw : d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
   };
 
-  const isConnected = tagConfigs.length > 0 || data.length > 0;
+  const isConnected = useMemo(() => {
+    void refreshTrigger;
+    return !!getSupabaseClient();
+  }, [refreshTrigger]);
 
   /* ────────────────────────────────────────────
      RENDER
@@ -745,13 +834,21 @@ export default function Explorer() {
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                {discoveredTables.map(tbl => {
+                {discoveredTables.filter(tbl => tbl.name === dbTable).map(tbl => {
                   const isSelected = tbl.name === dbTable;
                   return (
                     <div key={tbl.name} style={S.schemaTable}>
                       {/* Table Header / Selector */}
                       <div
-                        onClick={() => { setDbTable(tbl.name); setCurrentPage(1); }}
+                        onClick={() => {
+                          setDbTable(tbl.name);
+                          setCurrentPage(1);
+                          const defaultSort = tbl.columns && tbl.columns.length > 0 
+                            ? (tbl.columns.find(c => c.isPk)?.name || tbl.columns[0].name)
+                            : 'DateAndTime';
+                          setSortField(defaultSort);
+                          setSortDirection('desc');
+                        }}
                         style={{
                           ...S.schemaTableHeader,
                           cursor: 'pointer',
@@ -945,6 +1042,127 @@ export default function Explorer() {
             </div>
           </div>
 
+          {/* Table metadata strip */}
+          {activeTableObj && (
+            <div style={{
+              padding: '10px 16px',
+              background: 'var(--surface)',
+              borderBottom: '1px solid var(--border)',
+              display: 'flex',
+              gap: '24px',
+              fontSize: '0.76rem',
+              color: 'var(--text-muted)',
+              flexShrink: 0
+            }}>
+              <div>
+                <span style={{ color: 'var(--text-dim)', marginRight: '6px' }}>Table:</span>
+                <strong style={{ color: 'var(--text)' }}>{activeTableObj.name}</strong>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text-dim)', marginRight: '6px' }}>Row Count:</span>
+                <strong style={{ color: 'var(--text)' }}>{activeTableObj.recordCount !== undefined ? activeTableObj.recordCount.toLocaleString() : '0'}</strong>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text-dim)', marginRight: '6px' }}>Columns:</span>
+                <strong style={{ color: 'var(--text)' }}>{activeColumns.length} fields</strong>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text-dim)', marginRight: '6px' }}>Primary Key:</span>
+                <strong style={{ color: 'var(--secondary)', fontFamily: 'var(--mono)' }}>🔑 {activeTableObj.primaryKey || 'id'}</strong>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text-dim)', marginRight: '6px' }}>Last Record:</span>
+                <strong style={{ color: 'var(--text)' }}>
+                  {activeTableObj.lastRecordTimestamp ? fmtTime(activeTableObj.lastRecordTimestamp) : 'No records'}
+                </strong>
+              </div>
+            </div>
+          )}
+
+          {/* Detailed Statistics Panel for Database Table */}
+          {dbTable === 'Database' && dbStats && (
+            <div style={{
+              margin: '12px 16px 4px 16px',
+              padding: '12px 16px',
+              background: 'var(--surface-raised)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-md)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '10px',
+              flexShrink: 0
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-subtle)', paddingBottom: '6px' }}>
+                <h4 style={{ fontSize: '0.78rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text)', margin: 0, display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  📊 Historian Tag Statistics
+                </h4>
+                <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+                  Latest Entry: <strong style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{dbStats.latestTimestamp ? fmtTime(dbStats.latestTimestamp) : 'N/A'}</strong>
+                </div>
+              </div>
+              
+              {loadingStats ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-muted)', fontSize: '0.72rem', padding: '6px 0' }}>
+                  <div style={{ ...S.spinnerRing, width: '12px', height: '12px', borderWidth: '1px' }} />
+                  Calculating tag telemetry stats...
+                </div>
+              ) : dbStats.tagStats && dbStats.tagStats.length === 0 ? (
+                <div style={{ fontSize: '0.72rem', color: 'var(--text-dim)', padding: '6px 0' }}>
+                  No tag configurations detected or telemetry data written.
+                </div>
+              ) : (
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+                  gap: '8px',
+                  maxHeight: '175px',
+                  overflowY: 'auto',
+                  paddingRight: '4px'
+                }}>
+                  {dbStats.tagStats.map(stat => {
+                    const tagDp = tagConfigs.find(tc => tc.TagIndex === stat.TagIndex)?.DecimalPlaces ?? 2;
+                    return (
+                      <div key={stat.TagIndex} style={{
+                        padding: '8px 10px',
+                        background: 'var(--surface)',
+                        border: '1px solid var(--border-subtle)',
+                        borderRadius: 'var(--radius-sm)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '3px'
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <span style={S.tagIndexChip}>T{stat.TagIndex}</span>
+                          <strong style={{ fontSize: '0.7rem', color: 'var(--text)', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap', maxWidth: '130px' }} title={stat.TagName}>
+                            {stat.TagName}
+                          </strong>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginTop: '2px' }}>
+                          <span style={{ fontSize: '0.62rem', color: 'var(--text-dim)' }}>Value</span>
+                          <strong style={{ fontSize: '0.8rem', color: 'var(--secondary)', fontFamily: 'var(--mono)' }}>
+                            {stat.LatestValue !== null && stat.LatestValue !== undefined 
+                              ? `${stat.LatestValue.toFixed(tagDp)} ${stat.Unit}`.trim()
+                              : '—'
+                            }
+                          </strong>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <span style={{ fontSize: '0.62rem', color: 'var(--text-dim)' }}>Count</span>
+                          <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', fontFamily: 'var(--mono)' }}>{stat.RecordCount.toLocaleString()}</span>
+                        </div>
+                        {stat.LatestTime && (
+                          <div style={{ fontSize: '0.56rem', color: 'var(--text-dim)', textAlign: 'right', marginTop: '1px', fontFamily: 'var(--mono)' }}>
+                            {new Date(stat.LatestTime).toLocaleTimeString()}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* ── Data table ─────────────────────── */}
           <div style={S.tableWrapper}>
             {loading && data.length === 0 ? (
@@ -995,7 +1213,12 @@ export default function Explorer() {
                           }
 
                           let renderedEl;
-                          if (col.name === 'TagIndex' || (settings?.columnMappings && col.name === settings.columnMappings.tagCol)) {
+                          const isTagCol = col.name === 'TagIndex' || (settings?.columnMappings && col.name === settings.columnMappings.tagCol);
+                          const isStatusCol = col.name === 'Status' || (settings?.columnMappings && col.name === settings.columnMappings.statusCol);
+                          const isAlarmCol = col.name === 'Marker' || (settings?.columnMappings && col.name === settings.columnMappings.alarmCol);
+                          const isTimeCol = col.name === 'DateAndTime' || (settings?.columnMappings && col.name === settings.columnMappings.timestampCol);
+
+                          if (isMainHistorian && isTagCol) {
                             const meta = tagMap[displayVal] || {};
                             const tagName = meta.TagName || `Tag ${displayVal}`;
                             renderedEl = (
@@ -1003,24 +1226,24 @@ export default function Explorer() {
                                 T{displayVal}
                               </span>
                             );
-                          } else if (col.name === 'Status' || (settings?.columnMappings && col.name === settings.columnMappings.statusCol)) {
+                          } else if (isMainHistorian && isStatusCol) {
                             const isGood = displayVal === 192;
                             renderedEl = (
                               <span style={isGood ? S.qBadgeGood : S.qBadgeBad}>
                                 {isGood ? 'Good (192)' : `Bad (${displayVal})`}
                               </span>
                             );
-                          } else if (col.name === 'Marker' || (settings?.columnMappings && col.name === settings.columnMappings.alarmCol)) {
+                          } else if (isMainHistorian && isAlarmCol) {
                             renderedEl = displayVal ? (
                               <span style={S.markerBadge}>{displayVal}</span>
                             ) : (
                               <span style={{ opacity: 0.12 }}>—</span>
                             );
-                          } else if (col.name === 'DateAndTime' || (settings?.columnMappings && col.name === settings.columnMappings.timestampCol)) {
+                          } else if (isTimeCol) {
                             renderedEl = <span style={S.tdMono}>{fmtTime(displayVal)}</span>;
                           } else if (typeof displayVal === 'number') {
                             const isValueCol = col.name === 'Val' || (settings?.columnMappings && col.name === settings.columnMappings.valueCol);
-                            if (isValueCol) {
+                            if (isMainHistorian && isValueCol) {
                               const tagIdx = row.TagIndex;
                               const meta = tagMap[tagIdx] || {};
                               const dp = meta.DecimalPlaces !== undefined ? meta.DecimalPlaces : 2;

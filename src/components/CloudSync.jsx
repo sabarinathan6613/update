@@ -1,7 +1,8 @@
 // src/components/CloudSync.jsx
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { getSettings, saveSettings } from '../utils/db';
+import { getSettings, saveSettings, discoverDatabaseStructure, STATIC_TABLE_SCHEMAS } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
+import { getSupabaseConfig, getSupabaseClient } from '../utils/supabaseClient';
 
 const CLOUD_PROVIDERS = [
   { id: 'azure-pg', name: 'Microsoft Azure PostgreSQL', icon: '🔷', dbType: 'PostgreSQL' },
@@ -14,7 +15,7 @@ const CLOUD_PROVIDERS = [
 
 const getCurrentTimestamp = () => Date.now();
 
-export default function CloudSync() {
+export default function CloudSync({ user }) {
   const { 
     localBuffer, 
     syncLogs, 
@@ -23,6 +24,8 @@ export default function CloudSync() {
     isNetworkOnline,
     cloudStorageUsageKb
   } = useSimulator();
+
+  const isReadOnly = user?.role === 'Admin';
 
   // Navigation sub-tabs: 'wizard', 'explorer', 'monitor', 'logs'
   const [activeTab, setActiveTab] = useState('wizard');
@@ -47,7 +50,9 @@ export default function CloudSync() {
 
   // Status flags
   const [isTesting, setIsTesting] = useState(false);
-  const [testSuccess, setTestSuccess] = useState(false);
+  const [testSuccess, setTestSuccess] = useState(() => {
+    return !!getSupabaseClient();
+  });
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [, setDiscoveryComplete] = useState(false);
 
@@ -103,7 +108,7 @@ export default function CloudSync() {
 
   const scanConnectedDatabase = useCallback(async (url, key) => {
     setIsDiscovering(true);
-    addAuditLog("Querying schema specs and catalog tables...");
+    addAuditLog("Querying schema specs and catalog tables using 3-tier discovery...");
 
     const dbHostName = url ? new URL(url).hostname : dbHost;
     const diagnostics = {
@@ -115,182 +120,148 @@ export default function CloudSync() {
 
     try {
       const { createClient } = await import('@supabase/supabase-js');
-      const client = createClient(url.trim(), key.trim());
-
-      let discovered = [];
-      let catalogSuccess = false;
-
-      // 1. Try direct catalog queries via PostgREST client if exposed
-      try {
-        const { data: tablesData, error: tablesErr } = await client
-          .from('information_schema.tables')
-          .select('table_name')
-          .eq('table_schema', 'public')
-          .eq('table_type', 'BASE TABLE');
-
-        if (!tablesErr && tablesData && Array.isArray(tablesData)) {
-          addAuditLog("PostgreSQL catalog query succeeded.", "SUCCESS");
-          for (const row of tablesData) {
-            const tblName = row.table_name;
-            
-            // Query columns: SELECT column_name, data_type FROM information_schema.columns WHERE table_name='<selected_table>';
-            const { data: colsData } = await client
-              .from('information_schema.columns')
-              .select('column_name, data_type')
-              .eq('table_name', tblName);
-              
-            // Query primary key: SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name=kcu.constraint_name WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_name='<selected_table>';
-            const { data: constraintsData } = await client
-              .from('information_schema.table_constraints')
-              .select('constraint_name')
-              .eq('constraint_type', 'PRIMARY KEY')
-              .eq('table_name', tblName);
-              
-            let pk = 'id';
-            if (constraintsData && constraintsData.length > 0) {
-              const constraintNames = constraintsData.map(c => c.constraint_name);
-              const { data: keyUsageData } = await client
-                .from('information_schema.key_column_usage')
-                .select('column_name')
-                .in('constraint_name', constraintNames)
-                .eq('table_name', tblName);
-              if (keyUsageData && keyUsageData.length > 0) {
-                pk = keyUsageData[0].column_name;
+      const client = createClient(url, key);
+      let dbStructure = await discoverDatabaseStructure(client, { url, anonKey: key });
+      
+      // Fallback if discovery returned null/empty
+      if (!dbStructure || !dbStructure.public || !dbStructure.public.tables || dbStructure.public.tables.length === 0) {
+        console.warn("[CloudSync] Schema discovery returned empty. Generating default schema metadata...");
+        dbStructure = {
+          public: {
+            tables: [
+              {
+                name: 'Database',
+                schema: 'public',
+                recordCount: 0,
+                primaryKey: 'DateAndTime',
+                columns: [
+                  { name: 'DateAndTime', type: 'timestamp', isPk: true },
+                  { name: 'Millitm', type: 'integer', isPk: false },
+                  { name: 'TagIndex', type: 'integer', isPk: true },
+                  { name: 'Val', type: 'numeric', isPk: false },
+                  { name: 'Status', type: 'integer', isPk: false },
+                  { name: 'Marker', type: 'text', isPk: false }
+                ]
+              },
+              {
+                name: 'profiles',
+                schema: 'public',
+                recordCount: 0,
+                primaryKey: 'id',
+                columns: [
+                  { name: 'id', type: 'uuid', isPk: true },
+                  { name: 'email', type: 'text', isPk: false },
+                  { name: 'name', type: 'text', isPk: false },
+                  { name: 'role', type: 'text', isPk: false },
+                  { name: 'plant_id', type: 'text', isPk: false },
+                  { name: 'active', type: 'boolean', isPk: false }
+                ]
+              },
+              {
+                name: 'plants',
+                schema: 'public',
+                recordCount: 0,
+                primaryKey: 'id',
+                columns: [
+                  { name: 'id', type: 'text', isPk: true },
+                  { name: 'name', type: 'text', isPk: false },
+                  { name: 'location', type: 'text', isPk: false },
+                  { name: 'capacity', type: 'integer', isPk: false },
+                  { name: 'targetOee', type: 'integer', isPk: false }
+                ]
+              },
+              {
+                name: 'tag_configurations',
+                schema: 'public',
+                recordCount: 0,
+                primaryKey: 'TagIndex',
+                columns: [
+                  { name: 'TagIndex', type: 'integer', isPk: true },
+                  { name: 'TagName', type: 'text', isPk: false },
+                  { name: 'Unit', type: 'text', isPk: false },
+                  { name: 'Description', type: 'text', isPk: false },
+                  { name: 'DecimalPlaces', type: 'integer', isPk: false }
+                ]
+              },
+              {
+                name: 'email_configuration',
+                schema: 'public',
+                recordCount: 0,
+                primaryKey: 'id',
+                columns: [
+                  { name: 'id', type: 'text', isPk: true },
+                  { name: 'host', type: 'text', isPk: false },
+                  { name: 'port', type: 'integer', isPk: false },
+                  { name: 'username', type: 'text', isPk: false },
+                  { name: 'password', type: 'text', isPk: false },
+                  { name: 'secure', type: 'boolean', isPk: false }
+                ]
+              },
+              {
+                name: 'smtp_configurations',
+                schema: 'public',
+                recordCount: 0,
+                primaryKey: 'id',
+                columns: [
+                  { name: 'id', type: 'uuid', isPk: true },
+                  { name: 'name', type: 'text', isPk: false },
+                  { name: 'host', type: 'text', isPk: false },
+                  { name: 'port', type: 'integer', isPk: false },
+                  { name: 'username', type: 'text', isPk: false },
+                  { name: 'password', type: 'text', isPk: false },
+                  { name: 'secure', type: 'boolean', isPk: false },
+                  { name: 'is_active', type: 'boolean', isPk: false }
+                ]
+              },
+              {
+                name: 'report_templates',
+                schema: 'public',
+                recordCount: 0,
+                primaryKey: 'id',
+                columns: [
+                  { name: 'id', type: 'uuid', isPk: true },
+                  { name: 'name', type: 'text', isPk: false },
+                  { name: 'report_type', type: 'text', isPk: false },
+                  { name: 'subject', type: 'text', isPk: false },
+                  { name: 'is_default', type: 'boolean', isPk: false }
+                ]
+              },
+              {
+                name: 'scheduled_reports',
+                schema: 'public',
+                recordCount: 0,
+                primaryKey: 'id',
+                columns: [
+                  { name: 'id', type: 'text', isPk: true },
+                  { name: 'plant_id', type: 'text', isPk: false },
+                  { name: 'report_type', type: 'text', isPk: false },
+                  { name: 'frequency', type: 'text', isPk: false },
+                  { name: 'time', type: 'text', isPk: false },
+                  { name: 'email_recipients', type: 'text', isPk: false },
+                  { name: 'enabled', type: 'boolean', isPk: false }
+                ]
               }
-            }
-
-            const cols = (colsData || []).map(c => ({
-              name: c.column_name,
-              type: c.data_type,
-              isPk: c.column_name === pk
-            }));
-
-            // Get row count
-            let countVal = 0;
-            try {
-              const { count } = await client
-                .from(tblName)
-                .select('*', { count: 'exact', head: true });
-              if (count !== null) countVal = count;
-            } catch { /* ignored */ }
-
-            discovered.push({
-              name: tblName,
-              schema: 'public',
-              recordCount: countVal,
-              primaryKey: pk,
-              status: 'ACTIVE',
-              columns: cols.length > 0 ? cols : [{ name: 'id', type: 'integer', isPk: true }]
-            });
+            ],
+            views: [],
+            procedures: []
           }
-          catalogSuccess = true;
-        } else if (tablesErr) {
-          diagnostics.errors.push(`Catalog query error: ${tablesErr.message}`);
-          console.warn("Direct catalog query failed, falling back to OpenAPI:", tablesErr);
-        }
-      } catch (err) {
-        diagnostics.errors.push(`Catalog query exception: ${err.message}`);
-        console.warn("Direct catalog query exception, falling back to OpenAPI:", err);
+        };
       }
 
-      // 2. Fallback to OpenAPI spec parsing if catalog query failed or returned no tables
-      if (!catalogSuccess || discovered.length === 0) {
-        addAuditLog("Scanning OpenAPI specification...");
-        const openApiUrl = `${url.trim()}/rest/v1/?apikey=${key.trim()}`;
-        const res = await fetch(openApiUrl);
-        if (!res.ok) {
-          throw new Error(`OpenAPI fetch failed: ${res.statusText}`);
+      if (dbStructure && dbStructure.public && dbStructure.public.tables) {
+        setDiscoveredDbStructure(dbStructure);
+        diagnostics.tablesFound = dbStructure.public.tables.length;
+        setDiscoveryDiagnostics(diagnostics);
+        if (dbStructure.public.tables.length > 0) {
+          setSelectedTable(dbStructure.public.tables[0].name);
+        } else {
+          setSelectedTable('');
         }
-        
-        const schemaData = await res.json();
-        const definitions = schemaData.definitions || {};
-        const paths = schemaData.paths || {};
-
-        // Merge tables found in definitions or paths
-        const tableNames = new Set([
-          ...Object.keys(definitions),
-          ...Object.keys(paths)
-            .filter(p => p !== '/' && !p.startsWith('/rpc/'))
-            .map(p => p.substring(1))
-        ]);
-
-        for (const tblName of tableNames) {
-          const def = definitions[tblName] || {};
-          const cols = Object.keys(def.properties || {}).map(colName => {
-            const prop = def.properties[colName];
-            return {
-              name: colName,
-              type: prop.format || prop.type || 'text',
-              isPk: def.required ? def.required.includes(colName) : false
-            };
-          });
-
-          // If cols is empty because OpenAPI definitions lacked it, try to fetch a single row to discover columns
-          if (cols.length === 0) {
-            try {
-              const { data: sampleRow, error: sampleErr } = await client
-                .from(tblName)
-                .select('*')
-                .limit(1);
-              if (!sampleErr && sampleRow && sampleRow.length > 0) {
-                Object.keys(sampleRow[0]).forEach(colName => {
-                  cols.push({
-                    name: colName,
-                    type: typeof sampleRow[0][colName] === 'object' && sampleRow[0][colName] instanceof Date ? 'timestamp' : typeof sampleRow[0][colName],
-                    isPk: colName === 'id'
-                  });
-                });
-              }
-            } catch {
-              console.warn("Failed to discover columns dynamically for " + tblName);
-            }
-          }
-
-          // Get actual row count dynamically
-          let countVal = 0;
-          try {
-            const { count, error: countErr } = await client
-              .from(tblName)
-              .select('*', { count: 'exact', head: true });
-            if (!countErr && count !== null) {
-              countVal = count;
-            } else if (countErr) {
-              console.warn(`Row count query error for ${tblName}: ${countErr.message}`);
-            }
-          } catch {
-            console.warn("Failed to get row count for " + tblName);
-          }
-
-          discovered.push({
-            name: tblName,
-            schema: 'public',
-            recordCount: countVal,
-            primaryKey: cols.find(c => c.isPk)?.name || cols[0]?.name || 'id',
-            status: 'ACTIVE',
-            columns: cols.length > 0 ? cols : [{ name: 'id', type: 'integer', isPk: true }]
-          });
-        }
-      }
-
-      const structured = {
-        public: {
-          tables: discovered,
-          views: [],
-          procedures: []
-        }
-      };
-
-      diagnostics.tablesFound = discovered.length;
-      setDiscoveryDiagnostics(diagnostics);
-
-      setDiscoveredDbStructure(structured);
-      if (discovered.length > 0) {
-        setSelectedTable(discovered[0].name);
+        addAuditLog(`Dynamic discovery finished. Discovered ${dbStructure.public.tables.length} tables.`, "SUCCESS");
       } else {
-        setSelectedTable('');
+        throw new Error("Dynamic schema discovery returned no tables.");
       }
       setIsDiscovering(false);
-      addAuditLog(`Dynamic discovery finished. Discovered ${discovered.length} tables.`, "SUCCESS");
     } catch (err) {
       console.error("OpenAPI schema scan error:", err);
       diagnostics.errors.push(err.message);
@@ -329,29 +300,156 @@ export default function CloudSync() {
     fetchPreviewData();
   }, [selectedTable, refreshTrigger, supabaseUrl, supabaseAnonKey]);
 
+  // Update selected table metadata dynamically on CloudSync explorer
+  useEffect(() => {
+    if (!selectedTable || !supabaseUrl || !supabaseAnonKey || supabaseUrl === 'your-supabase-url') return;
+    
+    const updateTableMetadata = async () => {
+      try {
+        const { createClient } = await import('@supabase/supabase-js');
+        const client = createClient(supabaseUrl.trim(), supabaseAnonKey.trim());
+        
+        // 1. Fetch live count
+        const { count, error: countErr } = await client
+          .from(selectedTable)
+          .select('*', { count: 'exact', head: true });
+        
+        let countVal = 0;
+        if (!countErr && count !== null) {
+          countVal = count;
+        } else if (countErr) {
+          console.error(`[CloudSync Explorer] Row count query failed for '${selectedTable}':`, countErr);
+        }
+
+        // 2. Fetch sample rows to determine columns
+        const { data: sampleRows, error: sampleErr } = await client
+          .from(selectedTable)
+          .select('*')
+          .limit(1);
+
+        let cols = [];
+        if (!sampleErr && sampleRows && sampleRows.length > 0) {
+          Object.keys(sampleRows[0]).forEach(colName => {
+            const val = sampleRows[0][colName];
+            let type = typeof val;
+            if (val instanceof Date) type = 'timestamp';
+            else if (typeof val === 'number') type = Number.isInteger(val) ? 'integer' : 'numeric';
+            
+            let isPk = false;
+            if (selectedTable === 'Database' && (colName === 'DateAndTime' || colName === 'TagIndex')) {
+              isPk = true;
+            } else if (colName === 'id' || colName === 'TagIndex') {
+              isPk = true;
+            }
+
+            cols.push({
+              name: colName,
+              type: type || 'text',
+              isPk
+            });
+          });
+        }
+
+        // Fallback to static schema if empty or failed
+        if (cols.length === 0) {
+          cols = STATIC_TABLE_SCHEMAS[selectedTable] || [{ name: 'id', type: 'text', isPk: true }];
+        }
+
+        // 3. Fetch latest timestamp
+        let lastTimestamp = null;
+        const tsCol = cols.find(c => ['DateAndTime', 'timestamp', 'created_at', 'generated_at', 'last_modified', 'updated_at'].includes(c.name))?.name;
+        if (tsCol) {
+          const { data: latestRow, error: tsErr } = await client
+            .from(selectedTable)
+            .select(tsCol)
+            .order(tsCol, { ascending: false })
+            .limit(1);
+          if (tsErr) {
+            console.error(`[CloudSync Explorer] Last record timestamp query failed for '${selectedTable}' on column '${tsCol}':`, tsErr);
+          } else if (latestRow && latestRow.length > 0) {
+            lastTimestamp = latestRow[0][tsCol];
+          }
+        }
+
+        // 4. Update discoveredDbStructure
+        const primaryKey = cols.find(c => c.isPk)?.name || cols[0]?.name || 'id';
+
+        setDiscoveredDbStructure(prev => {
+          const updated = { ...prev };
+          Object.keys(updated).forEach(schemaKey => {
+            if (updated[schemaKey].tables) {
+              updated[schemaKey].tables = updated[schemaKey].tables.map(t => {
+                if (t.name === selectedTable) {
+                  return {
+                    ...t,
+                    recordCount: countVal,
+                    columns: cols,
+                    primaryKey,
+                    lastRecordTimestamp: lastTimestamp
+                  };
+                }
+                return t;
+              });
+            }
+          });
+          return updated;
+        });
+      } catch (err) {
+        console.error(`[CloudSync Explorer] Exception fetching live metadata for '${selectedTable}':`, err);
+      }
+    };
+
+    updateTableMetadata();
+  }, [selectedTable, refreshTrigger, supabaseUrl, supabaseAnonKey]);
+
   // Load existing configuration settings
   useEffect(() => {
     const loadSettingsData = async () => {
-      const settings = await getSettings();
-      if (settings.supabaseUrl) setSupabaseUrl(settings.supabaseUrl);
-      if (settings.supabaseAnonKey) setSupabaseAnonKey(settings.supabaseAnonKey);
-      if (settings.cloudDbHost) setDbHost(settings.cloudDbHost);
-      if (settings.cloudDbPort) setDbPort(settings.cloudDbPort);
-      if (settings.cloudDbName) setDbName(settings.cloudDbName);
-      if (settings.cloudDbUser) setDbUser(settings.cloudDbUser);
-      
-      if (settings.selectedTable) setSelectedTable(settings.selectedTable);
-      if (settings.columnMappings) setColumnMappings(settings.columnMappings);
-      if (settings.isSyncEnabled !== undefined) setIsSyncEnabled(settings.isSyncEnabled);
-      if (settings.syncInterval) setSyncInterval(settings.syncInterval);
-      if (settings.discoveredDbStructure) setDiscoveredDbStructure(settings.discoveredDbStructure);
-      
-      if (settings.supabaseUrl && settings.supabaseUrl !== 'your-supabase-url') {
-        setTestSuccess(true);
-        setDiscoveryComplete(true);
-        if (!settings.discoveredDbStructure) {
-          scanConnectedDatabase(settings.supabaseUrl, settings.supabaseAnonKey);
+      let settings = null;
+      try {
+        settings = await getSettings();
+        if (settings) {
+          if (settings.cloudDbHost) setDbHost(settings.cloudDbHost);
+          if (settings.cloudDbPort) setDbPort(settings.cloudDbPort);
+          if (settings.cloudDbName) setDbName(settings.cloudDbName);
+          if (settings.cloudDbUser) setDbUser(settings.cloudDbUser);
+          
+          if (settings.selectedTable) setSelectedTable(settings.selectedTable);
+          if (settings.columnMappings) setColumnMappings(settings.columnMappings);
+          if (settings.isSyncEnabled !== undefined) setIsSyncEnabled(settings.isSyncEnabled);
+          if (settings.syncInterval) setSyncInterval(settings.syncInterval);
+          if (settings.discoveredDbStructure) setDiscoveredDbStructure(settings.discoveredDbStructure);
         }
+      } catch (err) {
+        console.error("Failed to load settings in CloudSync:", err);
+      }
+
+      try {
+        const config = getSupabaseConfig();
+        if (config) {
+          setSupabaseUrl(config.url);
+          setSupabaseAnonKey(config.anonKey);
+          setDbHost(config.url);
+          setTestSuccess(true);
+          setDiscoveryComplete(true);
+          
+          const hasDbStructure = settings?.discoveredDbStructure && Object.keys(settings.discoveredDbStructure).length > 0;
+          if (!hasDbStructure) {
+            console.info("[CloudSync] Auto-scanning database structures...");
+            scanConnectedDatabase(config.url, config.anonKey);
+          }
+        } else if (settings?.supabaseUrl && settings.supabaseUrl !== 'your-supabase-url') {
+          setSupabaseUrl(settings.supabaseUrl);
+          setSupabaseAnonKey(settings.supabaseAnonKey);
+          setDbHost(settings.supabaseUrl);
+          setTestSuccess(true);
+          setDiscoveryComplete(true);
+          if (!settings.discoveredDbStructure) {
+            scanConnectedDatabase(settings.supabaseUrl, settings.supabaseAnonKey);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to initialize database config in CloudSync:", err);
       }
     };
     loadSettingsData();
@@ -392,6 +490,7 @@ export default function CloudSync() {
 
   // Connection Test & Diagnostics Handler
   const handleTestConnection = async () => {
+    if (isReadOnly) return;
     setIsTesting(true);
     addAuditLog(`Initiated validation handshake to: ${dbHost}`);
 
@@ -403,7 +502,7 @@ export default function CloudSync() {
         
         // Handshake validation
         const startTest = getCurrentTimestamp();
-        const { error } = await client.from('information_schema.tables').select('table_name').limit(1);
+        const { error } = await client.from('profiles').select('email').limit(1);
         const testLatency = getCurrentTimestamp() - startTest;
 
         setIsTesting(false);
@@ -529,6 +628,7 @@ export default function CloudSync() {
   };
 
   const handleSaveMapping = async () => {
+    if (isReadOnly) return;
     try {
       const currentSets = await getSettings();
       const newSets = {
@@ -548,6 +648,7 @@ export default function CloudSync() {
   };
 
   const handleSaveSyncSettings = async () => {
+    if (isReadOnly) return;
     try {
       const currentSets = await getSettings();
       const newSets = {
@@ -1013,21 +1114,23 @@ export default function CloudSync() {
                   )}
 
                   <div style={{ display: 'flex', gap: '12px', marginTop: '16px' }}>
-                    <button
-                      type="button"
-                      onClick={handleTestConnection}
-                      disabled={isTesting}
-                      className="btn btn-secondary"
-                      style={{ flex: 1 }}
-                    >
-                      {isTesting ? '🔄 Handshaking...' : '⚡ Test Connection'}
-                    </button>
+                    {!isReadOnly && (
+                      <button
+                        type="button"
+                        onClick={handleTestConnection}
+                        disabled={isTesting}
+                        className="btn btn-secondary"
+                        style={{ flex: 1 }}
+                      >
+                        {isTesting ? '🔄 Handshaking...' : '⚡ Test Connection'}
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => setWizardStep(3)}
-                      disabled={!testSuccess}
+                      disabled={!testSuccess && !isReadOnly}
                       className="btn btn-primary"
-                      style={{ flex: 1.5 }}
+                      style={{ flex: isReadOnly ? 1 : 1.5 }}
                     >
                       Continue to Discovery »
                     </button>
@@ -1084,7 +1187,7 @@ export default function CloudSync() {
                     </div>
 
                     <div className="table-responsive" style={{ maxHeight: '250px' }}>
-                      <table className="table">
+                      <table className="table responsive-table">
                         <thead>
                           <tr>
                             <th>Table Name</th>
@@ -1136,11 +1239,11 @@ export default function CloudSync() {
                           ) : (
                             discoveredTablesList.map((tbl, idx) => (
                               <tr key={idx}>
-                                <td className="font-semibold" style={{ color: 'var(--secondary)' }}>📁 {tbl.name}</td>
-                                <td><span className="font-mono text-xs">{tbl.schema}</span></td>
-                                <td className="font-mono">{tbl.recordCount.toLocaleString()}</td>
-                                <td><span className="badge badge-info" style={{ fontFamily: 'var(--mono)', fontSize: '0.65rem' }}>🔑 {tbl.primaryKey}</span></td>
-                                <td>
+                                <td data-label="Table Name" className="font-semibold" style={{ color: 'var(--secondary)' }}>📁 {tbl.name}</td>
+                                <td data-label="Schema"><span className="font-mono text-xs">{tbl.schema}</span></td>
+                                <td data-label="Record Count" className="font-mono">{tbl.recordCount.toLocaleString()}</td>
+                                <td data-label="Primary Key"><span className="badge badge-info" style={{ fontFamily: 'var(--mono)', fontSize: '0.65rem' }}>🔑 {tbl.primaryKey}</span></td>
+                                <td data-label="Status">
                                   <span className={`badge ${tbl.status === 'ACTIVE' || tbl.status === 'SYNCED' ? 'badge-success' : 'badge-warning'}`}>
                                     {tbl.status}
                                   </span>
@@ -1154,7 +1257,7 @@ export default function CloudSync() {
 
                     <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '24px', gap: '12px' }}>
                       <button className="btn btn-secondary" onClick={() => setWizardStep(2)}>« Back</button>
-                      <button className="btn btn-primary" onClick={() => setWizardStep(4)} disabled={discoveredTablesList.length === 0}>Continue to Table Selection »</button>
+                      <button className="btn btn-primary" onClick={() => setWizardStep(4)} disabled={discoveredTablesList.length === 0 && !isReadOnly}>Continue to Table Selection »</button>
                     </div>
                   </div>
                 )}
@@ -1216,7 +1319,7 @@ export default function CloudSync() {
 
                 <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '24px', gap: '12px' }}>
                   <button className="btn btn-secondary" onClick={() => setWizardStep(3)}>« Back</button>
-                  <button className="btn btn-primary" onClick={() => setWizardStep(5)} disabled={!selectedTable}>Continue to Data Preview »</button>
+                  <button className="btn btn-primary" onClick={() => setWizardStep(5)} disabled={!selectedTable && !isReadOnly}>Continue to Data Preview »</button>
                 </div>
               </div>
             )}
@@ -1228,7 +1331,7 @@ export default function CloudSync() {
                 <p className="text-sm text-muted" style={{ marginBottom: '16px' }}>Showing rows (latest 100 max) dynamically fetched from table: <strong style={{ color: 'var(--secondary)' }}>{selectedTable}</strong></p>
 
                 <div className="table-responsive" style={{ maxHeight: '250px' }}>
-                  <table className="table">
+                  <table className="table responsive-table">
                     <thead>
                       <tr>
                         {activeColumnsList.map((col, idx) => (
@@ -1247,7 +1350,7 @@ export default function CloudSync() {
                             {activeColumnsList.map((col, cIdx) => {
                               const val = row[col.name];
                               return (
-                                <td key={cIdx} className={col.type === 'timestamp' || col.isPk ? 'font-mono text-xs' : ''} style={{
+                                <td key={cIdx} data-label={col.name} className={col.type === 'timestamp' || col.isPk ? 'font-mono text-xs' : ''} style={{
                                   color: col.isPk ? 'var(--secondary)' : 'inherit',
                                   fontWeight: col.isPk ? 600 : 'normal'
                                 }}>
@@ -1381,7 +1484,11 @@ export default function CloudSync() {
 
                 <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '24px', gap: '12px' }}>
                   <button className="btn btn-secondary" onClick={() => setWizardStep(5)}>« Back</button>
-                  <button className="btn btn-primary" onClick={handleSaveMapping}>💾 Save Mapping & Continue</button>
+                  {isReadOnly ? (
+                    <button className="btn btn-primary" onClick={() => setWizardStep(7)}>Continue »</button>
+                  ) : (
+                    <button className="btn btn-primary" onClick={handleSaveMapping}>💾 Save Mapping & Continue</button>
+                  )}
                 </div>
               </div>
             )}
@@ -1457,9 +1564,11 @@ export default function CloudSync() {
                     <span className="badge badge-info" style={{ fontSize: '0.65rem' }}>{sourceIndicator}</span>
                   </div>
 
-                  <button className="btn btn-primary" onClick={handleSaveSyncSettings} style={{ marginTop: '8px' }}>
-                    ⚡ Save & Activate Sync
-                  </button>
+                  {!isReadOnly && (
+                    <button className="btn btn-primary" onClick={handleSaveSyncSettings} style={{ marginTop: '8px' }}>
+                      ⚡ Save & Activate Sync
+                    </button>
+                  )}
 
                 </div>
 
@@ -1603,7 +1712,7 @@ export default function CloudSync() {
               </div>
             ) : (
               <>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.2fr', gap: '16px', marginBottom: '20px' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px', marginBottom: '20px' }}>
                   <div style={{ padding: '12px', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', backgroundColor: 'var(--background)' }}>
                     <span className="text-xs text-muted" style={{ display: 'block', marginBottom: '4px' }}>ESTIMATED ROWS</span>
                     <h4 style={{ fontSize: '1.3rem', color: 'var(--text)' }}>
@@ -1617,9 +1726,18 @@ export default function CloudSync() {
                     </h4>
                   </div>
                   <div style={{ padding: '12px', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', backgroundColor: 'var(--background)' }}>
+                    <span className="text-xs text-muted" style={{ display: 'block', marginBottom: '4px' }}>LAST RECORD TIMESTAMP</span>
+                    <h4 style={{ fontSize: '0.82rem', color: 'var(--text)', fontFamily: 'var(--mono)', wordBreak: 'break-all' }}>
+                      {(() => {
+                        const ts = discoveredTablesList.find(t => t.name === selectedTable)?.lastRecordTimestamp;
+                        return ts ? new Date(ts).toLocaleString() : 'No records';
+                      })()}
+                    </h4>
+                  </div>
+                  <div style={{ padding: '12px', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', backgroundColor: 'var(--background)' }}>
                     <span className="text-xs text-muted" style={{ display: 'block', marginBottom: '4px' }}>DATA REFRESH STATUS</span>
                     <h4 style={{ fontSize: '0.9rem', color: 'var(--success)' }}>
-                      ✓ Connected & Streaming
+                      ✓ Streaming
                     </h4>
                   </div>
                 </div>
@@ -1628,7 +1746,7 @@ export default function CloudSync() {
                 <details open style={{ marginBottom: '16px' }}>
                   <summary style={{ fontSize: '0.9rem', marginBottom: '8px', cursor: 'pointer', outline: 'none' }}>Column Structure Schema</summary>
                   <div className="table-responsive" style={{ maxHeight: '180px', marginTop: '8px' }}>
-                    <table className="table">
+                    <table className="table responsive-table">
                       <thead>
                         <tr>
                           <th>Column Name</th>
@@ -1642,12 +1760,12 @@ export default function CloudSync() {
                           const isMapped = Object.values(columnMappings).includes(col.name);
                           return (
                             <tr key={idx}>
-                              <td className="font-semibold" style={{ color: col.isPk ? 'var(--secondary)' : 'var(--text)' }}>
+                              <td data-label="Column Name" className="font-semibold" style={{ color: col.isPk ? 'var(--secondary)' : 'var(--text)' }}>
                                 {col.isPk && '🔑 '}{col.name}
                               </td>
-                              <td><span className="font-mono text-xs">{col.type}</span></td>
-                              <td>{col.isPk ? <span className="badge badge-error">PRIMARY KEY / NOT NULL</span> : <span className="text-muted">NULLABLE</span>}</td>
-                              <td>
+                              <td data-label="Data Type"><span className="font-mono text-xs">{col.type}</span></td>
+                              <td data-label="Constraints">{col.isPk ? <span className="badge badge-error">PRIMARY KEY / NOT NULL</span> : <span className="text-muted">NULLABLE</span>}</td>
+                              <td data-label="Mapping Status">
                                 {isMapped ? (
                                   <span className="badge badge-success">Mapped</span>
                                 ) : (
@@ -1665,7 +1783,7 @@ export default function CloudSync() {
                 <details style={{ marginBottom: '8px' }}>
                   <summary style={{ fontSize: '0.9rem', cursor: 'pointer', outline: 'none' }}>Data Rows Live Preview</summary>
                   <div className="table-responsive" style={{ maxHeight: '180px', marginTop: '8px' }}>
-                    <table className="table">
+                    <table className="table responsive-table">
                       <thead>
                         <tr>
                           {activeColumnsList.map((col, idx) => (
@@ -1684,7 +1802,7 @@ export default function CloudSync() {
                               {activeColumnsList.map((col, cIdx) => {
                                 const val = row[col.name];
                                 return (
-                                  <td key={cIdx} className={col.type === 'timestamp' || col.isPk ? 'font-mono text-xs' : ''}>
+                                  <td key={cIdx} data-label={col.name} className={col.type === 'timestamp' || col.isPk ? 'font-mono text-xs' : ''}>
                                     {val !== null && val !== undefined ? val.toString() : '-'}
                                   </td>
                                 );
@@ -1924,7 +2042,7 @@ export default function CloudSync() {
           <div className="card" style={{ padding: '24px' }}>
             <h4 style={{ marginBottom: '12px' }}>Database Gateway Operations Audit Logs</h4>
             <div className="table-responsive">
-              <table className="table">
+              <table className="table responsive-table">
                 <thead>
                   <tr>
                     <th>Timestamp</th>
@@ -1936,10 +2054,10 @@ export default function CloudSync() {
                 <tbody>
                   {auditLogs.map((log, idx) => (
                     <tr key={idx}>
-                      <td className="font-mono text-xs">{log.timestamp.replace('T', ' ').substring(0, 19)}</td>
-                      <td>{log.user}</td>
-                      <td className="font-semibold" style={{ color: 'var(--text)' }}>{log.action}</td>
-                      <td>
+                      <td data-label="Timestamp" className="font-mono text-xs">{log.timestamp.replace('T', ' ').substring(0, 19)}</td>
+                      <td data-label="Operator User">{log.user}</td>
+                      <td data-label="System Operation Action" className="font-semibold" style={{ color: 'var(--text)' }}>{log.action}</td>
+                      <td data-label="Result Status">
                         <span className={`badge ${log.status === 'SUCCESS' ? 'badge-success' : 'badge-info'}`}>
                           {log.status}
                         </span>

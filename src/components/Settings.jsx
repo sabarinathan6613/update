@@ -1,17 +1,16 @@
 // src/components/Settings.jsx
 import { useState, useEffect, useCallback } from 'react';
 import { 
-  getSettings, saveSettings, 
   getSchedules, saveSchedule, deleteSchedule, 
-  getPlants, getEmailLogs, addEmailLog,
-  getTagConfigs, compileReportData,
-  getRecipients, saveRecipient, deleteRecipient, bulkUpdateRecipientsStatus
+  getPlants, getEmailLogs, getSchedulerHistory,
+  getSmtpConfigurations, saveSmtpConfiguration, deleteSmtpConfiguration, setActiveSmtpConfiguration,
+  getReportTemplates, saveReportTemplate, deleteReportTemplate, setDefaultReportTemplate
 } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
 /* ─────────────────────────────────────────────
-   Eye icon SVGs
-───────────────────────────────────────────── */
+   SVGs & Icons
+   ───────────────────────────────────────────── */
 const EyeOpen = () => (
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
     stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
@@ -32,9 +31,6 @@ const EyeOff = () => (
   </svg>
 );
 
-/* ─────────────────────────────────────────────
-   Toggle Switch Component
-───────────────────────────────────────────── */
 function ToggleSwitch({ checked, onChange, id }) {
   return (
     <label htmlFor={id} style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', cursor: 'pointer', gap: '10px' }}>
@@ -48,8 +44,8 @@ function ToggleSwitch({ checked, onChange, id }) {
       <span style={{
         position: 'relative',
         display: 'inline-block',
-        width: 44,
-        height: 24,
+        width: 40,
+        height: 20,
         backgroundColor: checked ? 'var(--secondary)' : 'var(--border)',
         borderRadius: 34,
         transition: 'background-color 0.25s ease',
@@ -57,9 +53,9 @@ function ToggleSwitch({ checked, onChange, id }) {
       }}>
         <span style={{
           position: 'absolute',
-          height: 18,
-          width: 18,
-          left: checked ? 22 : 3,
+          height: 14,
+          width: 14,
+          left: checked ? 23 : 3,
           top: 3,
           backgroundColor: 'white',
           borderRadius: '50%',
@@ -71,71 +67,155 @@ function ToggleSwitch({ checked, onChange, id }) {
   );
 }
 
+function getPlantTimeZone(plantId) {
+  if (!plantId) return 'UTC';
+  const cleanId = String(plantId).trim();
+  switch (cleanId) {
+    case 'plant-1': return 'America/New_York';
+    case 'plant-2': return 'Europe/Berlin';
+    case 'plant-3': return 'Asia/Tokyo';
+    case 'plant-4':
+    case 'plant':
+    case 'Mettur':
+    case 'mettur':
+      return 'Asia/Kolkata';
+    default: return 'UTC';
+  }
+}
+
+function getTimeZoneOffsetMs(timeZone, date = new Date()) {
+  try {
+    const tzString = date.toLocaleString('en-US', { timeZone });
+    const localDate = new Date(tzString);
+    const utcString = date.toLocaleString('en-US', { timeZone: 'UTC' });
+    const utcDate = new Date(utcString);
+    return localDate.getTime() - utcDate.getTime();
+  } catch (e) {
+    console.error("getTimeZoneOffsetMs error:", e);
+    return 0;
+  }
+}
+
+function convertLocalToUtcTime(localTimeStr, plantId) {
+  if (!localTimeStr) return '00:00';
+  const [hour, min] = localTimeStr.split(':').map(Number);
+  const date = new Date();
+  date.setUTCHours(12, 0, 0, 0);
+  const tz = getPlantTimeZone(plantId);
+  const offsetMs = getTimeZoneOffsetMs(tz, date);
+  const targetLocalDate = new Date(date);
+  targetLocalDate.setUTCHours(hour, min, 0, 0);
+  const targetUtcDate = new Date(targetLocalDate.getTime() - offsetMs);
+  const utcHourStr = String(targetUtcDate.getUTCHours()).padStart(2, '0');
+  const utcMinStr = String(targetUtcDate.getUTCMinutes()).padStart(2, '0');
+  return `${utcHourStr}:${utcMinStr}`;
+}
+
+function convertUtcToLocalTime(utcTimeStr, plantId) {
+  if (!utcTimeStr) return '00:00';
+  const [hour, min] = utcTimeStr.split(':').map(Number);
+  const date = new Date();
+  date.setUTCHours(hour, min, 0, 0);
+  const tz = getPlantTimeZone(plantId);
+  const offsetMs = getTimeZoneOffsetMs(tz, date);
+  const targetLocalDate = new Date(date.getTime() + offsetMs);
+  const localHourStr = String(targetLocalDate.getUTCHours()).padStart(2, '0');
+  const localMinStr = String(targetLocalDate.getUTCMinutes()).padStart(2, '0');
+  return `${localHourStr}:${localMinStr}`;
+}
+
+function getTimeZoneAbbreviation(plantId) {
+  const tz = getPlantTimeZone(plantId);
+  try {
+    const formatter = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' });
+    const parts = formatter.formatToParts(new Date());
+    const tzPart = parts.find(p => p.type === 'timeZoneName');
+    return tzPart ? tzPart.value : tz;
+  } catch {
+    return tz;
+  }
+}
+
+function formatTimestampToPlantTime(timestampStr, plantId) {
+  if (!timestampStr) return '—';
+  const tz = getPlantTimeZone(plantId);
+  try {
+    const date = new Date(timestampStr);
+    return date.toLocaleString('en-US', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    });
+  } catch {
+    return timestampStr;
+  }
+}
+
 /* ─────────────────────────────────────────────
    Main Component
-───────────────────────────────────────────── */
+   ───────────────────────────────────────────── */
 export default function Settings({ user }) {
   const { currentPlantId } = useSimulator();
 
   const isSuperAdmin = user.role === 'Super Admin';
-  const targetPlantId = isSuperAdmin ? currentPlantId : user.plantId;
+  const isReadOnly = user.role === 'Admin';
+  const targetPlantId = (isSuperAdmin || isReadOnly) ? currentPlantId : user.plantId;
 
   // ── Active sub-tab
-  const [activeSubTab, setActiveSubTab] = useState(
-    isSuperAdmin ? 'smtp' : 'schedules'
-  );
+  const [activeSubTab, setActiveSubTab] = useState(() => (isSuperAdmin || isReadOnly) ? 'smtp' : 'schedules');
 
-  // ── SMTP Config
-  const [smtpHost, setSmtpHost]       = useState('');
-  const [smtpPort, setSmtpPort]       = useState(587);
-  const [smtpUser, setSmtpUser]       = useState('');
-  const [smtpPass, setSmtpPass]       = useState('');
-  const [smtpSecure, setSmtpSecure]   = useState(true);
-  const [isTestingSmtp, setIsTestingSmtp] = useState(false);
-  const [showSmtpPass, setShowSmtpPass]   = useState(false);
+  // ── SMTP Configurations States
+  const [smtpConfigsList, setSmtpConfigsList] = useState([]);
+  const [smtpSearch, setSmtpSearch] = useState('');
+  const [showSmtpModal, setShowSmtpModal] = useState(false);
+  const [isSavingSmtp, setIsSavingSmtp] = useState(false);
+  const [editSmtpObj, setEditSmtpObj] = useState({
+    id: '', name: '', host: '', port: 587, username: '', password: '', secure: false, security_type: 'STARTTLS', is_active: false
+  });
+  const [showSmtpPass, setShowSmtpPass] = useState(false);
+  const [isTestingSmtpId, setIsTestingSmtpId] = useState(null); // stores config.id being tested
+  const [testEmailRecipient, setTestEmailRecipient] = useState('');
+  const [showTestModal, setShowTestModal] = useState(false);
+  const [testingConfig, setTestingConfig] = useState(null);
+  const [lastSavedSmtp, setLastSavedSmtp] = useState(null);
 
-  // ── Test email modal
-  const [showTestEmailModal, setShowTestEmailModal]   = useState(false);
-  const [testEmailRecipient, setTestEmailRecipient]   = useState('');
-  const [isSendingTestEmail, setIsSendingTestEmail]   = useState(false);
+  // ── Report Templates States
+  const [templatesList, setTemplatesList] = useState([]);
+  const [templateSearch, setTemplateSearch] = useState('');
+  const [showTemplateModal, setShowTemplateModal] = useState(false);
+  const [isSavingTemplate, setIsSavingTemplate] = useState(false);
+  const [editTemplateObj, setEditTemplateObj] = useState({
+    id: '', name: '', report_type: 'Historian Shift Summary', subject: '', is_default: false, logo_text: '', header_color: '#0A0F1E', footer_text: '', email_body: '', summary_layout: 'standard', pdf_layout: 'standard', excel_layout: 'standard'
+  });
+  const [previewTemplate, setPreviewTemplate] = useState(null);
+  const [showPreviewModal, setShowPreviewModal] = useState(false);
+  const [lastSavedTemplate, setLastSavedTemplate] = useState(null);
 
-  // ── Scheduled Reports
+  // ── Scheduled Reports States
   const [schedulesList, setSchedulesList] = useState([]);
-  const [plantsList, setPlantsList]       = useState([]);
-  const [showModal, setShowModal]         = useState(false);
-  const [editSchedule, setEditSchedule]   = useState({
-    id: '', plantId: '', reportType: 'Daily Report',
+  const [plantsList, setPlantsList] = useState([]);
+  const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [isSavingSchedule, setIsSavingSchedule] = useState(false);
+  const [editSchedule, setEditSchedule] = useState({
+    id: '', plantId: '', reportType: 'Historian Shift Summary',
     frequency: 'Daily', time: '08:00',
     emailRecipients: '', enabled: true,
     formatPdf: true, formatExcel: true,
   });
 
-  // ── Email Logs
+  // ── Email Logs States
   const [emailLogsList, setEmailLogsList] = useState([]);
+  const [schedulerHistoryList, setSchedulerHistoryList] = useState([]);
 
-  // ── Report Templates
-  const [logoText, setLogoText]           = useState('');
-  const [headerColor, setHeaderColor]     = useState('#1e293b');
-  const [footerText, setFooterText]       = useState('');
-
-  // ── Retry queue (hidden when empty)
-  const [retryQueue, setRetryQueue] = useState([]);
-
-  // ── Recipients State
-  const [recipientsList, setRecipientsList] = useState([]);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState('all');
-  const [selectedRecipientIds, setSelectedRecipientIds] = useState([]);
-  const [showRecipientModal, setShowRecipientModal] = useState(false);
-  const [isSavingRecipient, setIsSavingRecipient] = useState(false);
-  const [isTestingDistribution, setIsTestingDistribution] = useState(false);
-  const [editRecipientObj, setEditRecipientObj] = useState({
-    id: '', email: '', name: '', role: 'Operator', active: true,
-    groups: '', report_types: ''
-  });
-
+  // ── Status Messages
   const [smtpStatus, setSmtpStatus] = useState(null); // { type: 'success' | 'error', text: string }
-  const [templateStatus, setTemplateStatus] = useState(null); // { type: 'success' | 'error', text: string }
+  const [templateStatus, setTemplateStatus] = useState(null);
+  const [scheduleStatus, setScheduleStatus] = useState(null);
 
   const showSmtpStatus = (type, text) => {
     setSmtpStatus({ type, text });
@@ -147,30 +227,44 @@ export default function Settings({ user }) {
     setTimeout(() => setTemplateStatus(null), 6000);
   };
 
+  const showScheduleStatus = (type, text) => {
+    setScheduleStatus({ type, text });
+    setTimeout(() => setScheduleStatus(null), 6000);
+  };
+
   /* ── Load data ────────────────────────── */
   const loadData = useCallback(async () => {
-    const plist = await getPlants();
-    setPlantsList(plist);
+    try {
+      const plist = await getPlants();
+      setPlantsList(plist);
 
-    const sets = await getSettings();
-    setSmtpHost(sets.smtpHost   || '');
-    setSmtpPort(sets.smtpPort   || 587);
-    setSmtpUser(sets.smtpUser   || '');
-    setSmtpPass(sets.smtpPass   || '');
-    setSmtpSecure(sets.smtpSecure !== undefined ? sets.smtpSecure : true);
-    setLogoText(sets.logoText   || '');
-    setHeaderColor(sets.headerColor || '#1e293b');
-    setFooterText(sets.templateFooterText || sets.footerColor || '');
+      const allSchedules = await getSchedules();
+      setSchedulesList((isSuperAdmin || isReadOnly) ? allSchedules : allSchedules.filter(s => s.plantId === targetPlantId));
 
-    const allSchedules = await getSchedules();
-    setSchedulesList(allSchedules.filter(s => s.plantId === targetPlantId));
+      if (isSuperAdmin || isReadOnly) {
+        const allEmailLogs = await getEmailLogs();
+        setEmailLogsList(allEmailLogs);
 
-    const allEmailLogs = await getEmailLogs();
-    setEmailLogsList(allEmailLogs);
+        const history = await getSchedulerHistory();
+        setSchedulerHistoryList(history);
 
-    const recs = await getRecipients();
-    setRecipientsList(recs);
-  }, [targetPlantId]);
+        const smtpConfigs = await getSmtpConfigurations();
+        setSmtpConfigsList(smtpConfigs);
+
+        const templates = await getReportTemplates();
+        setTemplatesList(templates);
+      } else {
+        // Plant Admin can also see SMTP & Templates
+        const smtpConfigs = await getSmtpConfigurations();
+        setSmtpConfigsList(smtpConfigs);
+
+        const templates = await getReportTemplates();
+        setTemplatesList(templates);
+      }
+    } catch (err) {
+      console.error('Error loading settings data:', err);
+    }
+  }, [targetPlantId, isSuperAdmin, isReadOnly]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -179,464 +273,346 @@ export default function Settings({ user }) {
     return () => clearTimeout(timer);
   }, [loadData]);
 
-  /* ── SMTP Handlers ────────────────────── */
-  const handleSaveSystemConfigs = async (e) => {
-    e.preventDefault();
-    const existing = await getSettings();
-    await saveSettings({ ...existing, smtpHost, smtpPort, smtpUser, smtpPass, smtpSecure });
-    showSmtpStatus('success', 'SMTP connection settings updated successfully.');
-  };
-
-  const handleTestSmtpConnection = async () => {
-    if (!smtpHost) { showSmtpStatus('error', 'Please configure an SMTP host before testing.'); return; }
-    setIsTestingSmtp(true);
-    try {
-      const response = await fetch('/api/send-email', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          smtpConfig: {
-            host: smtpHost,
-            port: smtpPort,
-            username: smtpUser,
-            password: smtpPass,
-            secure: smtpSecure,
-            logoText: logoText,
-            headerColor: headerColor,
-            footerText: footerText
-          },
-          recipient: smtpUser,
-          subject: `SMTP Gateway Diagnostic Check - Skadomation`,
-          message: `Connection handshake verification. Test OK.`
-        })
-      });
-
-      const result = await response.json();
-      if (!response.ok || result.error) {
-        throw new Error(result.error || 'Failed to verify SMTP credentials.');
-      }
-
-      showSmtpStatus('success', `SMTP handshake verified successfully! Connection established with ${smtpHost}:${smtpPort}.`);
-    } catch (err) {
-      console.error("SMTP Test Connection failed:", err);
-      showSmtpStatus('error', `SMTP Connection Failure: ${err.message}`);
-    } finally {
-      setIsTestingSmtp(false);
-    }
-  };
-
-  const handleSendTestEmail = async (e) => {
-    e.preventDefault();
-    setIsSendingTestEmail(true);
-    try {
-      const response = await fetch('/api/send-email', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          smtpConfig: {
-            host: smtpHost,
-            port: smtpPort,
-            username: smtpUser,
-            password: smtpPass,
-            secure: smtpSecure,
-            logoText: logoText,
-            headerColor: headerColor,
-            footerText: footerText
-          },
-          recipient: testEmailRecipient,
-          subject: `SMTP Diagnostic Test Email - Skadomation Gateway`,
-          message: `This is a diagnostic test email dispatched from Skadomation's central historian gateway.\n\nConnection Handshake: Successful\nSMTP Host: ${smtpHost}:${smtpPort}\nEncryption: ${smtpSecure ? 'SSL/TLS' : 'STARTTLS'}\nTimestamp: ${new Date().toLocaleString()}`
-        })
-      });
-
-      const result = await response.json();
-      if (!response.ok || result.error) {
-        throw new Error(result.error || 'Failed to dispatch test email.');
-      }
-
-      await addEmailLog({
-        recipient: testEmailRecipient,
-        subject: `SMTP Diagnostic Test Email - Skadomation Gateway`,
-        status: 'SENT',
-        message: 'SMTP handshake verification message. Test connection OK.',
-      });
-
-      showSmtpStatus('success', `Test email successfully dispatched to ${testEmailRecipient}. Verify SMTP log feed.`);
-      setShowTestEmailModal(false);
-      loadData();
-    } catch (err) {
-      console.error("Test email failed:", err);
-      showSmtpStatus('error', `SMTP Dispatch Failure: ${err.message}`);
-    } finally {
-      setIsSendingTestEmail(false);
-    }
-  };
-
-  /* ── Recipient Handlers ────────────────── */
-  const validateEmail = (email) => {
-    return String(email)
-      .toLowerCase()
-      .match(
-        /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|.(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/
-      );
-  };
-
-  const handleOpenRecipientEdit = (rec = null) => {
-    if (rec) {
-      setEditRecipientObj({
-        id: rec.id,
-        email: rec.email,
-        name: rec.name,
-        role: rec.role || 'Operator',
-        active: rec.active !== false,
-        groups: rec.groups || '',
-        report_types: rec.report_types || ''
+  /* ── SMTP Configuration CRUD ────────────────── */
+  const handleOpenSmtpEdit = (config = null) => {
+    setShowSmtpPass(false);
+    if (config) {
+      setEditSmtpObj({
+        id: config.id,
+        name: config.name,
+        host: config.host,
+        port: config.port,
+        username: config.username,
+        password: config.password,
+        secure: config.secure,
+        security_type: config.security_type || (config.secure ? 'SSL/TLS' : 'STARTTLS'),
+        is_active: config.is_active
       });
     } else {
-      setEditRecipientObj({
+      setEditSmtpObj({
         id: '',
-        email: '',
         name: '',
-        role: 'Operator',
-        active: true,
-        groups: 'Management',
-        report_types: 'Daily Reports'
+        host: '',
+        port: 587,
+        username: '',
+        password: '',
+        secure: false,
+        security_type: 'STARTTLS',
+        is_active: false
       });
     }
-    setShowRecipientModal(true);
+    setShowSmtpModal(true);
   };
 
-  const handleSaveRecipient = async (e) => {
+  const handleSaveSmtp = async (e) => {
     e.preventDefault();
-    if (!editRecipientObj.name.trim()) {
-      alert('Name is required.');
-      return;
-    }
-    if (!validateEmail(editRecipientObj.email.trim())) {
-      alert('Please enter a valid email address.');
-      return;
-    }
-    setIsSavingRecipient(true);
+    if (!editSmtpObj.name.trim()) return alert('Please enter a configuration name.');
+    if (!editSmtpObj.host.trim()) return alert('Please enter a host server.');
+    if (!editSmtpObj.username.trim()) return alert('Please enter a username.');
+    if (!editSmtpObj.password.trim()) return alert('Please enter a password.');
+
+    setIsSavingSmtp(true);
     try {
-      await saveRecipient(editRecipientObj);
-      setShowRecipientModal(false);
+      await saveSmtpConfiguration({
+        ...editSmtpObj,
+        secure: editSmtpObj.security_type === 'SSL/TLS' || editSmtpObj.port === 465
+      });
+      setLastSavedSmtp(new Date().toLocaleTimeString());
+      setShowSmtpModal(false);
+      showSmtpStatus('success', `SMTP Configuration "${editSmtpObj.name}" saved successfully.`);
       await loadData();
     } catch (err) {
-      console.error('Failed to save recipient:', err);
-      alert(`Error saving recipient: ${err.message}`);
+      alert(`Error saving SMTP configuration: ${err.message}`);
     } finally {
-      setIsSavingRecipient(false);
+      setIsSavingSmtp(false);
     }
   };
 
-  const handleDeleteRecipient = async (id) => {
-    if (window.confirm('Are you sure you want to delete this recipient?')) {
+  const handleDeleteSmtp = async (id, name) => {
+    if (window.confirm(`Are you sure you want to permanently delete SMTP configuration "${name}"?`)) {
       try {
-        await deleteRecipient(id);
-        setSelectedRecipientIds(prev => prev.filter(x => x !== id));
+        await deleteSmtpConfiguration(id);
+        showSmtpStatus('success', `SMTP Configuration "${name}" deleted successfully.`);
         await loadData();
       } catch (err) {
-        alert(`Failed to delete: ${err.message}`);
+        alert(`Error deleting SMTP configuration: ${err.message}`);
       }
     }
   };
 
-  const handleToggleRecipientActive = async (rec) => {
+  const handleDuplicateSmtp = async (config) => {
     try {
-      await saveRecipient({ ...rec, active: !rec.active });
+      const copy = {
+        ...config,
+        id: '',
+        name: `${config.name} (Copy)`,
+        is_active: false
+      };
+      await saveSmtpConfiguration(copy);
+      showSmtpStatus('success', `SMTP Configuration duplicated as "${copy.name}".`);
       await loadData();
     } catch (err) {
-      alert(`Failed to update status: ${err.message}`);
+      alert(`Error duplicating SMTP configuration: ${err.message}`);
     }
   };
 
-  const handleBulkRecipientStatus = async (active) => {
-    if (selectedRecipientIds.length === 0) return;
+  const handleSetActiveSmtp = async (id, name) => {
     try {
-      await bulkUpdateRecipientsStatus(selectedRecipientIds, active);
-      setSelectedRecipientIds([]);
+      await setActiveSmtpConfiguration(id);
+      showSmtpStatus('success', `SMTP configuration "${name}" activated successfully.`);
       await loadData();
-      alert(`Bulk updated selected recipients to ${active ? 'Active' : 'Inactive'}.`);
     } catch (err) {
-      alert(`Bulk update failed: ${err.message}`);
+      alert(`Error activating SMTP configuration: ${err.message}`);
     }
   };
 
-  const handleTestDistribution = async () => {
-    const activeRecs = recipientsList.filter(r => r.active);
-    if (activeRecs.length === 0) {
-      alert('No active recipients configured to test.');
-      return;
-    }
-    
-    setIsTestingDistribution(true);
-    const emailsList = activeRecs.map(r => r.email);
-    
-    try {
-      const sets = await getSettings();
-      if (!sets.smtpHost || !sets.smtpUser || !sets.smtpPass) {
-        throw new Error('SMTP credentials are not configured. Please complete configuration in SMTP Config tab first.');
-      }
+  const handleOpenTestModal = (config) => {
+    setTestingConfig(config);
+    setTestEmailRecipient(config.username || '');
+    setShowTestModal(true);
+  };
 
+  const handleRunSmtpTest = async (e) => {
+    e.preventDefault();
+    if (!testEmailRecipient.trim()) return alert('Please enter a recipient email.');
+    
+    setIsTestingSmtpId(testingConfig.id);
+    setShowTestModal(false);
+    try {
       const response = await fetch('/api/send-email', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           smtpConfig: {
-            host: sets.smtpHost,
-            port: sets.smtpPort,
-            username: sets.smtpUser,
-            password: sets.smtpPass,
-            secure: sets.smtpSecure,
-            logoText: sets.templateLogoText || sets.logoText,
-            headerColor: sets.templateHeaderColor || sets.headerColor,
-            footerText: sets.templateFooterText || sets.footerColor
+            host: testingConfig.host,
+            port: testingConfig.port,
+            username: testingConfig.username,
+            password: testingConfig.password,
+            secure: testingConfig.secure
           },
-          to: emailsList,
-          subject: `Skadomation SMTP Broadcast Test Distribution`,
-          message: `This is a test broadcast report distribution sent to verify email routing.\n\nRecipients Configured: ${activeRecs.length} Active users\nRecipients List: ${emailsList.join(', ')}\nTimestamp: ${new Date().toLocaleString()}\n\nDelivery verification: SUCCESS.`
+          to: testEmailRecipient,
+          subject: 'SKADOMATION SMTP Diagnostic Link Check',
+          message: `This is an automated test verifying connection to the SMTP mail relay: ${testingConfig.name}.\n\nHost: ${testingConfig.host}\nPort: ${testingConfig.port}\nUsername: ${testingConfig.username}\nSecurity: ${testingConfig.security_type}\n\nStatus: VERIFIED SUCCESS.`
         })
       });
-
-      const result = await response.json();
-      if (!response.ok || result.error) {
-        throw new Error(result.error || 'Failed to dispatch broadcast email.');
+      const res = await response.json();
+      if (!response.ok || res.error) {
+        throw new Error(res.error || 'Failed to dispatch test email.');
       }
-
-      alert(`Test distribution broadcast successfully sent to all ${activeRecs.length} active recipients!`);
+      showSmtpStatus('success', `Test email successfully dispatched using "${testingConfig.name}". Verify SMTP log feed.`);
     } catch (err) {
-      console.error("Test distribution failed:", err);
-      alert(`SMTP Test Distribution Failure: ${err.message}`);
+      alert(`SMTP Diagnostics Connection Failed: ${err.message}`);
     } finally {
-      setIsTestingDistribution(false);
+      setIsTestingSmtpId(null);
+      setTestingConfig(null);
     }
   };
 
-  /* ── Schedule Handlers ────────────────── */
-  const handleToggleEnable = async (sched) => {
-    await saveSchedule({ ...sched, enabled: !sched.enabled });
-    await loadData();
-  };
 
-  const handleOpenEdit = (sched = null) => {
-    if (sched) {
-      setEditSchedule({ formatPdf: sched.formatPdf !== false, formatExcel: sched.formatExcel !== false, ...sched });
+  /* ── Report Templates CRUD ──────────────────── */
+  const handleOpenTemplateEdit = (template = null) => {
+    if (template) {
+      setEditTemplateObj({
+        id: template.id,
+        name: template.name,
+        report_type: template.report_type,
+        subject: template.subject,
+        is_default: template.is_default,
+        logo_text: template.logo_text,
+        header_color: template.header_color,
+        footer_text: template.footer_text,
+        email_body: template.email_body,
+        summary_layout: template.summary_layout || 'standard',
+        pdf_layout: template.pdf_layout || 'standard',
+        excel_layout: template.excel_layout || 'standard'
+      });
     } else {
-      setEditSchedule({
-        id: '', plantId: targetPlantId, reportType: 'Daily Report',
-        frequency: 'Daily', time: '08:00',
-        emailRecipients: '', enabled: true,
-        formatPdf: true, formatExcel: true,
+      setEditTemplateObj({
+        id: '',
+        name: '',
+        report_type: 'Historian Shift Summary',
+        subject: 'Production Report Summary: {{reportName}}',
+        is_default: false,
+        logo_text: 'SKADOMATION CO',
+        header_color: '#0A0F1E',
+        footer_text: 'CONFIDENTIAL — AUTOMATED REPORT DISPATCHED BY SKADOMATION HISTORIAN MODULE.',
+        email_body: 'Dear Team,\n\nPlease find the compiled production report details attached below:\n\nReport Name: {{reportName}}\nReport Type: {{reportType}}\nShift Reference: {{shift}}\nGenerated At: {{generatedAt}}\n\nReport compilation completed successfully. Formats: PDF, Excel.',
+        summary_layout: 'standard',
+        pdf_layout: 'standard',
+        excel_layout: 'standard'
       });
     }
-    setShowModal(true);
+    setShowTemplateModal(true);
   };
 
-  const handleDelete = async (schedId) => {
-    if (window.confirm('Are you sure you want to delete this report schedule?')) {
-      await deleteSchedule(schedId);
+  const handleSaveTemplate = async (e) => {
+    e.preventDefault();
+    if (!editTemplateObj.name.trim()) return alert('Please enter a template name.');
+    if (!editTemplateObj.subject.trim()) return alert('Please enter an email subject.');
+
+    setIsSavingTemplate(true);
+    try {
+      await saveReportTemplate(editTemplateObj);
+      setLastSavedTemplate(new Date().toLocaleTimeString());
+      setShowTemplateModal(false);
+      showTemplateStatus('success', `Report template "${editTemplateObj.name}" saved successfully.`);
       await loadData();
+    } catch (err) {
+      alert(`Error saving template: ${err.message}`);
+    } finally {
+      setIsSavingTemplate(false);
     }
+  };
+
+  const handleDeleteTemplate = async (id, name) => {
+    if (window.confirm(`Are you sure you want to permanently delete template "${name}"?`)) {
+      try {
+        await deleteReportTemplate(id);
+        showTemplateStatus('success', `Report template "${name}" deleted successfully.`);
+        await loadData();
+      } catch (err) {
+        alert(`Error deleting template: ${err.message}`);
+      }
+    }
+  };
+
+  const handleDuplicateTemplate = async (template) => {
+    try {
+      const copy = {
+        ...template,
+        id: '',
+        name: `${template.name} (Copy)`,
+        is_default: false
+      };
+      await saveReportTemplate(copy);
+      showTemplateStatus('success', `Template duplicated as "${copy.name}".`);
+      await loadData();
+    } catch (err) {
+      alert(`Error duplicating template: ${err.message}`);
+    }
+  };
+
+  const handleSetDefaultTemplate = async (id, reportType, name) => {
+    try {
+      await setDefaultReportTemplate(id, reportType);
+      showTemplateStatus('success', `"${name}" is now the default template for "${reportType}".`);
+      await loadData();
+    } catch (err) {
+      alert(`Error setting default template: ${err.message}`);
+    }
+  };
+
+  const handlePreviewTemplate = (template) => {
+    setPreviewTemplate(template);
+    setShowPreviewModal(true);
+  };
+
+
+  /* ── Scheduled Reports CRUD ─────────────────── */
+  const handleOpenScheduleEdit = (sched = null) => {
+    if (sched) {
+      const localTime = convertUtcToLocalTime(sched.time, sched.plantId);
+      setEditSchedule({
+        id: sched.id,
+        plantId: sched.plantId,
+        reportType: sched.reportType,
+        frequency: sched.frequency,
+        time: sched.time,
+        localTime: localTime,
+        emailRecipients: sched.emailRecipients,
+        enabled: sched.enabled,
+        formatPdf: sched.formatPdf !== false,
+        formatExcel: sched.formatExcel !== false,
+        reportMode: sched.reportMode || 'Daily',
+        shiftNumber: sched.shiftNumber || 1
+      });
+    } else {
+      setEditSchedule({
+        id: '',
+        plantId: targetPlantId,
+        reportType: 'Daily Production Report',
+        frequency: 'Daily',
+        time: '02:30',
+        localTime: '08:00',
+        emailRecipients: '',
+        enabled: true,
+        formatPdf: true,
+        formatExcel: true,
+        reportMode: 'Daily',
+        shiftNumber: 1
+      });
+    }
+    setShowScheduleModal(true);
   };
 
   const handleSaveSchedule = async (e) => {
     e.preventDefault();
-    await saveSchedule(editSchedule);
-    setShowModal(false);
-    await loadData();
-  };
+    if (!editSchedule.localTime) return alert('Please enter a daily run time.');
+    if (!editSchedule.emailRecipients.trim()) return alert('Please enter default recipients.');
 
-  const handleTriggerSimulatedSend = async (sched) => {
-    const activePlantName = plantsList.find(p => p.id === sched.plantId)?.name || 'Unknown Plant';
-    const subject = `Automated ${sched.reportType} - ${activePlantName} - ${new Date().toISOString().split('T')[0]}`;
-    const formatsMsg = [];
-    if (sched.formatPdf !== false)   formatsMsg.push('PDF');
-    if (sched.formatExcel !== false) formatsMsg.push('Excel');
-    const attachmentInfo = formatsMsg.length > 0 ? `[Attachments: ${formatsMsg.join(', ')}]` : '[No Attachments]';
-    
-    const getReportCategory = (type) => {
-      const t = (type || '').toLowerCase();
-      if (t.includes('daily')) return 'Daily Reports';
-      if (t.includes('shift')) return 'Shift Reports';
-      if (t.includes('weekly')) return 'Weekly Reports';
-      if (t.includes('monthly')) return 'Monthly Reports';
-      if (t.includes('alarm') || t.includes('incident')) return 'Alarm Reports';
-      if (t.includes('historian') || t.includes('audit') || t.includes('process')) return 'Historian Reports';
-      return 'Historian Reports';
-    };
-
+    setIsSavingSchedule(true);
     try {
-      const sets = await getSettings();
-      if (!sets.smtpHost || !sets.smtpUser || !sets.smtpPass) {
-        throw new Error('SMTP credentials are not configured. Please complete configuration in SMTP Config tab first.');
-      }
-
-      const recs = await getRecipients();
-      const category = getReportCategory(sched.reportType);
-      const activeSubscribers = recs.filter(r => {
-        if (!r.active) return false;
-        const subbedTypes = (r.report_types || '').split(',').map(x => x.trim()).filter(Boolean);
-        return subbedTypes.includes(category);
-      });
-
-      const toList = activeSubscribers.map(r => r.email);
-      const manualRecs = (sched.emailRecipients || '').split(',').map(x => x.trim()).filter(Boolean);
-      manualRecs.forEach(email => {
-        if (!toList.includes(email)) {
-          toList.push(email);
-        }
-      });
-
-      if (toList.length === 0) {
-        throw new Error(`No active recipients are subscribed to ${category}, and no manual recipients are configured on the schedule.`);
-      }
-
-      // Compile actual database telemetry for the simulation report
-      const tagConfigs = await getTagConfigs();
-      const activeTags = tagConfigs.filter(t => t.ReportsVisible !== false).map(t => t.TagIndex);
-      
-      const endDate = new Date().toISOString();
-      const startDate = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-      const dateInfo = `${startDate.replace('T', ' ').substring(0, 16)} to ${endDate.replace('T', ' ').substring(0, 16)}`;
-
-      const tempReport = {
-        id: 'sched-sim-' + Date.now(),
-        name: `Automated ${sched.reportType} - ${activePlantName}`,
-        type: sched.reportType,
-        dateInfo,
-        startDate,
-        endDate,
-        tags: activeTags.length > 0 ? activeTags : [1],
-        generatedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
-        createdBy: 'System Scheduler'
+      const utcTime = convertLocalToUtcTime(editSchedule.localTime, editSchedule.plantId);
+      const scheduleToSave = {
+        ...editSchedule,
+        time: utcTime
       };
-
-      const reportData = await compileReportData(tempReport);
-
-      const response = await fetch('/api/send-email', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          smtpConfig: {
-            host: sets.smtpHost,
-            port: sets.smtpPort,
-            username: sets.smtpUser,
-            password: sets.smtpPass,
-            secure: sets.smtpSecure,
-            logoText: sets.templateLogoText || sets.logoText,
-            headerColor: sets.templateHeaderColor || sets.headerColor,
-            footerText: sets.templateFooterText || sets.footerColor
-          },
-          to: toList,
-          subject,
-          message: `This is an automated dispatch of your production report.\n\nReport Type: ${sched.reportType}\nPlant Assigned: ${activePlantName}\nTrigger Time: ${sched.time}\nFormat(s): ${formatsMsg.join(', ')}\n\n${attachmentInfo}\n\nReport compilation completed successfully. Telemetry data attached.`,
-          reportData: {
-            meta: tempReport,
-            data: reportData
-          }
-        })
-      });
-
-      const result = await response.json();
-      if (!response.ok || result.error) {
-        throw new Error(result.error || 'Failed to dispatch report email.');
-      }
-
-      await addEmailLog({
-        recipient: toList.join(', '),
-        subject,
-        status: 'SENT',
-        message: `Triggered automated test dispatch for: ${sched.reportType}. ${attachmentInfo}`,
-      });
-      const updatedSched = { ...sched, lastRun: new Date().toISOString().replace('T', ' ').substring(0, 19) };
-      await saveSchedule(updatedSched);
-      alert(`SMTP Success: Email report dispatched to [${toList.join(', ')}]`);
+      await saveSchedule(scheduleToSave);
+      setShowScheduleModal(false);
+      showScheduleStatus('success', 'Report schedule configurations updated successfully.');
       await loadData();
     } catch (err) {
-      console.error("Force dispatch failed:", err);
-      alert(`SMTP Dispatch Failure: ${err.message}`);
+      alert(`Error updating schedule: ${err.message}`);
+    } finally {
+      setIsSavingSchedule(false);
     }
   };
 
-  /* ── Retry Queue Handler ──────────────── */
-  const handleManualRetry = (id) => {
-    setRetryQueue(prev => prev.map(item =>
-      item.id === id ? { ...item, status: 'RETRYING', attempts: item.attempts + 1 } : item
-    ));
-    setTimeout(async () => {
-      const targetItem = retryQueue.find(item => item.id === id);
-      if (targetItem) {
-        await addEmailLog({
-          recipient: targetItem.recipient,
-          subject: targetItem.subject,
-          status: 'SENT',
-          message: 'Resent successfully after SMTP gateway routing optimization.',
-        });
-        setRetryQueue(prev => prev.filter(item => item.id !== id));
-        alert('Email resent successfully!');
-        loadData();
+  const handleDeleteSchedule = async (id) => {
+    if (window.confirm('Are you sure you want to permanently delete this report schedule?')) {
+      try {
+        await deleteSchedule(id);
+        showScheduleStatus('success', 'Report schedule configuration deleted successfully.');
+        await loadData();
+      } catch (err) {
+        alert(`Error deleting schedule: ${err.message}`);
       }
-    }, 1200);
+    }
   };
 
-  const handleSaveTemplates = async (e) => {
-    e.preventDefault();
-    const existing = await getSettings();
-    await saveSettings({
-      ...existing,
-      templateLogoText: logoText,
-      templateHeaderColor: headerColor,
-      templateFooterText: footerText
-    });
-    showTemplateStatus('success', 'Report template settings saved successfully.');
+  const handleToggleScheduleEnabled = async (sched) => {
+    try {
+      await saveSchedule({ ...sched, enabled: !sched.enabled });
+      showScheduleStatus('success', `Schedule is now ${!sched.enabled ? 'Enabled' : 'Disabled'}.`);
+      await loadData();
+    } catch (err) {
+      alert(`Error toggling schedule state: ${err.message}`);
+    }
   };
+
 
   /* ─────────────────────────────────────────────
      Tab definitions
-  ───────────────────────────────────────────── */
-  const superAdminTabs = [
-    { key: 'smtp',      label: 'SMTP Config' },
-    { key: 'emaillogs', label: 'Email Logs' },
-    { key: 'schedules', label: 'Scheduled Reports' },
+   ───────────────────────────────────────────── */
+  const tabs = [
+    { key: 'smtp',      label: 'SMTP Servers' },
     { key: 'templates', label: 'Report Templates' },
-    { key: 'recipients', label: 'Recipient Management' },
-  ];
-  const plantAdminTabs = [
     { key: 'schedules', label: 'Scheduled Reports' },
-    { key: 'recipients', label: 'Recipient Management' },
+    ...(isSuperAdmin ? [
+      { key: 'emaillogs', label: 'Email Dispatches' },
+      { key: 'schedulerhistory', label: 'Execution History' }
+    ] : []),
   ];
-  const tabs = isSuperAdmin ? superAdminTabs : plantAdminTabs;
 
   /* ─────────────────────────────────────────────
-     Inline styles (scoped to component)
-  ───────────────────────────────────────────── */
+     Styles
+   ───────────────────────────────────────────── */
   const S = {
-    page: {
-      display: 'flex',
-      flexDirection: 'column',
-      gap: 0,
-    },
-    header: {
-      marginBottom: '28px',
-    },
-    headerTitle: {
-      fontSize: '1.55rem',
-      fontWeight: 700,
-      color: 'var(--text)',
-      margin: 0,
-      letterSpacing: '-0.3px',
-    },
-    headerSub: {
-      fontSize: '0.85rem',
-      color: 'var(--text-muted)',
-      margin: '4px 0 0',
-    },
-    tabBar: {
-      display: 'flex',
-      gap: 2,
-      borderBottom: '1px solid var(--border)',
-      marginBottom: '28px',
-    },
+    page: { display: 'flex', flexDirection: 'column', gap: 0 },
+    header: { marginBottom: '28px' },
+    headerTitle: { fontSize: '1.55rem', fontWeight: 700, color: 'var(--text)', margin: 0, letterSpacing: '-0.3px' },
+    headerSub: { fontSize: '0.85rem', color: 'var(--text-muted)', margin: '4px 0 0' },
+    tabBar: { display: 'flex', gap: 2, borderBottom: '1px solid var(--border)', marginBottom: '28px' },
     tabBtn: (active) => ({
       padding: '10px 20px',
       border: 'none',
@@ -651,264 +627,44 @@ export default function Settings({ user }) {
       whiteSpace: 'nowrap',
       letterSpacing: '0.01em',
     }),
-    // Section card wrapper
-    card: {
-      background: 'var(--card-bg)',
-      border: '1px solid var(--border)',
-      borderRadius: 'var(--radius)',
-      padding: '28px 32px',
-    },
-    sectionTitle: {
-      fontSize: '1rem',
-      fontWeight: 700,
-      color: 'var(--text)',
-      margin: '0 0 4px',
-    },
-    sectionSub: {
-      fontSize: '0.8rem',
-      color: 'var(--text-muted)',
-      margin: '0 0 24px',
-    },
-    divider: {
-      borderTop: '1px solid var(--border)',
-      margin: '24px 0',
-    },
-    // Form
-    formGrid2: {
-      display: 'grid',
-      gridTemplateColumns: '1fr 1fr',
-      gap: '20px',
-    },
-    formGroup: {
-      display: 'flex',
-      flexDirection: 'column',
-      gap: '6px',
-      marginBottom: 0,
-    },
-    label: {
-      fontSize: '0.8rem',
-      fontWeight: 600,
-      color: 'var(--text-muted)',
-      textTransform: 'uppercase',
-      letterSpacing: '0.05em',
-    },
-    inputWrap: {
-      position: 'relative',
-    },
-    eyeBtn: {
-      position: 'absolute',
-      right: 12,
-      top: '50%',
-      transform: 'translateY(-50%)',
-      background: 'none',
-      border: 'none',
-      padding: 0,
-      color: 'var(--text-muted)',
-      cursor: 'pointer',
-      display: 'flex',
-      alignItems: 'center',
-    },
-    actionRow: {
-      display: 'flex',
-      gap: '12px',
-      paddingTop: '8px',
-      flexWrap: 'wrap',
-    },
-    // Badges
-    badgeEnabled: {
-      display: 'inline-block',
-      padding: '2px 10px',
-      borderRadius: 99,
-      fontSize: '0.72rem',
-      fontWeight: 600,
-      background: 'rgba(34,197,94,0.12)',
-      color: 'var(--success)',
-      border: '1px solid rgba(34,197,94,0.25)',
-    },
-    badgeDisabled: {
-      display: 'inline-block',
-      padding: '2px 10px',
-      borderRadius: 99,
-      fontSize: '0.72rem',
-      fontWeight: 600,
-      background: 'rgba(100,116,139,0.12)',
-      color: 'var(--text-muted)',
-      border: '1px solid var(--border)',
-    },
-    badgeFreq: {
-      display: 'inline-block',
-      padding: '2px 10px',
-      borderRadius: 99,
-      fontSize: '0.72rem',
-      fontWeight: 600,
-      background: 'rgba(79,70,229,0.08)',
-      color: '#4F46E5',
-      border: '1px solid rgba(99,102,241,0.25)',
-    },
-    // Table
-    tableWrap: {
-      overflowX: 'auto',
-      borderRadius: 'var(--radius-sm)',
-      border: '1px solid var(--border)',
-    },
-    table: {
-      width: '100%',
-      borderCollapse: 'collapse',
-    },
-    th: {
-      padding: '10px 16px',
-      textAlign: 'left',
-      fontSize: '0.75rem',
-      fontWeight: 700,
-      textTransform: 'uppercase',
-      letterSpacing: '0.05em',
-      color: 'var(--text-muted)',
-      borderBottom: '1px solid var(--border)',
-      background: 'var(--background)',
-      whiteSpace: 'nowrap',
-    },
-    td: {
-      padding: '12px 16px',
-      fontSize: '0.85rem',
-      color: 'var(--text)',
-      borderBottom: '1px solid var(--border)',
-      verticalAlign: 'middle',
-    },
-    // Empty state
-    empty: {
-      display: 'flex',
-      flexDirection: 'column',
-      alignItems: 'center',
-      justifyContent: 'center',
-      padding: '60px 24px',
-      color: 'var(--text-muted)',
-      gap: '12px',
-      textAlign: 'center',
-    },
-    emptyIcon: {
-      fontSize: '2.2rem',
-      opacity: 0.4,
-    },
-    emptyText: {
-      fontSize: '0.9rem',
-      margin: 0,
-    },
-    // Schedule card
-    scheduleCard: (enabled) => ({
-      background: 'var(--background)',
-      border: `1px solid var(--border)`,
-      borderLeft: enabled ? '4px solid var(--success)' : '4px solid var(--border)',
-      borderRadius: 'var(--radius-sm)',
-      padding: '18px 20px',
-      display: 'flex',
-      flexDirection: 'column',
-      gap: '14px',
-    }),
-    schedMeta: {
-      display: 'grid',
-      gridTemplateColumns: '1fr 1fr 2fr',
-      gap: '8px 20px',
-      fontSize: '0.82rem',
-    },
-    schedMetaKey: {
-      display: 'block',
-      fontSize: '0.7rem',
-      fontWeight: 700,
-      textTransform: 'uppercase',
-      letterSpacing: '0.05em',
-      color: 'var(--text-muted)',
-      marginBottom: '2px',
-    },
-    schedMetaVal: {
-      color: 'var(--text)',
-      fontWeight: 500,
-    },
-    schedActions: {
-      display: 'flex',
-      gap: '8px',
-      borderTop: '1px solid var(--border)',
-      paddingTop: '12px',
-    },
-    // Color swatch preview
-    colorWrap: {
-      display: 'flex',
-      alignItems: 'center',
-      gap: '10px',
-    },
-    colorInput: {
-      width: 44,
-      height: 36,
-      padding: '2px',
-      border: '1px solid var(--border)',
-      borderRadius: 'var(--radius-sm)',
-      background: 'var(--card-bg)',
-      cursor: 'pointer',
-    },
-    // Modal
-    modalOverlay: {
-      position: 'fixed',
-      inset: 0,
-      background: 'rgba(0,0,0,0.6)',
-      backdropFilter: 'blur(4px)',
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      zIndex: 1000,
-    },
-    modalBox: (maxW) => ({
-      background: 'var(--card-bg)',
-      border: '1px solid var(--border)',
-      borderRadius: 'var(--radius)',
-      width: '100%',
-      maxWidth: maxW || 480,
-      maxHeight: '90vh',
-      overflowY: 'auto',
-      boxShadow: '0 24px 48px rgba(0,0,0,0.5)',
-    }),
-    modalHead: {
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'space-between',
-      padding: '20px 24px',
-      borderBottom: '1px solid var(--border)',
-    },
-    modalTitle: {
-      fontSize: '1rem',
-      fontWeight: 700,
-      color: 'var(--text)',
-      margin: 0,
-    },
-    modalClose: {
-      background: 'transparent',
-      border: 'none',
-      color: 'var(--text-muted)',
-      fontSize: '1.4rem',
-      cursor: 'pointer',
-      lineHeight: 1,
-      padding: '2px 6px',
-      borderRadius: 4,
-    },
-    modalBody: {
-      padding: '24px',
-      display: 'flex',
-      flexDirection: 'column',
-      gap: '18px',
-    },
+    card: { background: 'var(--card-bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: '24px 28px' },
+    sectionTitle: { fontSize: '1rem', fontWeight: 700, color: 'var(--text)', margin: '0 0 4px' },
+    sectionSub: { fontSize: '0.8rem', color: 'var(--text-muted)', margin: '0 0 20px' },
+    divider: { borderTop: '1px solid var(--border)', margin: '20px 0' },
+    formGroup: { marginBottom: '16px', display: 'flex', flexDirection: 'column', gap: '6px' },
+    label: { fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' },
+    table: { width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem', textAlign: 'left' },
+    th: { padding: '12px 14px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)', fontWeight: 600, fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.05em', background: 'rgba(255,255,255,0.02)' },
+    td: { padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text)', verticalAlign: 'middle' },
+    modalOverlay: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(5, 8, 16, 0.85)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1100, padding: '20px' },
+    modalBox: (width) => ({ background: 'var(--card-bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', width: '100%', maxWidth: width, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }),
+    modalHead: { padding: '16px 20px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255,255,255,0.01)' },
+    modalTitle: { fontSize: '1rem', fontWeight: 700, color: 'var(--text)', margin: 0 },
+    modalClose: { border: 'none', background: 'transparent', color: 'var(--text-muted)', fontSize: '1.4rem', cursor: 'pointer', lineBreak: 'none', lineHeight: 1 },
+    modalBody: { padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: '16px' },
   };
 
-  /* ─────────────────────────────────────────────
-     RENDER
-  ───────────────────────────────────────────── */
+  // Filter lists based on search
+  const filteredSmtp = smtpConfigsList.filter(c => 
+    c.name.toLowerCase().includes(smtpSearch.toLowerCase()) || 
+    c.host.toLowerCase().includes(smtpSearch.toLowerCase()) ||
+    c.username.toLowerCase().includes(smtpSearch.toLowerCase())
+  );
+
+  const filteredTemplates = templatesList.filter(t =>
+    t.name.toLowerCase().includes(templateSearch.toLowerCase()) ||
+    t.report_type.toLowerCase().includes(templateSearch.toLowerCase()) ||
+    t.subject.toLowerCase().includes(templateSearch.toLowerCase())
+  );
+
   return (
     <div style={S.page}>
 
       {/* ── Page Header ─────────────────────── */}
       <div style={S.header}>
-        <h2 style={S.headerTitle}>System Settings</h2>
+        <h2 style={S.headerTitle}>Industrial Configuration System</h2>
         <p style={S.headerSub}>
-          {isSuperAdmin
-            ? 'Manage SMTP configuration, email delivery, scheduled reports, and report branding.'
-            : 'Configure automated report schedules for your plant.'}
+          SCADA parameterization panel for SMTP engines, branding layouts, and automated dispatch schedules.
         </p>
       </div>
 
@@ -926,721 +682,134 @@ export default function Settings({ user }) {
       </div>
 
       {/* ═══════════════════════════════════════
-          TAB: SMTP CONFIG
+          TAB: SMTP SERVERS
       ═══════════════════════════════════════ */}
-      {activeSubTab === 'smtp' && isSuperAdmin && (
-        <div style={{ display: 'flex', justifyContent: 'center' }}>
-          <div style={{ ...S.card, width: '100%', maxWidth: 620 }}>
-            <p style={S.sectionTitle}>SMTP Server Configuration</p>
-            <p style={S.sectionSub}>
-              Configure outbound mail relay for automated report delivery.
-            </p>
+      {activeSubTab === 'smtp' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          <div style={S.card}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '16px' }}>
+              <div>
+                <p style={S.sectionTitle}>SMTP Configuration Manager</p>
+                <p style={{ ...S.sectionSub, marginBottom: 0 }}>
+                  Manage outbound server profiles for report delivery.
+                </p>
+              </div>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <input
+                  type="text"
+                  placeholder="🔍 Search SMTP profiles..."
+                  value={smtpSearch}
+                  onChange={e => setSmtpSearch(e.target.value)}
+                  className="form-control"
+                  style={{ width: '220px', height: '36px', fontSize: '0.8rem' }}
+                />
+                {!isReadOnly && (
+                  <button onClick={() => handleOpenSmtpEdit(null)} className="btn btn-primary btn-sm" style={{ height: '36px' }}>
+                    ➕ New Server
+                  </button>
+                )}
+              </div>
+            </div>
 
             {smtpStatus && (
               <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px',
-                padding: '10px 14px',
-                borderRadius: '6px',
-                fontSize: '0.85rem',
-                fontWeight: 500,
+                display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', borderRadius: '6px', fontSize: '0.85rem', fontWeight: 500,
                 backgroundColor: smtpStatus.type === 'success' ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.08)',
                 border: smtpStatus.type === 'success' ? '1px solid rgba(16, 185, 129, 0.25)' : '1px solid rgba(239, 68, 68, 0.25)',
-                color: smtpStatus.type === 'success' ? '#34D399' : '#F87171',
-                marginBottom: '16px'
+                color: smtpStatus.type === 'success' ? '#34D399' : '#F87171', marginBottom: '16px'
               }}>
                 {smtpStatus.type === 'success' ? '✓' : '✗'} {smtpStatus.text}
               </div>
             )}
 
-            <form onSubmit={handleSaveSystemConfigs} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              {/* Host */}
-              <div style={S.formGroup}>
-                <label style={S.label} htmlFor="smtp-host">Host</label>
-                <input
-                  id="smtp-host"
-                  type="text"
-                  className="form-control"
-                  placeholder="smtp.example.com"
-                  value={smtpHost}
-                  onChange={e => setSmtpHost(e.target.value)}
-                  required
-                />
-              </div>
-
-              {/* Port + Security */}
-              <div style={S.formGrid2}>
-                <div style={S.formGroup}>
-                  <label style={S.label} htmlFor="smtp-port">Port</label>
-                  <input
-                    id="smtp-port"
-                    type="number"
-                    className="form-control"
-                    placeholder="587"
-                    value={smtpPort}
-                    onChange={e => {
-                      const val = parseInt(e.target.value) || 587;
-                      setSmtpPort(val);
-                      setSmtpSecure(val === 465);
-                    }}
-                    required
-                  />
-                </div>
-                <div style={S.formGroup}>
-                  <label style={S.label} htmlFor="smtp-security">Security</label>
-                  <select
-                    id="smtp-security"
-                    className="form-control"
-                    value={smtpSecure ? 'SSL' : 'TLS'}
-                    onChange={e => {
-                      const isSSL = e.target.value === 'SSL';
-                      setSmtpSecure(isSSL);
-                      setSmtpPort(isSSL ? 465 : 587);
-                    }}
-                  >
-                    <option value="SSL">SSL / TLS (Port 465)</option>
-                    <option value="TLS">STARTTLS (Port 587)</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* Username */}
-              <div style={S.formGroup}>
-                <label style={S.label} htmlFor="smtp-username">Username</label>
-                <input
-                  id="smtp-username"
-                  type="text"
-                  className="form-control"
-                  placeholder="user@example.com"
-                  value={smtpUser}
-                  onChange={e => setSmtpUser(e.target.value)}
-                  required
-                />
-              </div>
-
-              {/* Password */}
-              <div style={S.formGroup}>
-                <label style={S.label} htmlFor="smtp-password">Password</label>
-                <div style={S.inputWrap}>
-                  <input
-                    id="smtp-password"
-                    type={showSmtpPass ? 'text' : 'password'}
-                    className="form-control"
-                    placeholder="••••••••••••"
-                    value={smtpPass}
-                    onChange={e => setSmtpPass(e.target.value)}
-                    style={{ paddingRight: 40 }}
-                    required
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowSmtpPass(p => !p)}
-                    style={{ ...S.eyeBtn, color: showSmtpPass ? 'var(--secondary)' : 'var(--text-muted)' }}
-                    title={showSmtpPass ? 'Hide Password' : 'Show Password'}
-                  >
-                    {showSmtpPass ? <EyeOpen /> : <EyeOff />}
-                  </button>
-                </div>
-              </div>
-
-              {/* TLS Secure toggle row */}
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 16px', background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                <div>
-                  <p style={{ margin: 0, fontSize: '0.875rem', fontWeight: 600, color: 'var(--text)' }}>TLS Secure</p>
-                  <p style={{ margin: 0, fontSize: '0.76rem', color: 'var(--text-muted)' }}>Encrypt connection using TLS handshake</p>
-                </div>
-                <ToggleSwitch
-                  id="smtp-tls-toggle"
-                  checked={smtpSecure}
-                  onChange={() => {
-                    setSmtpSecure(v => {
-                      const next = !v;
-                      setSmtpPort(next ? 465 : 587);
-                      return next;
-                    });
-                  }}
-                />
-              </div>
-
-              {/* SMTP Configuration Guidance Tip */}
-              <div style={{
-                padding: '16px 20px',
-                background: 'rgba(59, 130, 246, 0.05)',
-                border: '1px solid rgba(59, 130, 246, 0.15)',
-                borderRadius: 'var(--radius-sm)',
-                fontSize: '0.825rem',
-                lineHeight: '1.5',
-                color: 'var(--text-muted)'
-              }}>
-                <strong style={{ color: 'var(--text)', display: 'block', marginBottom: '8px' }}>💡 Quick SMTP Tips:</strong>
-                <ul style={{ paddingLeft: '18px', margin: 0, display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                  <li><strong>Gmail Users:</strong> You must generate and use a 16-character <strong>App Password</strong> in your Google Account security settings. Your standard Gmail login password will be rejected.</li>
-                  <li><strong>Port & Security Sync:</strong> Port <strong>465</strong> requires <strong>SSL/TLS</strong>. Port <strong>587</strong> requires <strong>STARTTLS</strong>. The system will automatically align these settings.</li>
-                  <li><strong>Self-Signed Industrial Relays:</strong> The backend automatically bypasses SSL handshake checks to accommodate local enterprise SMTP servers.</li>
-                </ul>
-              </div>
-
-              <div style={S.divider} />
-
-              {/* Action buttons */}
-              <div style={S.actionRow}>
-                <button
-                  type="button"
-                  onClick={handleTestSmtpConnection}
-                  disabled={isTestingSmtp}
-                  className="btn btn-secondary"
-                  style={{ flex: 1, minWidth: 140 }}
-                >
-                  {isTestingSmtp ? 'Testing…' : '⚡ Test Connection'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShowTestEmailModal(true)}
-                  className="btn btn-secondary"
-                  style={{ flex: 1, minWidth: 140 }}
-                >
-                  ✉️ Send Test Email
-                </button>
-                <button type="submit" className="btn btn-primary" style={{ flex: 1.5, minWidth: 160 }}>
-                  Save SMTP Settings
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* ═══════════════════════════════════════
-          TAB: EMAIL LOGS
-      ═══════════════════════════════════════ */}
-      {activeSubTab === 'emaillogs' && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-
-          {/* Retry Queue — only if queue has items */}
-          {retryQueue.length > 0 && (
-            <div style={{ ...S.card, borderLeft: '4px solid var(--warning)', paddingLeft: 28 }}>
-              <p style={{ ...S.sectionTitle, color: 'var(--warning)' }}>⚠️ Retry Queue ({retryQueue.length})</p>
-              <p style={S.sectionSub}>Dispatches retrying due to SMTP timeouts or network failures.</p>
-              <div style={S.tableWrap}>
-                <table style={S.table}>
-                  <thead>
-                    <tr>
-                      {['Recipient', 'Subject', 'Attempts', 'Error', 'Actions'].map(h => (
-                        <th key={h} style={S.th}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {retryQueue.map((item, idx) => (
-                      <tr key={idx}>
-                        <td style={S.td}>{item.recipient}</td>
-                        <td style={S.td}>{item.subject}</td>
-                        <td style={{ ...S.td, textAlign: 'center', fontFamily: 'monospace' }}>{item.attempts} / 5</td>
-                        <td style={{ ...S.td, color: 'var(--error)', fontSize: '0.78rem' }}>{item.error}</td>
-                        <td style={S.td}>
-                          <div style={{ display: 'flex', gap: 8 }}>
-                            <button
-                              onClick={() => handleManualRetry(item.id)}
-                              disabled={item.status === 'RETRYING'}
-                              className="btn btn-primary"
-                              style={{ padding: '4px 10px', fontSize: '0.78rem' }}
-                            >
-                              {item.status === 'RETRYING' ? 'Sending…' : '🔄 Retry'}
-                            </button>
-                            <button
-                              onClick={() => setRetryQueue(prev => prev.filter(q => q.id !== item.id))}
-                              className="btn btn-secondary"
-                              style={{ padding: '4px 10px', fontSize: '0.78rem' }}
-                            >
-                              ✕ Cancel
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {/* Email Logs Table */}
-          <div style={S.card}>
-            <p style={S.sectionTitle}>Sent Email History</p>
-            <p style={S.sectionSub}>Outbound SMTP transaction log for all dispatched reports and notifications.</p>
-
-            {emailLogsList.length === 0 ? (
-              <div style={S.empty}>
-                <span style={S.emptyIcon}>✉️</span>
-                <p style={S.emptyText}>No emails have been sent yet</p>
-                <p style={{ ...S.emptyText, fontSize: '0.78rem', opacity: 0.6 }}>
-                  Sent emails will appear here once the system starts dispatching reports.
-                </p>
-              </div>
-            ) : (
-              <div style={S.tableWrap}>
-                <table style={S.table}>
-                  <thead>
-                    <tr>
-                      {['Timestamp', 'Recipient', 'Subject', 'Formats', 'Status'].map(h => (
-                        <th key={h} style={S.th}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {emailLogsList.map((log, idx) => {
-                      const msg  = log.message || '';
-                      const subj = log.subject  || '';
-                      const hasPdf   = msg.includes('PDF')   || subj.includes('Daily') || subj.includes('Shift') || subj.includes('Weekly') || msg.includes('test');
-                      const hasExcel = msg.includes('Excel') || subj.includes('Daily') || subj.includes('Shift') || subj.includes('Weekly') || msg.includes('test');
-                      return (
-                        <tr key={idx} style={{ background: idx % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.015)' }}>
-                          <td style={{ ...S.td, fontFamily: 'monospace', fontSize: '0.78rem', whiteSpace: 'nowrap' }}>
-                            {log.timestamp.replace('T', ' ').substring(0, 19)}
-                          </td>
-                          <td style={{ ...S.td, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.recipient}>
-                            {log.recipient}
-                          </td>
-                          <td style={{ ...S.td, maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={subj}>
-                            {subj}
-                          </td>
-                          <td style={S.td}>
-                            <div style={{ display: 'flex', gap: 6 }}>
-                              {hasPdf   && <span className="badge badge-info"    style={{ fontSize: '0.7rem', padding: '2px 7px' }}>📄 PDF</span>}
-                              {hasExcel && <span className="badge badge-success" style={{ fontSize: '0.7rem', padding: '2px 7px' }}>📊 Excel</span>}
-                              {!hasPdf && !hasExcel && <span className="badge" style={{ fontSize: '0.7rem', padding: '2px 7px', opacity: 0.5 }}>—</span>}
-                            </div>
-                          </td>
-                          <td style={S.td}>
-                            <span className="badge badge-success" style={{ fontSize: '0.72rem' }}>✓ {log.status}</span>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* ═══════════════════════════════════════
-          TAB: SCHEDULED REPORTS
-      ═══════════════════════════════════════ */}
-      {activeSubTab === 'schedules' && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-          {/* Header action bar */}
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
-            <div>
-              <p style={{ ...S.sectionTitle, marginBottom: 2 }}>Scheduled Reports</p>
-              <p style={{ ...S.sectionSub, marginBottom: 0 }}>Automate report compilation and delivery by configuring time-based triggers.</p>
-            </div>
-            <button onClick={() => handleOpenEdit(null)} className="btn btn-primary">
-              + Add Schedule
-            </button>
-          </div>
-
-          {/* Schedule list + sidebar */}
-          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 20, alignItems: 'start' }}>
-            {/* List */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              {schedulesList.length === 0 ? (
-                <div style={{ ...S.card, ...S.empty }}>
-                  <span style={S.emptyIcon}>⏱️</span>
-                  <p style={S.emptyText}>No scheduled reports configured</p>
-                  <p style={{ ...S.emptyText, fontSize: '0.78rem', opacity: 0.6 }}>
-                    Click "Add Schedule" to set up automated report delivery.
-                  </p>
-                </div>
-              ) : (
-                schedulesList.map((sched, idx) => (
-                  <div key={idx} style={S.scheduleCard(sched.enabled)}>
-                    {/* Top row */}
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                        <span style={sched.enabled ? S.badgeEnabled : S.badgeDisabled}>
-                          {sched.enabled ? 'Active' : 'Paused'}
-                        </span>
-                        <span style={S.badgeFreq}>{sched.frequency}</span>
-                        <strong style={{ fontSize: '0.9rem', color: 'var(--text)' }}>{sched.reportType}</strong>
-                      </div>
-                      <ToggleSwitch
-                        id={`sched-toggle-${idx}`}
-                        checked={sched.enabled}
-                        onChange={() => handleToggleEnable(sched)}
-                      />
-                    </div>
-
-                    {/* Meta grid */}
-                    <div style={S.schedMeta}>
-                      <div>
-                        <span style={S.schedMetaKey}>Plant</span>
-                        <span style={S.schedMetaVal}>{plantsList.find(p => p.id === sched.plantId)?.name || '—'}</span>
-                      </div>
-                      <div>
-                        <span style={S.schedMetaKey}>Trigger Time</span>
-                        <span style={{ ...S.schedMetaVal, fontFamily: 'monospace' }}>🕒 {sched.time}</span>
-                      </div>
-                      <div>
-                        <span style={S.schedMetaKey}>Recipients</span>
-                        <span style={{ ...S.schedMetaVal, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }} title={sched.emailRecipients}>
-                          {sched.emailRecipients || '—'}
-                        </span>
-                      </div>
-                    </div>
-
-                    {/* Format tags */}
-                    <div style={{ display: 'flex', gap: 8 }}>
-                      {sched.formatPdf   !== false && <span className="badge badge-info"    style={{ fontSize: '0.72rem', padding: '2px 8px' }}>📄 PDF</span>}
-                      {sched.formatExcel !== false && <span className="badge badge-success" style={{ fontSize: '0.72rem', padding: '2px 8px' }}>📊 Excel</span>}
-                    </div>
-
-                    {/* Actions */}
-                    <div style={S.schedActions}>
-                      <button onClick={() => handleTriggerSimulatedSend(sched)} className="btn btn-secondary" style={{ flex: 2, fontSize: '0.8rem', padding: '6px' }}>
-                        ⚡ Force Dispatch
-                      </button>
-                      <button onClick={() => handleOpenEdit(sched)} className="btn btn-secondary" style={{ flex: 1, fontSize: '0.8rem', padding: '6px' }}>
-                        ✏️ Edit
-                      </button>
-                      <button onClick={() => handleDelete(sched.id)} className="btn btn-danger" style={{ flex: 1, fontSize: '0.8rem', padding: '6px', color: 'white' }}>
-                        🗑 Delete
-                      </button>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-
-            {/* Sidebar: Upcoming calendar */}
-            <div style={S.card}>
-              <p style={{ ...S.sectionTitle, marginBottom: 4 }}>Distribution Calendar</p>
-              <p style={{ ...S.sectionSub, marginBottom: 16 }}>Upcoming trigger times for active schedules</p>
-
-              {schedulesList.filter(s => s.enabled).length === 0 ? (
-                <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.82rem', padding: '20px 0' }}>
-                  No enabled schedules to preview.
-                </div>
-              ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                  {schedulesList.filter(s => s.enabled).map((sched, idx) => {
-                    const today = new Date().toISOString().split('T')[0];
-                    return (
-                      <div key={idx} style={{ padding: '10px 14px', background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                          <span style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)' }}>{sched.reportType}</span>
-                          <span style={S.badgeFreq}>{sched.frequency}</span>
-                        </div>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.76rem', color: 'var(--text-muted)' }}>
-                          <span>Next execution</span>
-                          <span style={{ fontFamily: 'monospace', color: 'var(--secondary)' }}>{today} {sched.time}</span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ═══════════════════════════════════════
-          TAB: REPORT TEMPLATES
-      ═══════════════════════════════════════ */}
-      {activeSubTab === 'templates' && isSuperAdmin && (
-        <div style={{ display: 'flex', justifyContent: 'center' }}>
-          <div style={{ ...S.card, width: '100%', maxWidth: 620 }}>
-            <p style={S.sectionTitle}>Report Branding & Templates</p>
-            <p style={S.sectionSub}>
-              Customize the visual identity of exported PDF and Excel reports.
-            </p>
-
-            {templateStatus && (
-              <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px',
-                padding: '10px 14px',
-                borderRadius: '6px',
-                fontSize: '0.85rem',
-                fontWeight: 500,
-                backgroundColor: templateStatus.type === 'success' ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.08)',
-                border: templateStatus.type === 'success' ? '1px solid rgba(16, 185, 129, 0.25)' : '1px solid rgba(239, 68, 68, 0.25)',
-                color: templateStatus.type === 'success' ? '#34D399' : '#F87171',
-                marginBottom: '16px'
-              }}>
-                {templateStatus.type === 'success' ? '✓' : '✗'} {templateStatus.text}
+            {lastSavedSmtp && (
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)', marginBottom: '8px', textAlign: 'right' }}>
+                Last saved at: <strong>{lastSavedSmtp}</strong>
               </div>
             )}
 
-            <form onSubmit={handleSaveTemplates} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              {/* Logo / Company name */}
-              <div style={S.formGroup}>
-                <label style={S.label} htmlFor="tmpl-logo">Organisation / Logo Text</label>
-                <input
-                  id="tmpl-logo"
-                  type="text"
-                  className="form-control"
-                  placeholder="e.g. Acme Industries Pvt. Ltd."
-                  value={logoText}
-                  onChange={e => setLogoText(e.target.value)}
-                />
-                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                  Appears in the report header as the organisation name.
-                </span>
-              </div>
-
-              <div style={S.divider} />
-
-              {/* Template settings customization fields */}
-              <div style={S.formGroup}>
-                <label style={S.label} htmlFor="tmpl-header-color">Header Background Color</label>
-                <div style={S.colorWrap}>
-                  <input
-                    id="tmpl-header-color"
-                    type="color"
-                    value={headerColor}
-                    onChange={e => setHeaderColor(e.target.value)}
-                    style={S.colorInput}
-                  />
-                  <input
-                    type="text"
-                    className="form-control"
-                    value={headerColor}
-                    onChange={e => setHeaderColor(e.target.value)}
-                    style={{ flex: 1, fontFamily: 'monospace', fontSize: '0.85rem' }}
-                    maxLength={7}
-                  />
-                </div>
-              </div>
-
-              <div style={S.formGroup}>
-                <label style={S.label} htmlFor="tmpl-footer-text">PDF Footer Compliance Text</label>
-                <input
-                  id="tmpl-footer-text"
-                  type="text"
-                  className="form-control"
-                  placeholder="e.g. Confidential Report. For internal use only."
-                  value={footerText}
-                  onChange={e => setFooterText(e.target.value)}
-                />
-                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                  Appears at the very bottom of exported report files.
-                </span>
-              </div>
-
-              {/* Live preview bar */}
-              <div style={{ borderRadius: 'var(--radius-sm)', overflow: 'hidden', border: '1px solid var(--border)' }}>
-                <div style={{ background: headerColor, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <div style={{ width: 28, height: 28, borderRadius: 6, background: 'rgba(255,255,255,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.9rem' }}>📊</div>
-                  <div>
-                    <div style={{ fontSize: '0.8rem', fontWeight: 700, color: 'rgba(255,255,255,0.92)' }}>{logoText || 'Your Organisation'}</div>
-                    <div style={{ fontSize: '0.65rem', color: 'rgba(255,255,255,0.5)' }}>Report Header Preview</div>
-                  </div>
-                </div>
-                <div style={{ background: 'var(--background)', padding: '10px 16px', fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center' }}>
-                  — Report body content —
-                </div>
-                <div style={{ background: '#0f172a', padding: '8px 16px', fontSize: '0.65rem', color: 'rgba(255,255,255,0.45)', textAlign: 'center' }}>
-                  {footerText || 'CONFIDENTIAL — AUTOMATED REPORT DISPATCHED BY SKADOMATION HISTORIAN MODULE.'}
-                </div>
-              </div>
-
-              <div style={S.divider} />
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                <button type="submit" className="btn btn-primary" style={{ minWidth: 180 }}>
-                  Save Template Settings
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* ═══════════════════════════════════════
-          TAB: RECIPIENT MANAGEMENT
-      ═══════════════════════════════════════ */}
-      {activeSubTab === 'recipients' && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-          <div style={S.card}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '16px' }}>
-              <div>
-                <p style={S.sectionTitle}>Recipient Management</p>
-                <p style={{ ...S.sectionSub, marginBottom: 0 }}>
-                  Manage report distribution lists, contact groups, and delivery configurations.
-                </p>
-              </div>
-              <div style={{ display: 'flex', gap: '8px' }}>
-                <button
-                  onClick={handleTestDistribution}
-                  disabled={isTestingDistribution}
-                  className="btn btn-secondary"
-                >
-                  ⚡ {isTestingDistribution ? 'Testing Broadcast…' : 'Test Distribution'}
-                </button>
-                <button
-                  onClick={() => handleOpenRecipientEdit()}
-                  className="btn btn-primary"
-                >
-                  ➕ Add Recipient
-                </button>
-              </div>
-            </div>
-
-            {/* Filters and search row */}
-            <div style={{ display: 'flex', gap: '12px', marginBottom: '20px', flexWrap: 'wrap', alignItems: 'center' }}>
-              <div style={{ flex: 1, minWidth: '240px' }}>
-                <input
-                  type="text"
-                  className="form-control"
-                  placeholder="Search by name or email..."
-                  value={searchQuery}
-                  onChange={e => setSearchQuery(e.target.value)}
-                />
-              </div>
-              <div style={{ width: '150px' }}>
-                <select
-                  className="form-control"
-                  value={statusFilter}
-                  onChange={e => setStatusFilter(e.target.value)}
-                >
-                  <option value="all">All Statuses</option>
-                  <option value="active">Active Only</option>
-                  <option value="inactive">Inactive Only</option>
-                </select>
-              </div>
-
-              {selectedRecipientIds.length > 0 && (
-                <div style={{ display: 'flex', gap: '8px', marginLeft: 'auto' }}>
-                  <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', alignSelf: 'center', marginRight: '8px' }}>
-                    {selectedRecipientIds.length} selected
-                  </span>
-                  <button onClick={() => handleBulkRecipientStatus(true)} className="btn btn-secondary btn-sm">
-                    Bulk Enable
-                  </button>
-                  <button onClick={() => handleBulkRecipientStatus(false)} className="btn btn-secondary btn-sm">
-                    Bulk Disable
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Recipient Directory Table */}
-            <div style={S.tableWrap}>
-              <table style={S.table}>
+            <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+              <table style={S.table} className="table responsive-table">
                 <thead>
                   <tr>
-                    <th style={{ ...S.th, width: 40, textAlign: 'center' }}>
-                      <input
-                        type="checkbox"
-                        checked={
-                          recipientsList.length > 0 &&
-                          recipientsList.every(r => selectedRecipientIds.includes(r.id))
-                        }
-                        onChange={e => {
-                          if (e.target.checked) {
-                            setSelectedRecipientIds(recipientsList.map(r => r.id));
-                          } else {
-                            setSelectedRecipientIds([]);
-                          }
-                        }}
-                      />
-                    </th>
-                    <th style={S.th}>Name</th>
-                    <th style={S.th}>Email Address</th>
-                    <th style={S.th}>Role</th>
-                    <th style={S.th}>Groups</th>
-                    <th style={S.th}>Report Types</th>
-                    <th style={{ ...S.th, width: 80, textAlign: 'center' }}>Status</th>
-                    <th style={{ ...S.th, width: 120, textAlign: 'center' }}>Actions</th>
+                    <th style={S.th}>Configuration Name</th>
+                    <th style={S.th}>SMTP Host</th>
+                    <th style={S.th}>Port</th>
+                    <th style={S.th}>Username</th>
+                    <th style={S.th}>Security</th>
+                    <th style={{ ...S.th, textAlign: 'center' }}>Active Status</th>
+                    <th style={{ ...S.th, textAlign: 'center' }}>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {recipientsList
-                    .filter(r => {
-                      const matchesSearch =
-                        r.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                        r.email?.toLowerCase().includes(searchQuery.toLowerCase());
-                      const matchesStatus =
-                        statusFilter === 'all' ||
-                        (statusFilter === 'active' && r.active) ||
-                        (statusFilter === 'inactive' && !r.active);
-                      return matchesSearch && matchesStatus;
-                    })
-                    .map(rec => (
-                      <tr key={rec.id} style={{ background: selectedRecipientIds.includes(rec.id) ? 'rgba(59,130,246,0.05)' : 'transparent' }}>
-                        <td style={{ ...S.td, textAlign: 'center' }}>
-                          <input
-                            type="checkbox"
-                            checked={selectedRecipientIds.includes(rec.id)}
-                            onChange={e => {
-                              if (e.target.checked) {
-                                setSelectedRecipientIds(prev => [...prev, rec.id]);
-                              } else {
-                                setSelectedRecipientIds(prev => prev.filter(id => id !== rec.id));
-                              }
-                            }}
-                          />
-                        </td>
-                        <td style={{ ...S.td, fontWeight: 600, color: 'var(--text)' }}>{rec.name}</td>
-                        <td style={S.td}>{rec.email}</td>
-                        <td style={S.td}>
-                          <span style={{ fontSize: '0.75rem', background: 'var(--surface-raised)', padding: '2px 6px', borderRadius: 4, color: 'var(--text-muted)' }}>
-                            {rec.role || 'Operator'}
+                  {filteredSmtp.map(config => (
+                    <tr key={config.id} style={{ background: config.is_active ? 'rgba(59, 130, 246, 0.02)' : 'transparent' }}>
+                      <td data-label="Configuration Name" style={{ ...S.td, fontWeight: 600 }}>{config.name}</td>
+                      <td data-label="SMTP Host" style={S.td}>{config.host}</td>
+                      <td data-label="Port" style={S.td}>{config.port}</td>
+                      <td data-label="Username" style={S.td}>{config.username}</td>
+                      <td data-label="Security" style={S.td}>
+                        <span style={{ fontSize: '0.72rem', padding: '1px 6px', background: 'var(--surface-raised)', border: '1px solid var(--border)', borderRadius: 3, fontWeight: 600 }}>
+                          {config.security_type || (config.secure ? 'SSL/TLS' : 'STARTTLS')}
+                        </span>
+                      </td>
+                      <td data-label="Active Status" style={{ ...S.td, textAlign: 'center' }}>
+                        {config.is_active ? (
+                          <span style={{ fontSize: '0.72rem', padding: '2px 8px', background: 'rgba(16,185,129,0.1)', color: 'var(--success)', borderRadius: 12, fontWeight: 700 }}>
+                            ● ACTIVE
                           </span>
-                        </td>
-                        <td style={S.td}>
-                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                            {(rec.groups || '').split(',').filter(Boolean).map(g => (
-                              <span key={g} style={{ fontSize: '0.7rem', padding: '1px 6px', background: 'rgba(59,130,246,0.1)', color: 'var(--secondary)', borderRadius: 3 }}>
-                                {g.trim()}
-                              </span>
-                            ))}
-                          </div>
-                        </td>
-                        <td style={S.td}>
-                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                            {(rec.report_types || '').split(',').filter(Boolean).map(rt => (
-                              <span key={rt} style={{ fontSize: '0.7rem', padding: '1px 6px', background: 'rgba(16,185,129,0.1)', color: 'var(--success)', borderRadius: 3 }}>
-                                {rt.trim()}
-                              </span>
-                            ))}
-                          </div>
-                        </td>
-                        <td style={{ ...S.td, textAlign: 'center' }}>
-                          <ToggleSwitch
-                            id={`status-${rec.id}`}
-                            checked={rec.active}
-                            onChange={() => handleToggleRecipientActive(rec)}
-                          />
-                        </td>
-                        <td style={{ ...S.td, textAlign: 'center' }}>
-                          <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
-                            <button
-                              onClick={() => handleOpenRecipientEdit(rec)}
-                              className="btn btn-secondary btn-sm"
-                            >
-                              Edit
-                            </button>
-                            <button
-                              onClick={() => handleDeleteRecipient(rec.id)}
-                              className="btn btn-danger btn-sm"
-                            >
-                              Delete
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
+                        ) : (
+                          <button
+                            onClick={() => handleSetActiveSmtp(config.id, config.name)}
+                            className="btn btn-secondary btn-sm"
+                            style={{ height: '22px', fontSize: '0.72rem', padding: '0 8px' }}
+                          >
+                            Set Active
+                          </button>
+                        )}
+                      </td>
+                      <td data-label="Actions" style={S.td}>
+                        <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
+                          <button
+                            onClick={() => handleOpenTestModal(config)}
+                            disabled={isTestingSmtpId === config.id}
+                            className="btn btn-success btn-sm"
+                            style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
+                          >
+                            {isTestingSmtpId === config.id ? '⚡ Testing…' : '🔌 Test Link'}
+                          </button>
+                          {!isReadOnly && (<>
+                          <button
+                            onClick={() => handleOpenSmtpEdit(config)}
+                            className="btn btn-secondary btn-sm"
+                            style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            onClick={() => handleDuplicateSmtp(config)}
+                            className="btn btn-secondary btn-sm"
+                            style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
+                          >
+                            Copy
+                          </button>
+                          <button
+                            onClick={() => handleDeleteSmtp(config.id, config.name)}
+                            className="btn btn-danger btn-sm"
+                            style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
+                          >
+                            Delete
+                          </button>
+                          </>)}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
 
-                  {recipientsList.length === 0 && (
+                  {filteredSmtp.length === 0 && (
                     <tr>
-                      <td colSpan="8" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
-                        No report recipients configured. Add recipients to start routing reports.
+                      <td colSpan="7" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
+                        No SMTP configurations found matching your search.
                       </td>
                     </tr>
                   )}
@@ -1652,145 +821,566 @@ export default function Settings({ user }) {
       )}
 
       {/* ═══════════════════════════════════════
-          MODAL: Send Test Email
+          TAB: REPORT TEMPLATES
       ═══════════════════════════════════════ */}
-      {showTestEmailModal && (
-        <div style={S.modalOverlay}>
-          <div style={S.modalBox(420)}>
-            <div style={S.modalHead}>
-              <h3 style={S.modalTitle}>Send Test Email</h3>
-              <button onClick={() => setShowTestEmailModal(false)} style={S.modalClose}>×</button>
-            </div>
-            <form onSubmit={handleSendTestEmail} style={S.modalBody}>
-              <div style={S.formGroup}>
-                <label style={S.label} htmlFor="test-recipient">Recipient Email</label>
+      {activeSubTab === 'templates' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          <div style={S.card}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '16px' }}>
+              <div>
+                <p style={S.sectionTitle}>Report Templates Designer</p>
+                <p style={{ ...S.sectionSub, marginBottom: 0 }}>
+                  Customize PDF/Excel layouts, branding colors, and default email notification summaries.
+                </p>
+              </div>
+              <div style={{ display: 'flex', gap: '10px' }}>
                 <input
-                  id="test-recipient"
-                  type="email"
+                  type="text"
+                  placeholder="🔍 Search templates..."
+                  value={templateSearch}
+                  onChange={e => setTemplateSearch(e.target.value)}
                   className="form-control"
-                  placeholder="recipient@example.com"
-                  value={testEmailRecipient}
-                  onChange={e => setTestEmailRecipient(e.target.value)}
-                  required
+                  style={{ width: '220px', height: '36px', fontSize: '0.8rem' }}
                 />
-              </div>
-              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', background: 'var(--background)', padding: '10px 14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)' }}>
-                A diagnostic email will be sent using the configured SMTP credentials to verify delivery.
-              </div>
-              <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
-                <button type="button" onClick={() => setShowTestEmailModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>
-                  Cancel
-                </button>
-                <button type="submit" disabled={isSendingTestEmail} className="btn btn-primary" style={{ flex: 2 }}>
-                  {isSendingTestEmail ? 'Sending…' : '⚡ Send Test Email'}
+                <button onClick={() => handleOpenTemplateEdit(null)} className="btn btn-primary btn-sm" style={{ height: '36px' }}>
+                  ➕ New Template
                 </button>
               </div>
-            </form>
+            </div>
+
+            {templateStatus && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', borderRadius: '6px', fontSize: '0.85rem', fontWeight: 500,
+                backgroundColor: templateStatus.type === 'success' ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.08)',
+                border: templateStatus.type === 'success' ? '1px solid rgba(16, 185, 129, 0.25)' : '1px solid rgba(239, 68, 68, 0.25)',
+                color: templateStatus.type === 'success' ? '#34D399' : '#F87171', marginBottom: '16px'
+              }}>
+                {templateStatus.type === 'success' ? '✓' : '✗'} {templateStatus.text}
+              </div>
+            )}
+
+            {lastSavedTemplate && (
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)', marginBottom: '8px', textAlign: 'right' }}>
+                Last saved at: <strong>{lastSavedTemplate}</strong>
+              </div>
+            )}
+
+            <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+              <table style={S.table} className="table responsive-table">
+                <thead>
+                  <tr>
+                    <th style={S.th}>Template Name</th>
+                    <th style={S.th}>Report Type</th>
+                    <th style={S.th}>Email Subject</th>
+                    <th style={S.th}>Theme Color</th>
+                    <th style={{ ...S.th, textAlign: 'center' }}>Default Status</th>
+                    <th style={{ ...S.th, textAlign: 'center' }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredTemplates.map(template => (
+                    <tr key={template.id} style={{ background: template.is_default ? 'rgba(59, 130, 246, 0.02)' : 'transparent' }}>
+                      <td data-label="Template Name" style={{ ...S.td, fontWeight: 600 }}>{template.name}</td>
+                      <td data-label="Report Type" style={S.td}>{template.report_type}</td>
+                      <td data-label="Email Subject" style={S.td}>{template.subject}</td>
+                      <td data-label="Theme Color" style={S.td}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span style={{ width: '12px', height: '12px', borderRadius: '50%', background: template.header_color, border: '1px solid rgba(255,255,255,0.1)' }} />
+                          <span style={{ fontFamily: 'monospace' }}>{template.header_color}</span>
+                        </div>
+                      </td>
+                      <td data-label="Default Status" style={{ ...S.td, textAlign: 'center' }}>
+                        {template.is_default ? (
+                          <span style={{ fontSize: '0.72rem', padding: '2px 8px', background: 'rgba(16,185,129,0.1)', color: 'var(--success)', borderRadius: 12, fontWeight: 700 }}>
+                            ★ DEFAULT
+                          </span>
+                        ) : (
+                          <button
+                            onClick={() => handleSetDefaultTemplate(template.id, template.report_type, template.name)}
+                            className="btn btn-secondary btn-sm"
+                            style={{ height: '22px', fontSize: '0.72rem', padding: '0 8px' }}
+                          >
+                            Set Default
+                          </button>
+                        )}
+                      </td>
+                      <td data-label="Actions" style={S.td}>
+                        <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
+                          <button
+                            onClick={() => handlePreviewTemplate(template)}
+                            className="btn btn-success btn-sm"
+                            style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
+                          >
+                            👁️ Preview
+                          </button>
+                          <button
+                            onClick={() => handleOpenTemplateEdit(template)}
+                            className="btn btn-secondary btn-sm"
+                            style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            onClick={() => handleDuplicateTemplate(template)}
+                            className="btn btn-secondary btn-sm"
+                            style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
+                          >
+                            Copy
+                          </button>
+                          <button
+                            onClick={() => handleDeleteTemplate(template.id, template.name)}
+                            className="btn btn-danger btn-sm"
+                            style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+
+                  {filteredTemplates.length === 0 && (
+                    <tr>
+                      <td colSpan="6" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
+                        No templates found matching your search query.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}
 
       {/* ═══════════════════════════════════════
-          MODAL: Add / Edit Schedule
+          TAB: SCHEDULED REPORTS
       ═══════════════════════════════════════ */}
-      {showModal && (
+      {activeSubTab === 'schedules' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          <div style={S.card}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '16px' }}>
+              <div>
+                <p style={S.sectionTitle}>Automated Run Schedules</p>
+                <p style={{ ...S.sectionSub, marginBottom: 0 }}>
+                  Configure cron engines to auto-compile and dispatch reports.
+                </p>
+              </div>
+              {!isReadOnly && (
+                <button onClick={() => handleOpenScheduleEdit(null)} className="btn btn-primary btn-sm">
+                  ➕ New Schedule
+                </button>
+              )}
+            </div>
+
+            {scheduleStatus && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', borderRadius: '6px', fontSize: '0.85rem', fontWeight: 500,
+                backgroundColor: scheduleStatus.type === 'success' ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.08)',
+                border: scheduleStatus.type === 'success' ? '1px solid rgba(16, 185, 129, 0.25)' : '1px solid rgba(239, 68, 68, 0.25)',
+                color: scheduleStatus.type === 'success' ? '#34D399' : '#F87171', marginBottom: '16px'
+              }}>
+                {scheduleStatus.type === 'success' ? '✓' : '✗'} {scheduleStatus.text}
+              </div>
+            )}
+
+            <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+              <table style={S.table} className="table responsive-table">
+                <thead>
+                  <tr>
+                    <th style={S.th}>Plant Location</th>
+                    <th style={S.th}>Report Type</th>
+                    <th style={S.th}>Mode</th>
+                    <th style={S.th}>Shift #</th>
+                    <th style={S.th}>Trigger Time</th>
+                    <th style={S.th}>Format(s)</th>
+                    <th style={S.th}>Last Run</th>
+                    <th style={S.th}>Next Run</th>
+                    <th style={S.th}>Last Status</th>
+                    <th style={S.th}>Records</th>
+                    <th style={S.th}>Last Sent To</th>
+                    <th style={{ ...S.th, textAlign: 'center' }}>Scheduler Status</th>
+                    <th style={{ ...S.th, textAlign: 'center' }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {schedulesList.map(sched => {
+                    const plantName = plantsList.find(p => p.id === sched.plantId)?.name || sched.plantId || 'Unknown Plant';
+                    const formats = [sched.formatPdf !== false ? 'PDF' : '', sched.formatExcel !== false ? 'Excel' : ''].filter(Boolean).join(', ');
+                    const localTriggerTime = convertUtcToLocalTime(sched.time, sched.plantId);
+                    const tzAbbr = getTimeZoneAbbreviation(sched.plantId);
+                    
+                    const formattedLastRun = sched.lastRunTime ? formatTimestampToPlantTime(sched.lastRunTime, sched.plantId) : '—';
+                    const formattedNextRun = sched.nextRunTime ? formatTimestampToPlantTime(sched.nextRunTime, sched.plantId) : '—';
+                    
+                    let statusColor = 'var(--text-dim)';
+                    if (sched.lastExecutionStatus === 'success') statusColor = 'var(--success)';
+                    else if (sched.lastExecutionStatus && sched.lastExecutionStatus.startsWith('failed')) statusColor = 'var(--error)';
+                    else if (sched.lastExecutionStatus === 'running') statusColor = 'var(--info)';
+
+                    return (
+                      <tr key={sched.id}>
+                        <td data-label="Plant Location" style={{ ...S.td, fontWeight: 600 }}>{plantName}</td>
+                        <td data-label="Report Type" style={S.td}>{sched.reportType}</td>
+                        <td data-label="Mode" style={S.td}>{sched.reportMode || 'Daily'}</td>
+                        <td data-label="Shift #" style={S.td}>{sched.reportMode === 'Shift' ? `Shift ${sched.shiftNumber || 1}` : '—'}</td>
+                        <td data-label="Trigger Time" style={S.td}>{localTriggerTime} ({tzAbbr})</td>
+                        <td data-label="Format(s)" style={S.td}>{formats || 'None'}</td>
+                        <td data-label="Last Run" style={{ ...S.td, fontFamily: 'monospace', fontSize: '0.76rem', whiteSpace: 'nowrap' }}>{formattedLastRun}</td>
+                        <td data-label="Next Run" style={{ ...S.td, fontFamily: 'monospace', fontSize: '0.76rem', whiteSpace: 'nowrap' }}>{formattedNextRun}</td>
+                        <td data-label="Last Status" style={S.td}>
+                          {sched.lastExecutionStatus ? (
+                            <span style={{
+                              fontSize: '0.7rem', padding: '2px 6px', borderRadius: 4, fontWeight: 600,
+                              backgroundColor: sched.lastExecutionStatus === 'success' ? 'rgba(16,185,129,0.1)' : (sched.lastExecutionStatus === 'running' ? 'rgba(59,130,246,0.1)' : 'rgba(239,68,68,0.1)'),
+                              color: statusColor
+                            }} title={sched.lastExecutionStatus}>
+                              {sched.lastExecutionStatus.toUpperCase()}
+                            </span>
+                          ) : '—'}
+                        </td>
+                        <td data-label="Records" style={{ ...S.td, textAlign: 'center' }}>{sched.recordsIncluded !== null && sched.recordsIncluded !== undefined ? sched.recordsIncluded : '—'}</td>
+                        <td data-label="Last Sent To" style={{ ...S.td, maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={sched.lastEmailSentTo || sched.emailRecipients}>
+                          {sched.lastEmailSentTo || '—'}
+                        </td>
+                        <td data-label="Status" style={{ ...S.td, textAlign: 'center' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+                            <span style={{ fontSize: '0.72rem', color: sched.enabled ? 'var(--success)' : 'var(--text-dim)', fontWeight: 700 }}>
+                              {sched.enabled ? 'ENABLED' : 'DISABLED'}
+                            </span>
+                            <ToggleSwitch
+                              id={`sched-toggle-${sched.id}`}
+                              checked={sched.enabled}
+                              onChange={isReadOnly ? undefined : () => handleToggleScheduleEnabled(sched)}
+                              disabled={isReadOnly}
+                            />
+                          </div>
+                        </td>
+                        <td data-label="Actions" style={S.td}>
+                          {isReadOnly ? (
+                            <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>View Only</span>
+                          ) : (
+                            <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
+                              <button
+                                onClick={() => handleOpenScheduleEdit(sched)}
+                                className="btn btn-secondary btn-sm"
+                                style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
+                              >
+                                Edit
+                              </button>
+                              <button
+                                onClick={() => handleDeleteSchedule(sched.id)}
+                                className="btn btn-danger btn-sm"
+                                style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+
+                  {schedulesList.length === 0 && (
+                    <tr>
+                      <td colSpan="13" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
+                        No report schedules configured for this plant location.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════
+          TAB: EMAIL LOG DISPATCHES
+      ═══════════════════════════════════════ */}
+      {activeSubTab === 'emaillogs' && isSuperAdmin && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          <div style={S.card}>
+            <p style={S.sectionTitle}>SMTP Output Logs</p>
+            <p style={S.sectionSub}>
+              Historian dispatch telemetry detailing report outputs, recipients, and verification status codes.
+            </p>
+
+            <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+              <table style={S.table} className="table responsive-table">
+                <thead>
+                  <tr>
+                    <th style={S.th}>Timestamp</th>
+                    <th style={S.th}>Recipients</th>
+                    <th style={S.th}>Subject Name</th>
+                    <th style={S.th}>Attachment Contents</th>
+                    <th style={{ ...S.th, textAlign: 'center' }}>Relay Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {emailLogsList.map((log, index) => (
+                    <tr key={index}>
+                      <td data-label="Timestamp" style={{ ...S.td, fontFamily: 'monospace', fontSize: '0.76rem', whiteSpace: 'nowrap' }}>{log.timestamp}</td>
+                      <td data-label="Recipients" style={{ ...S.td, maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.recipient}>
+                        {log.recipient}
+                      </td>
+                      <td data-label="Subject Name" style={S.td}>{log.subject}</td>
+                      <td data-label="Attachment Contents" style={S.td}>
+                        <span style={{ fontSize: '0.75rem', padding: '2px 8px', background: 'var(--surface-raised)', border: '1px solid var(--border)', borderRadius: '4px' }}>
+                          📄 PDF, Excel
+                        </span>
+                      </td>
+                      <td data-label="Relay Status" style={{ ...S.td, textAlign: 'center' }}>
+                        <span style={{
+                          fontSize: '0.7rem', padding: '2px 8px', borderRadius: 4, fontWeight: 700,
+                          backgroundColor: log.status === 'SENT' ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)',
+                          color: log.status === 'SENT' ? 'var(--success)' : 'var(--error)'
+                        }}>
+                          {log.status || 'SENT'}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+
+                  {emailLogsList.length === 0 && (
+                    <tr>
+                      <td colSpan="5" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
+                        No email dispatch records found in the telemetry history log.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeSubTab === 'schedulerhistory' && isSuperAdmin && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          <div style={S.card}>
+            <p style={S.sectionTitle}>Scheduler Execution History</p>
+            <p style={S.sectionSub}>
+              Detailed audit trail tracking automated report scheduling triggers, execution times, dispatches, and delivery status.
+            </p>
+
+            <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+              <table style={S.table} className="table responsive-table">
+                <thead>
+                  <tr>
+                    <th style={S.th}>Schedule Name</th>
+                    <th style={S.th}>Trigger Time</th>
+                    <th style={S.th}>Execution Time</th>
+                    <th style={S.th}>Report Period</th>
+                    <th style={S.th}>Records Processed</th>
+                    <th style={S.th}>Email Recipients</th>
+                    <th style={S.th}>Success / Failure</th>
+                    <th style={S.th}>Error Message / Context</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {schedulerHistoryList.map((log, index) => {
+                    const errorMsg = log.delivery_status === 'FAILED' ? log.type : 'None';
+                    const triggerTime = log.trigger_time || '—';
+                    const executionTime = formatTimestampToPlantTime(log.delivery_time || log.generated_at, log.plant_id);
+                    const recordsProcessed = log.records_processed !== null && log.records_processed !== undefined ? log.records_processed : '—';
+                    return (
+                      <tr key={log.id || index}>
+                        <td data-label="Schedule Name" style={{ ...S.td, fontWeight: 600 }}>
+                          {log.name || 'Automated Shift Report'}
+                        </td>
+                        <td data-label="Trigger Time" style={S.td}>
+                          {triggerTime}
+                        </td>
+                        <td data-label="Execution Time" style={{ ...S.td, fontFamily: 'monospace', fontSize: '0.76rem', whiteSpace: 'nowrap' }}>
+                          {executionTime}
+                        </td>
+                        <td data-label="Report Period" style={S.td}>
+                          {log.date_range || '—'}
+                        </td>
+                        <td data-label="Records Processed" style={{ ...S.td, textAlign: 'center' }}>
+                          {recordsProcessed}
+                        </td>
+                        <td data-label="Email Recipients" style={{ ...S.td, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.recipients}>
+                          {log.recipients || '—'}
+                        </td>
+                        <td data-label="Success / Failure" style={S.td}>
+                          <span style={{
+                            fontSize: '0.7rem', padding: '2px 8px', borderRadius: 4, fontWeight: 700,
+                            backgroundColor: log.delivery_status === 'SENT' ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)',
+                            color: log.delivery_status === 'SENT' ? 'var(--success)' : 'var(--error)'
+                          }}>
+                            {log.delivery_status === 'SENT' ? 'SUCCESS' : (log.delivery_status || 'FAILED')}
+                          </span>
+                        </td>
+                        <td data-label="Error Message / Context" style={{ ...S.td, fontSize: '0.78rem', color: log.delivery_status === 'FAILED' ? 'var(--error)' : 'var(--text-muted)' }}>
+                          {errorMsg}
+                        </td>
+                      </tr>
+                    );
+                  })}
+
+                  {schedulerHistoryList.length === 0 && (
+                    <tr>
+                      <td colSpan="8" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
+                        No scheduler execution logs found.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+
+      {/* ═══════════════════════════════════════
+          MODAL: Add / Edit SMTP Configuration
+      ═══════════════════════════════════════ */}
+      {showSmtpModal && (
         <div style={S.modalOverlay}>
-          <div style={S.modalBox(500)}>
+          <div style={S.modalBox(520)}>
             <div style={S.modalHead}>
               <h3 style={S.modalTitle}>
-                {editSchedule.id ? 'Edit Schedule' : 'Add Schedule'}
+                {editSmtpObj.id ? '⚙️ Edit SMTP Server Profile' : '🔌 Add SMTP Server Profile'}
               </h3>
-              <button onClick={() => setShowModal(false)} style={S.modalClose}>×</button>
+              <button onClick={() => setShowSmtpModal(false)} style={S.modalClose}>×</button>
             </div>
-            <form onSubmit={handleSaveSchedule} style={S.modalBody}>
-              {/* Report type */}
+            <form onSubmit={handleSaveSmtp} style={S.modalBody}>
+              {/* Config Name */}
               <div style={S.formGroup}>
-                <label style={S.label} htmlFor="sched-report-type">Report Template</label>
-                <select
-                  id="sched-report-type"
+                <label style={S.label} htmlFor="smtp-name">Configuration Name</label>
+                <input
+                  id="smtp-name"
+                  type="text"
                   className="form-control"
-                  value={editSchedule.reportType}
-                  onChange={e => setEditSchedule({ ...editSchedule, reportType: e.target.value })}
-                >
-                  <option value="Shift Report">Shift Report</option>
-                  <option value="Daily Report">Daily Report</option>
-                  <option value="Weekly Report">Weekly Report</option>
-                  <option value="Monthly Report">Monthly Report</option>
-                </select>
+                  placeholder="e.g. Primary Gmail Server, Site Relay"
+                  value={editSmtpObj.name}
+                  onChange={e => setEditSmtpObj({ ...editSmtpObj, name: e.target.value })}
+                  required
+                />
               </div>
 
-              {/* Frequency + Time */}
-              <div style={S.formGrid2}>
+              {/* Server Details Grid */}
+              <div className="form-grid-special-35">
                 <div style={S.formGroup}>
-                  <label style={S.label} htmlFor="sched-frequency">Frequency</label>
-                  <select
-                    id="sched-frequency"
+                  <label style={S.label} htmlFor="smtp-host">SMTP Host / Server Address</label>
+                  <input
+                    id="smtp-host"
+                    type="text"
                     className="form-control"
-                    value={editSchedule.frequency}
-                    onChange={e => setEditSchedule({ ...editSchedule, frequency: e.target.value })}
-                  >
-                    <option value="Daily">Daily</option>
-                    <option value="Weekly">Weekly</option>
-                    <option value="Monthly">Monthly</option>
-                  </select>
+                    placeholder="smtp.example.com"
+                    value={editSmtpObj.host}
+                    onChange={e => setEditSmtpObj({ ...editSmtpObj, host: e.target.value })}
+                    required
+                  />
                 </div>
                 <div style={S.formGroup}>
-                  <label style={S.label} htmlFor="sched-time">Trigger Time</label>
+                  <label style={S.label} htmlFor="smtp-port">Port Number</label>
                   <input
-                    id="sched-time"
-                    type="time"
+                    id="smtp-port"
+                    type="number"
                     className="form-control"
-                    value={editSchedule.time}
-                    onChange={e => setEditSchedule({ ...editSchedule, time: e.target.value })}
+                    placeholder="465"
+                    value={editSmtpObj.port}
+                    onChange={e => {
+                      const port = parseInt(e.target.value) || '';
+                      setEditSmtpObj({ 
+                        ...editSmtpObj, 
+                        port,
+                        security_type: port === 465 ? 'SSL/TLS' : (port === 587 ? 'STARTTLS' : editSmtpObj.security_type)
+                      });
+                    }}
                     required
                   />
                 </div>
               </div>
 
-              {/* Recipients */}
+              {/* Username */}
               <div style={S.formGroup}>
-                <label style={S.label} htmlFor="sched-emails">Email Recipients</label>
+                <label style={S.label} htmlFor="smtp-user">SMTP Username / Address</label>
                 <input
-                  id="sched-emails"
-                  type="text"
+                  id="smtp-user"
+                  type="email"
                   className="form-control"
-                  placeholder="alerts@company.com, admin@company.com"
-                  value={editSchedule.emailRecipients}
-                  onChange={e => setEditSchedule({ ...editSchedule, emailRecipients: e.target.value })}
+                  placeholder="alerts@company.com"
+                  value={editSmtpObj.username}
+                  onChange={e => setEditSmtpObj({ ...editSmtpObj, username: e.target.value })}
                   required
                 />
-                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Separate multiple addresses with commas.</span>
               </div>
 
-              {/* Formats */}
+              {/* Password */}
               <div style={S.formGroup}>
-                <label style={S.label}>Output Formats</label>
-                <div style={{ display: 'flex', gap: 24 }}>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.85rem', cursor: 'pointer', color: 'var(--text)' }}>
-                    <input
-                      type="checkbox"
-                      checked={editSchedule.formatPdf !== false}
-                      onChange={e => setEditSchedule({ ...editSchedule, formatPdf: e.target.checked })}
-                    />
-                    📄 PDF Report
-                  </label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.85rem', cursor: 'pointer', color: 'var(--text)' }}>
-                    <input
-                      type="checkbox"
-                      checked={editSchedule.formatExcel !== false}
-                      onChange={e => setEditSchedule({ ...editSchedule, formatExcel: e.target.checked })}
-                    />
-                    📊 Excel Sheet
-                  </label>
+                <label style={S.label} htmlFor="smtp-pass">SMTP Password / App Key</label>
+                <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+                  <input
+                    id="smtp-pass"
+                    type={showSmtpPass ? 'text' : 'password'}
+                    className="form-control"
+                    placeholder="••••••••••••"
+                    value={editSmtpObj.password}
+                    onChange={e => setEditSmtpObj({ ...editSmtpObj, password: e.target.value })}
+                    style={{ paddingRight: '40px', flex: 1 }}
+                    required
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowSmtpPass(!showSmtpPass)}
+                    style={{ position: 'absolute', right: '10px', background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center' }}
+                  >
+                    {showSmtpPass ? <EyeOff /> : <EyeOpen />}
+                  </button>
                 </div>
               </div>
 
+              {/* Security Selection */}
+              <div className="form-grid-2">
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="smtp-security">Security Connection Type</label>
+                  <select
+                    id="smtp-security"
+                    className="form-control"
+                    value={editSmtpObj.security_type}
+                    onChange={e => {
+                      const type = e.target.value;
+                      setEditSmtpObj({ 
+                        ...editSmtpObj, 
+                        security_type: type,
+                        port: type === 'SSL/TLS' ? 465 : (type === 'STARTTLS' ? 587 : editSmtpObj.port)
+                      });
+                    }}
+                  >
+                    <option value="SSL/TLS">SSL / TLS (Port 465)</option>
+                    <option value="STARTTLS">STARTTLS (Port 587)</option>
+                    <option value="None">None / Plain (Port 25 / 2525)</option>
+                  </select>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', marginTop: '20px' }}>
+                  <div>
+                    <p style={{ margin: 0, fontSize: '0.78rem', fontWeight: 600, color: 'var(--text)' }}>Default Active</p>
+                    <p style={{ margin: 0, fontSize: '0.65rem', color: 'var(--text-muted)' }}>Use this relay as default</p>
+                  </div>
+                  <ToggleSwitch
+                    id="smtp-active-toggle"
+                    checked={editSmtpObj.is_active}
+                    onChange={e => setEditSmtpObj({ ...editSmtpObj, is_active: e.target.checked })}
+                  />
+                </div>
+              </div>
+
+              <div style={{ borderTop: '1px solid var(--border)', margin: '8px 0' }} />
+
+              {/* Action Buttons */}
               <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
-                <button type="button" onClick={() => setShowModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>
+                <button type="button" onClick={() => setShowSmtpModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>
                   Cancel
                 </button>
-                <button type="submit" className="btn btn-primary" style={{ flex: 2 }}>
-                  {editSchedule.id ? 'Save Changes' : 'Create Schedule'}
+                <button type="submit" disabled={isSavingSmtp} className="btn btn-primary" style={{ flex: 2 }}>
+                  {isSavingSmtp ? 'Saving Server…' : (editSmtpObj.id ? 'Save Configuration' : 'Add Configuration')}
                 </button>
               </div>
             </form>
@@ -1799,161 +1389,449 @@ export default function Settings({ user }) {
       )}
 
       {/* ═══════════════════════════════════════
-          MODAL: Add / Edit Recipient
+          MODAL: Test SMTP Server
       ═══════════════════════════════════════ */}
-      {showRecipientModal && (
+      {showTestModal && (
+        <div style={S.modalOverlay}>
+          <div style={S.modalBox(420)}>
+            <div style={S.modalHead}>
+              <h3 style={S.modalTitle}>🔌 SMTP Connection Diagnostics</h3>
+              <button onClick={() => setShowTestModal(false)} style={S.modalClose}>×</button>
+            </div>
+            <form onSubmit={handleRunSmtpTest} style={S.modalBody}>
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '0 0 4px' }}>
+                Test outbound connection for <strong>{testingConfig?.name}</strong>.
+              </p>
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="test-recipient">Recipient Diagnostic Address</label>
+                <input
+                  id="test-recipient"
+                  type="email"
+                  className="form-control"
+                  placeholder="recipient@company.com"
+                  value={testEmailRecipient}
+                  onChange={e => setTestEmailRecipient(e.target.value)}
+                  required
+                />
+              </div>
+              <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
+                <button type="button" onClick={() => setShowTestModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-primary" style={{ flex: 2 }}>
+                  ⚡ Dispatch Test Mail
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════
+          MODAL: Add / Edit Report Template
+      ═══════════════════════════════════════ */}
+      {showTemplateModal && (
+        <div style={S.modalOverlay}>
+          <div style={S.modalBox(620)}>
+            <div style={S.modalHead}>
+              <h3 style={S.modalTitle}>
+                {editTemplateObj.id ? '📝 Edit Branding Template' : '🎨 Create Branding Template'}
+              </h3>
+              <button onClick={() => setShowTemplateModal(false)} style={S.modalClose}>×</button>
+            </div>
+            <form onSubmit={handleSaveTemplate} style={{ ...S.modalBody, maxHeight: '85vh', overflowY: 'auto' }}>
+              
+              <div className="form-grid-2">
+                {/* Template Name */}
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="tmpl-name">Template Name</label>
+                  <input
+                    id="tmpl-name"
+                    type="text"
+                    className="form-control"
+                    placeholder="e.g. Industrial Green, High Priority Alerts"
+                    value={editTemplateObj.name}
+                    onChange={e => setEditTemplateObj({ ...editTemplateObj, name: e.target.value })}
+                    required
+                  />
+                </div>
+
+                {/* Report Type */}
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="tmpl-report-type">Associated Report Scope</label>
+                  <select
+                    id="tmpl-report-type"
+                    className="form-control"
+                    value={editTemplateObj.report_type}
+                    onChange={e => setEditTemplateObj({ ...editTemplateObj, report_type: e.target.value })}
+                  >
+                    <option value="Historian Shift Summary">Historian Shift Summary</option>
+                    <option value="Daily Production Report">Daily Production Report</option>
+                    <option value="Weekly Performance Review">Weekly Performance Review</option>
+                    <option value="Monthly Operations Summary">Monthly Operations Summary</option>
+                    <option value="Alarm & Incident Report">Alarm & Incident Report</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Email Subject */}
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="tmpl-subject">Email Subject Header</label>
+                <input
+                  id="tmpl-subject"
+                  type="text"
+                  className="form-control"
+                  placeholder="Production Log Summary: {{reportName}}"
+                  value={editTemplateObj.subject}
+                  onChange={e => setEditTemplateObj({ ...editTemplateObj, subject: e.target.value })}
+                  required
+                />
+              </div>
+
+              {/* Logo text & Color Grid */}
+              <div className="form-grid-special-32">
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="tmpl-logo">Company Banner Logo Text</label>
+                  <input
+                    id="tmpl-logo"
+                    type="text"
+                    className="form-control"
+                    placeholder="Acme SCADA Engine"
+                    value={editTemplateObj.logo_text}
+                    onChange={e => setEditTemplateObj({ ...editTemplateObj, logo_text: e.target.value })}
+                  />
+                </div>
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="tmpl-color">PDF Visual Color Theme</label>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <input
+                      id="tmpl-color"
+                      type="color"
+                      value={editTemplateObj.header_color}
+                      onChange={e => setEditTemplateObj({ ...editTemplateObj, header_color: e.target.value })}
+                      style={{ width: '42px', padding: 0, height: '38px', cursor: 'pointer', border: '1px solid var(--border)', borderRadius: 'var(--radius-xs)' }}
+                    />
+                    <input
+                      type="text"
+                      className="form-control"
+                      value={editTemplateObj.header_color}
+                      onChange={e => setEditTemplateObj({ ...editTemplateObj, header_color: e.target.value })}
+                      style={{ flex: 1, fontFamily: 'monospace' }}
+                      maxLength={7}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* PDF Footer Text */}
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="tmpl-footer">PDF Page Compliance Footer</label>
+                <input
+                  id="tmpl-footer"
+                  type="text"
+                  className="form-control"
+                  placeholder="e.g. Confidential Operations Audit Log"
+                  value={editTemplateObj.footer_text}
+                  onChange={e => setEditTemplateObj({ ...editTemplateObj, footer_text: e.target.value })}
+                />
+              </div>
+
+              {/* Email Body template */}
+              <div style={S.formGroup}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={S.label} htmlFor="tmpl-body">Email Message Content Template</label>
+                  <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)' }}>
+                    Variables: {"{{reportName}}"}, {"{{reportType}}"}, {"{{shift}}"}, {"{{dateRange}}"}, {"{{generatedAt}}"}
+                  </span>
+                </div>
+                <textarea
+                  id="tmpl-body"
+                  className="form-control"
+                  rows="4"
+                  value={editTemplateObj.email_body}
+                  onChange={e => setEditTemplateObj({ ...editTemplateObj, email_body: e.target.value })}
+                  placeholder="Dear team, please find the telemetry attached..."
+                  style={{ minHeight: '80px', fontSize: '0.78rem', fontFamily: 'monospace' }}
+                />
+              </div>
+
+              {/* Layout Presets */}
+              <div className="form-grid-3">
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="lay-table">Table Summary</label>
+                  <select
+                    id="lay-table"
+                    className="form-control"
+                    value={editTemplateObj.summary_layout}
+                    onChange={e => setEditTemplateObj({ ...editTemplateObj, summary_layout: e.target.value })}
+                  >
+                    <option value="standard">Standard Grid</option>
+                    <option value="detailed">Detailed Metrics</option>
+                    <option value="compact">Compact List</option>
+                  </select>
+                </div>
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="lay-pdf">PDF Document Style</label>
+                  <select
+                    id="lay-pdf"
+                    className="form-control"
+                    value={editTemplateObj.pdf_layout}
+                    onChange={e => setEditTemplateObj({ ...editTemplateObj, pdf_layout: e.target.value })}
+                  >
+                    <option value="standard">Corporate Tech</option>
+                    <option value="minimal">Minimal Inkjet</option>
+                    <option value="industrial">Heavy Blueprint</option>
+                  </select>
+                </div>
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="lay-excel">Excel Sheet Layout</label>
+                  <select
+                    id="lay-excel"
+                    className="form-control"
+                    value={editTemplateObj.excel_layout}
+                    onChange={e => setEditTemplateObj({ ...editTemplateObj, excel_layout: e.target.value })}
+                  >
+                    <option value="standard">Standard Aggregated</option>
+                    <option value="flat_log">Chronological Event Log</option>
+                    <option value="multi_sheet">Split Multi-Tab</option>
+                  </select>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+                <div>
+                  <p style={{ margin: 0, fontSize: '0.78rem', fontWeight: 600, color: 'var(--text)' }}>Set Default Template</p>
+                  <p style={{ margin: 0, fontSize: '0.65rem', color: 'var(--text-muted)' }}>Automatically load this template for the report scope</p>
+                </div>
+                <ToggleSwitch
+                  id="template-default-toggle"
+                  checked={editTemplateObj.is_default}
+                  onChange={e => setEditTemplateObj({ ...editTemplateObj, is_default: e.target.checked })}
+                />
+              </div>
+
+              <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
+                <button type="button" onClick={() => setShowTemplateModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>
+                  Cancel
+                </button>
+                <button type="submit" disabled={isSavingTemplate} className="btn btn-primary" style={{ flex: 2 }}>
+                  {isSavingTemplate ? 'Saving Template…' : (editTemplateObj.id ? 'Save Template' : 'Create Template')}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════
+          MODAL: Preview Template Layout
+      ═══════════════════════════════════════ */}
+      {showPreviewModal && previewTemplate && (
+        <div style={S.modalOverlay}>
+          <div style={S.modalBox(480)}>
+            <div style={S.modalHead}>
+              <h3 style={S.modalTitle}>👁️ Layout Preview: {previewTemplate.name}</h3>
+              <button onClick={() => { setShowPreviewModal(false); setPreviewTemplate(null); }} style={S.modalClose}>×</button>
+            </div>
+            <div style={{ ...S.modalBody, padding: '20px' }}>
+              <div style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', overflow: 'hidden' }}>
+                {/* Header */}
+                <div style={{ background: previewTemplate.header_color, padding: '16px 20px', color: 'white' }}>
+                  <span style={{ fontSize: '0.65rem', fontWeight: 800, letterSpacing: '0.1em', opacity: 0.85, display: 'block', marginBottom: '2px' }}>
+                    {previewTemplate.logo_text || 'LOGO BANNER'}
+                  </span>
+                  <h4 style={{ margin: 0, fontSize: '1rem', color: 'white', fontWeight: 700 }}>Telemetry Production Logs</h4>
+                </div>
+                {/* Content */}
+                <div style={{ padding: '24px 20px', background: '#FFFFFF', color: '#0F172A', fontSize: '0.8rem', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                  <div style={{ borderBottom: '1px solid #E2E8F0', paddingBottom: '8px' }}>
+                    <div style={{ fontWeight: 700, fontSize: '0.85rem', color: '#0F172A' }}>Subject: {previewTemplate.subject}</div>
+                    <div style={{ fontSize: '0.7rem', color: '#64748B', marginTop: 4 }}>Scope: {previewTemplate.report_type}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontWeight: 600, color: '#475569', marginBottom: 4 }}>Email Message Digest:</div>
+                    <div style={{ whiteSpace: 'pre-line', background: '#F8FAFC', padding: '10px', borderRadius: '4px', border: '1px solid #E2E8F0', fontFamily: 'monospace', fontSize: '0.72rem', color: '#1E293B', lineHeight: 1.4 }}>
+                      {previewTemplate.email_body}
+                    </div>
+                  </div>
+                  <div className="form-grid-3" style={{ fontSize: '0.7rem', borderTop: '1px solid #E2E8F0', paddingTop: '10px' }}>
+                    <div>📊 Table: <strong>{previewTemplate.summary_layout}</strong></div>
+                    <div>📄 PDF: <strong>{previewTemplate.pdf_layout}</strong></div>
+                    <div>excel Excel: <strong>{previewTemplate.excel_layout}</strong></div>
+                  </div>
+                </div>
+                {/* Footer */}
+                <div style={{ padding: '10px', background: '#0F172A', color: 'rgba(255,255,255,0.5)', fontSize: '0.62rem', textAlign: 'center', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                  {previewTemplate.footer_text || 'CONFIDENTIAL — SYSTEM DISPATCH FOOTER'}
+                </div>
+              </div>
+              <button onClick={() => { setShowPreviewModal(false); setPreviewTemplate(null); }} className="btn btn-secondary w-full" style={{ marginTop: '10px' }}>
+                Close Preview
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════
+          MODAL: Add / Edit Report Schedule
+      ═══════════════════════════════════════ */}
+      {showScheduleModal && (
         <div style={S.modalOverlay}>
           <div style={S.modalBox(480)}>
             <div style={S.modalHead}>
               <h3 style={S.modalTitle}>
-                {editRecipientObj.id ? 'Edit Report Recipient' : 'Add Report Recipient'}
+                {editSchedule.id ? '⚙️ Edit Automated Schedule' : '⏰ Create Automated Schedule'}
               </h3>
-              <button onClick={() => setShowRecipientModal(false)} style={S.modalClose}>×</button>
+              <button onClick={() => setShowScheduleModal(false)} style={S.modalClose}>×</button>
             </div>
-            
-            <form onSubmit={handleSaveRecipient} style={S.modalBody}>
-              {/* Name */}
+            <form onSubmit={handleSaveSchedule} style={S.modalBody}>
+              {/* Plant selection */}
               <div style={S.formGroup}>
-                <label style={S.label} htmlFor="rec-name">Recipient Name</label>
+                <label style={S.label} htmlFor="sched-plant">Target Plant Location</label>
                 <input
-                  id="rec-name"
                   type="text"
+                  id="sched-plant"
                   className="form-control"
-                  placeholder="e.g. John Doe"
-                  value={editRecipientObj.name}
-                  onChange={e => setEditRecipientObj({ ...editRecipientObj, name: e.target.value })}
-                  required
+                  value={editSchedule.plantId}
+                  onChange={e => setEditSchedule({ ...editSchedule, plantId: e.target.value })}
+                  placeholder="Enter plant ID or location name (e.g. plant-1)"
+                  style={{ height: '36px', fontSize: '0.85rem' }}
                 />
               </div>
 
-              {/* Email */}
-              <div style={S.formGroup}>
-                <label style={S.label} htmlFor="rec-email">Email Address</label>
-                <input
-                  id="rec-email"
-                  type="email"
-                  className="form-control"
-                  placeholder="e.g. john@company.com"
-                  value={editRecipientObj.email}
-                  onChange={e => setEditRecipientObj({ ...editRecipientObj, email: e.target.value })}
-                  required
-                />
-              </div>
-
-              {/* Role */}
-              <div style={S.formGroup}>
-                <label style={S.label} htmlFor="rec-role">Role / Job Title</label>
-                <input
-                  id="rec-role"
-                  type="text"
-                  className="form-control"
-                  placeholder="e.g. Production Manager"
-                  value={editRecipientObj.role}
-                  onChange={e => setEditRecipientObj({ ...editRecipientObj, role: e.target.value })}
-                />
-              </div>
-
-              {/* Groups Selector */}
-              <div style={S.formGroup}>
-                <label style={S.label}>Assigned Groups</label>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px', background: 'var(--background)', padding: '12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)' }}>
-                  {['Management', 'Plant Admins', 'Operations Team', 'Maintenance Team', 'Quality Team'].map(group => {
-                    const activeGroups = (editRecipientObj.groups || '').split(',').map(x => x.trim()).filter(Boolean);
-                    const isChecked = activeGroups.includes(group);
-                    return (
-                      <label key={group} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.8rem', cursor: 'pointer', color: 'var(--text)' }}>
-                        <input
-                          type="checkbox"
-                          checked={isChecked}
-                          onChange={e => {
-                            let nextGroups;
-                            if (e.target.checked) {
-                              nextGroups = [...activeGroups, group];
-                            } else {
-                              nextGroups = activeGroups.filter(g => g !== group);
-                            }
-                            setEditRecipientObj({ ...editRecipientObj, groups: nextGroups.join(', ') });
-                          }}
-                        />
-                        {group}
-                      </label>
-                    );
-                  })}
-                </div>
-                <div style={{ marginTop: '8px' }}>
-                  <label style={{ ...S.label, fontSize: '0.72rem', textTransform: 'none', letterSpacing: 'normal', marginBottom: '4px', display: 'block' }} htmlFor="custom-groups-input">Custom Groups (comma-separated)</label>
-                  <input
-                    id="custom-groups-input"
-                    type="text"
+              {/* Report Scope & Frequency */}
+              <div className="form-grid-special-12">
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="sched-report-type">Report Scope Type</label>
+                  <select
+                    id="sched-report-type"
                     className="form-control"
-                    placeholder="e.g. Finance, Safety Board"
-                    value={
-                      (() => {
-                        const standardGroups = ['Management', 'Plant Admins', 'Operations Team', 'Maintenance Team', 'Quality Team'];
-                        const activeGroups = (editRecipientObj.groups || '').split(',').map(x => x.trim()).filter(Boolean);
-                        return activeGroups.filter(g => !standardGroups.includes(g)).join(', ');
-                      })()
-                    }
-                    onChange={e => {
-                      const standardGroups = ['Management', 'Plant Admins', 'Operations Team', 'Maintenance Team', 'Quality Team'];
-                      const activeGroups = (editRecipientObj.groups || '').split(',').map(x => x.trim()).filter(Boolean);
-                      const selectedStandard = activeGroups.filter(g => standardGroups.includes(g));
-                      const customInput = e.target.value.split(',').map(x => x.trim()).filter(Boolean);
-                      setEditRecipientObj({ ...editRecipientObj, groups: [...selectedStandard, ...customInput].join(', ') });
-                    }}
-                  />
+                    value={editSchedule.reportType}
+                    onChange={e => setEditSchedule({ ...editSchedule, reportType: e.target.value })}
+                  >
+                    <option value="Historian Shift Summary">Historian Shift Summary</option>
+                    <option value="Daily Production Report">Daily Production Report</option>
+                    <option value="Weekly Performance Review">Weekly Performance Review</option>
+                    <option value="Monthly Operations Summary">Monthly Operations Summary</option>
+                    <option value="Alarm & Incident Report">Alarm & Incident Report</option>
+                  </select>
+                </div>
+
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="sched-freq">Run Frequency</label>
+                  <select
+                    id="sched-freq"
+                    className="form-control"
+                    value={editSchedule.frequency}
+                    onChange={e => setEditSchedule({ ...editSchedule, frequency: e.target.value })}
+                  >
+                    <option value="Daily">Daily</option>
+                    <option value="Weekly">Weekly (Sunday)</option>
+                    <option value="Monthly">Monthly (1st of Month)</option>
+                  </select>
                 </div>
               </div>
 
-              {/* Report Types Selector */}
+              {/* Report Mode & Shift Number */}
+              <div className="form-grid-special-12" style={{ display: 'grid', gridTemplateColumns: editSchedule.reportMode === 'Shift' ? '1fr 1fr' : '1fr', gap: '16px' }}>
+                <div style={S.formGroup}>
+                  <label style={S.label} htmlFor="sched-mode">Report Period Mode</label>
+                  <select
+                    id="sched-mode"
+                    className="form-control"
+                    value={editSchedule.reportMode || 'Daily'}
+                    onChange={e => setEditSchedule({ ...editSchedule, reportMode: e.target.value })}
+                  >
+                    <option value="Daily">Daily Report (24h)</option>
+                    <option value="Shift">Shift Report (12h)</option>
+                  </select>
+                </div>
+
+                {editSchedule.reportMode === 'Shift' && (
+                  <div style={S.formGroup}>
+                    <label style={S.label} htmlFor="sched-shift-number">Shift Number</label>
+                    <select
+                      id="sched-shift-number"
+                      className="form-control"
+                      value={editSchedule.shiftNumber || 1}
+                      onChange={e => setEditSchedule({ ...editSchedule, shiftNumber: parseInt(e.target.value) || 1 })}
+                    >
+                      <option value={1}>Shift 1 (06:00 - 18:00)</option>
+                      <option value={2}>Shift 2 (18:00 - 06:00)</option>
+                    </select>
+                  </div>
+                )}
+              </div>
+
+              {/* Run Time */}
               <div style={S.formGroup}>
-                <label style={S.label}>Assigned Report Subscriptions</label>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px', background: 'var(--background)', padding: '12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)' }}>
-                  {['Daily Reports', 'Shift Reports', 'Weekly Reports', 'Monthly Reports', 'Alarm Reports', 'Historian Reports'].map(type => {
-                    const activeTypes = (editRecipientObj.report_types || '').split(',').map(x => x.trim()).filter(Boolean);
-                    const isChecked = activeTypes.includes(type);
-                    return (
-                      <label key={type} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.8rem', cursor: 'pointer', color: 'var(--text)' }}>
-                        <input
-                          type="checkbox"
-                          checked={isChecked}
-                          onChange={e => {
-                            let nextTypes;
-                            if (e.target.checked) {
-                              nextTypes = [...activeTypes, type];
-                            } else {
-                              nextTypes = activeTypes.filter(t => t !== type);
-                            }
-                            setEditRecipientObj({ ...editRecipientObj, report_types: nextTypes.join(', ') });
-                          }}
-                        />
-                        {type}
-                      </label>
-                    );
-                  })}
+                <label style={S.label} htmlFor="sched-local-time">Dispatch Trigger Time ({getTimeZoneAbbreviation(editSchedule.plantId)} local time)</label>
+                <input
+                  type="time"
+                  id="sched-local-time"
+                  className="form-control"
+                  value={editSchedule.localTime || ''}
+                  onChange={e => setEditSchedule({ ...editSchedule, localTime: e.target.value })}
+                  style={{ height: '36px', fontSize: '0.85rem' }}
+                />
+              </div>
+
+              {/* Formats Selection */}
+              <div style={{ display: 'flex', gap: '20px', background: 'var(--background)', padding: '10px 14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.82rem' }}>
+                  <input
+                    type="checkbox"
+                    id="chk-pdf"
+                    checked={editSchedule.formatPdf}
+                    onChange={e => setEditSchedule({ ...editSchedule, formatPdf: e.target.checked })}
+                  />
+                  <label htmlFor="chk-pdf" style={{ cursor: 'pointer', color: 'var(--text)' }}>Include PDF Attachment</label>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.82rem' }}>
+                  <input
+                    type="checkbox"
+                    id="chk-excel"
+                    checked={editSchedule.formatExcel}
+                    onChange={e => setEditSchedule({ ...editSchedule, formatExcel: e.target.checked })}
+                  />
+                  <label htmlFor="chk-excel" style={{ cursor: 'pointer', color: 'var(--text)' }}>Include Excel Attachment</label>
                 </div>
               </div>
 
-              {/* Active Toggle */}
+              {/* Default Recipients */}
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="sched-recipients">Email Recipients (comma-separated list)</label>
+                <input
+                  id="sched-recipients"
+                  type="text"
+                  className="form-control"
+                  placeholder="manager@plant.com, staff@plant.com"
+                  value={editSchedule.emailRecipients}
+                  onChange={e => setEditSchedule({ ...editSchedule, emailRecipients: e.target.value })}
+                  required
+                />
+              </div>
+
+              {/* Scheduler Toggle */}
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
                 <div>
-                  <p style={{ margin: 0, fontSize: '0.8rem', fontWeight: 600, color: 'var(--text)' }}>Enabled Status</p>
-                  <p style={{ margin: 0, fontSize: '0.7rem', color: 'var(--text-muted)' }}>Include recipient in active broadcasts</p>
+                  <p style={{ margin: 0, fontSize: '0.8rem', fontWeight: 600, color: 'var(--text)' }}>Schedule Enabled</p>
+                  <p style={{ margin: 0, fontSize: '0.7rem', color: 'var(--text-muted)' }}>Keep schedule processing running</p>
                 </div>
                 <ToggleSwitch
-                  id="recipient-active-toggle"
-                  checked={editRecipientObj.active}
-                  onChange={e => setEditRecipientObj({ ...editRecipientObj, active: e.target.checked })}
+                  id="schedule-active-toggle"
+                  checked={editSchedule.enabled}
+                  onChange={e => setEditSchedule({ ...editSchedule, enabled: e.target.checked })}
                 />
               </div>
 
-              {/* Submit Buttons */}
               <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
-                <button type="button" onClick={() => setShowRecipientModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>
+                <button type="button" onClick={() => setShowScheduleModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>
                   Cancel
                 </button>
-                <button type="submit" disabled={isSavingRecipient} className="btn btn-primary" style={{ flex: 2 }}>
-                  {isSavingRecipient ? 'Saving…' : (editRecipientObj.id ? 'Save Changes' : 'Add Recipient')}
+                <button type="submit" disabled={isSavingSchedule} className="btn btn-primary" style={{ flex: 2 }}>
+                  {isSavingSchedule ? 'Saving…' : (editSchedule.id ? 'Save Changes' : 'Create Run Schedule')}
                 </button>
               </div>
             </form>

@@ -16,11 +16,10 @@ const DEFAULT_SETTINGS = {
   dashboardTags: []
 };
 
-const DEFAULT_TAG_CONFIGS = [];
-
 // ─── Query Cache ───────────────────────────────────────────────────────────────
 const queryCache = new Map();
 const CACHE_DURATION = 30 * 60 * 1000; // 30 minutes in milliseconds
+const CONFIG_CACHE_DURATION = 5000; // 5 seconds for config parameters (near-realtime sync)
 
 export function invalidateCache() {
   console.log('[Cache] Invalidating all cached database queries.');
@@ -143,7 +142,7 @@ export async function deleteUser(userId) {
   try {
     const { data } = await supabase.from('profiles').select('email').eq('id', userId).maybeSingle();
     if (data) userEmail = data.email;
-  } catch {}
+  } catch { /* ignored */ }
 
   const { error } = await supabase.from('profiles').delete().eq('id', userId);
   if (error) {
@@ -159,7 +158,7 @@ export async function getPlants(options = {}) {
   const cacheKey = 'getPlants';
   if (!options.forceRefresh) {
     const cached = queryCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    if (cached && Date.now() - cached.timestamp < CONFIG_CACHE_DURATION) {
       return cached.data;
     }
   }
@@ -198,7 +197,7 @@ export async function getTagConfigs(options = {}) {
   const cacheKey = 'getTagConfigs';
   if (!options.forceRefresh) {
     const cached = queryCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    if (cached && Date.now() - cached.timestamp < CONFIG_CACHE_DURATION) {
       return cached.data;
     }
   }
@@ -605,7 +604,14 @@ export async function getSchedules() {
     enabled: s.enabled,
     lastRun: s.last_run,
     formatPdf: s.format_pdf !== undefined ? s.format_pdf : true,
-    formatExcel: s.format_excel !== undefined ? s.format_excel : true
+    formatExcel: s.format_excel !== undefined ? s.format_excel : true,
+    reportMode: s.report_mode || 'Daily',
+    shiftNumber: s.shift_number,
+    lastRunTime: s.last_run_time,
+    nextRunTime: s.next_run_time,
+    lastExecutionStatus: s.last_execution_status,
+    recordsIncluded: s.records_included,
+    lastEmailSentTo: s.last_email_sent_to
   }));
 }
 
@@ -623,7 +629,14 @@ export async function saveSchedule(schedule) {
     enabled: schedule.enabled,
     last_run: schedule.lastRun || null,
     format_pdf: schedule.formatPdf !== undefined ? schedule.formatPdf : true,
-    format_excel: schedule.formatExcel !== undefined ? schedule.formatExcel : true
+    format_excel: schedule.formatExcel !== undefined ? schedule.formatExcel : true,
+    report_mode: schedule.reportMode || 'Daily',
+    shift_number: schedule.shiftNumber || null,
+    last_run_time: schedule.lastRunTime || null,
+    next_run_time: schedule.nextRunTime || null,
+    last_execution_status: schedule.lastExecutionStatus || null,
+    records_included: schedule.recordsIncluded || null,
+    last_email_sent_to: schedule.lastEmailSentTo || null
   };
   if (!dbSched.id) {
     dbSched.id = 'sched-' + Date.now();
@@ -653,7 +666,7 @@ export async function getSettings(options = {}) {
   const cacheKey = 'getSettings';
   if (!options.forceRefresh) {
     const cached = queryCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    if (cached && Date.now() - cached.timestamp < CONFIG_CACHE_DURATION) {
       return cached.data;
     }
   }
@@ -815,6 +828,21 @@ export async function getEmailLogs() {
     message: e.type,
     status: e.delivery_status || "SENT"
   }));
+}
+
+export async function getSchedulerHistory() {
+  const supabase = getSupabaseClient();
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from('report_history')
+    .select('*')
+    .order('generated_at', { ascending: false })
+    .limit(100);
+  if (error) {
+    console.error("Supabase report_history query error for scheduler history:", error);
+    throw new Error(`Supabase report_history query failed: ${error.message}`);
+  }
+  return data || [];
 }
 
 export async function addEmailLog(emailLog) {
@@ -1014,7 +1042,10 @@ export async function compileReportData(report) {
         tagName: config.TagName,
         unit: config.Unit,
         decimalPlaces: config.DecimalPlaces ?? 2,
-        min: 0, max: 0, avg: 0, current: 0, count: 0, goodPct: 100, sparkPoints: []
+        min: null, max: null, avg: null, stdDev: null,
+        current: null, count: 0, goodPct: 100,
+        firstSampleTime: null, lastSampleTime: null,
+        sparkPoints: []
       };
     }
 
@@ -1025,6 +1056,11 @@ export async function compileReportData(report) {
       sum += r.Val;
       if (r.Status === 192) goodCount++;
     });
+    const avg = sum / records.length;
+
+    // Standard deviation
+    const variance = records.reduce((acc, r) => acc + Math.pow(r.Val - avg, 2), 0) / records.length;
+    const stdDev = Math.sqrt(variance);
 
     const sparkPoints = records.slice(-20).map(r => r.Val);
 
@@ -1033,11 +1069,12 @@ export async function compileReportData(report) {
       tagName: config.TagName,
       unit: config.Unit,
       decimalPlaces: config.DecimalPlaces ?? 2,
-      min, max,
-      avg: sum / records.length,
+      min, max, avg, stdDev,
       current: records[records.length - 1].Val,
       count: records.length,
       goodPct: (goodCount / records.length) * 100,
+      firstSampleTime: records[0].DateAndTime,
+      lastSampleTime: records[records.length - 1].DateAndTime,
       sparkPoints
     };
   });
@@ -1056,13 +1093,28 @@ export async function compileReportData(report) {
       };
     });
 
+  // Build enriched raw rows with tag name for reporting
+  const allRows = chronRows.map(r => ({
+    ...r,
+    TagName: (tagMap[r.TagIndex] || {}).TagName || `Tag ${r.TagIndex}`
+  }));
+
+  // Days in range for average calculation
+  const startMs = new Date(report.startDate).getTime();
+  const endMs = new Date(report.endDate).getTime();
+  const daysInRange = Math.max(1, (endMs - startMs) / (1000 * 60 * 60 * 24));
+
   return {
-    rows: chronRows.slice(-300),
+    rows: allRows.slice(-10000),      // Last 10k for PDF appendix
+    allRows,                           // ALL rows for Excel full data sheet
     totalRowsCount: chronRows.length,
     summaries: tagSummaries,
-    incidents: incidents.slice(0, 50)
+    incidents: incidents.slice(0, 100),
+    daysInRange: Math.round(daysInRange * 10) / 10,
+    avgRecordsPerDay: Math.round(chronRows.length / daysInRange)
   };
 }
+
 
 async function getCurrentUserProfile() {
   const supabase = getSupabaseClient();
@@ -1169,4 +1221,591 @@ export async function deleteAuditLogs() {
     throw err;
   }
 }
+
+// ─── SMTP Configurations CRUD (Supabase-backed) ─────────────────────────────────
+export async function getSmtpConfigurations() {
+  const supabase = getSupabaseClient();
+  if (!supabase) return [];
+  try {
+    const { data, error } = await supabase
+      .from('smtp_configurations')
+      .select('*')
+      .order('name', { ascending: true });
+    if (error) throw error;
+    return data || [];
+  } catch (err) {
+    console.error("Error reading smtp_configurations from Supabase:", err);
+    return [];
+  }
+}
+
+export async function saveSmtpConfiguration(config) {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error("Supabase client is not initialized");
+  try {
+    const dbRow = {
+      name: config.name,
+      host: config.host,
+      port: parseInt(config.port) || 587,
+      username: config.username,
+      password: config.password,
+      secure: config.secure !== false,
+      security_type: config.security_type || 'SSL/TLS',
+      is_active: config.is_active === true,
+      last_modified: new Date().toISOString()
+    };
+    if (config.id) {
+      dbRow.id = config.id;
+    }
+    const { data, error } = await supabase
+      .from('smtp_configurations')
+      .upsert(dbRow)
+      .select()
+      .single();
+    if (error) throw error;
+    
+    // If this configuration was saved as active, set all other configurations to inactive
+    if (dbRow.is_active && data?.id) {
+      await supabase
+        .from('smtp_configurations')
+        .update({ is_active: false })
+        .neq('id', data.id);
+    }
+    
+    await addAuditLog(null, null, null, 'SMTP Configuration Save', `Saved SMTP configuration: ${config.name}. Active: ${config.is_active}`);
+    return data;
+  } catch (err) {
+    console.error("Error saving smtp_configuration to Supabase:", err);
+    throw err;
+  }
+}
+
+export async function deleteSmtpConfiguration(id) {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error("Supabase client is not initialized");
+  try {
+    // Check if it's the active one
+    const { data: config } = await supabase
+      .from('smtp_configurations')
+      .select('name')
+      .eq('id', id)
+      .maybeSingle();
+
+    const { error } = await supabase
+      .from('smtp_configurations')
+      .delete()
+      .eq('id', id);
+    if (error) throw error;
+
+    await addAuditLog(null, null, null, 'SMTP Configuration Deletion', `Deleted SMTP configuration: ${config?.name || id}`);
+  } catch (err) {
+    console.error("Error deleting smtp_configuration from Supabase:", err);
+    throw err;
+  }
+}
+
+export async function setActiveSmtpConfiguration(id) {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error("Supabase client is not initialized");
+  try {
+    // Set all to inactive
+    const { error: err1 } = await supabase
+      .from('smtp_configurations')
+      .update({ is_active: false })
+      .neq('id', '00000000-0000-0000-0000-000000000000');
+    if (err1) throw err1;
+
+    // Set target to active
+    const { data, error: err2 } = await supabase
+      .from('smtp_configurations')
+      .update({ is_active: true, last_modified: new Date().toISOString() })
+      .eq('id', id)
+      .select()
+      .single();
+    if (err2) throw err2;
+
+    await addAuditLog(null, null, null, 'SMTP Configuration Set Active', `Activated SMTP configuration: ${data?.name}`);
+    return data;
+  } catch (err) {
+    console.error("Error activating smtp_configuration in Supabase:", err);
+    throw err;
+  }
+}
+
+// ─── Report Templates CRUD (Supabase-backed) ────────────────────────────────────
+export async function getReportTemplates() {
+  const supabase = getSupabaseClient();
+  if (!supabase) return [];
+  try {
+    const { data, error } = await supabase
+      .from('report_templates')
+      .select('*')
+      .order('name', { ascending: true });
+    if (error) throw error;
+    return data || [];
+  } catch (err) {
+    console.error("Error reading report_templates from Supabase:", err);
+    return [];
+  }
+}
+
+export async function saveReportTemplate(template) {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error("Supabase client is not initialized");
+  try {
+    const dbRow = {
+      name: template.name,
+      report_type: template.report_type,
+      subject: template.subject,
+      is_default: template.is_default === true,
+      logo_text: template.logo_text || '',
+      header_color: template.header_color || '#0A0F1E',
+      footer_text: template.footer_text || '',
+      email_body: template.email_body || '',
+      summary_layout: template.summary_layout || 'standard',
+      pdf_layout: template.pdf_layout || 'standard',
+      excel_layout: template.excel_layout || 'standard',
+      last_modified: new Date().toISOString()
+    };
+    if (template.id) {
+      dbRow.id = template.id;
+    }
+    const { data, error } = await supabase
+      .from('report_templates')
+      .upsert(dbRow)
+      .select()
+      .single();
+    if (error) throw error;
+
+    // If this template is set as default, unset other defaults for the same report_type
+    if (dbRow.is_default && data?.id) {
+      await supabase
+        .from('report_templates')
+        .update({ is_default: false })
+        .eq('report_type', dbRow.report_type)
+        .neq('id', data.id);
+    }
+
+    await addAuditLog(null, null, null, 'Report Template Save', `Saved report template: ${template.name} for ${template.report_type}`);
+    return data;
+  } catch (err) {
+    console.error("Error saving report_template to Supabase:", err);
+    throw err;
+  }
+}
+
+export async function deleteReportTemplate(id) {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error("Supabase client is not initialized");
+  try {
+    const { data: template } = await supabase
+      .from('report_templates')
+      .select('name')
+      .eq('id', id)
+      .maybeSingle();
+
+    const { error } = await supabase
+      .from('report_templates')
+      .delete()
+      .eq('id', id);
+    if (error) throw error;
+
+    await addAuditLog(null, null, null, 'Report Template Deletion', `Deleted report template: ${template?.name || id}`);
+  } catch (err) {
+    console.error("Error deleting report_template from Supabase:", err);
+    throw err;
+  }
+}
+
+export async function setDefaultReportTemplate(id, reportType) {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error("Supabase client is not initialized");
+  try {
+    // Unset all defaults for this reportType
+    const { error: err1 } = await supabase
+      .from('report_templates')
+      .update({ is_default: false })
+      .eq('report_type', reportType);
+    if (err1) throw err1;
+
+    // Set target to default
+    const { data, error: err2 } = await supabase
+      .from('report_templates')
+      .update({ is_default: true, last_modified: new Date().toISOString() })
+      .eq('id', id)
+      .select()
+      .single();
+    if (err2) throw err2;
+
+    await addAuditLog(null, null, null, 'Report Template Set Default', `Set template "${data?.name}" as default for ${reportType}`);
+    return data;
+  } catch (err) {
+    console.error("Error setting default report_template in Supabase:", err);
+    throw err;
+  }
+}
+
+export async function discoverDatabaseStructure(customClient, customConfig) {
+  const supabase = customClient || getSupabaseClient();
+  if (!supabase) {
+    console.warn("[Schema Discovery] Supabase client not initialized.");
+    return null;
+  }
+  
+  const config = customConfig || getSupabaseConfig();
+  console.info("[Schema Discovery] Starting probe-based auto-discovery scan on:", config?.url);
+
+  const knownTables = [
+    'Database',
+    'profiles',
+    'plants',
+    'production_data',
+    'tag_configurations',
+    'email_configuration',
+    'smtp_configurations',
+    'report_templates',
+    'scheduled_reports',
+    'report_history',
+    'synchronization_logs',
+    'report_recipients',
+    'audit_logs'
+  ];
+
+  const discovered = [];
+  for (const tblName of knownTables) {
+    try {
+      console.info(`[Schema Discovery] Probing table existence for: '${tblName}'`);
+      // Try to fetch 1 row to test existence and inspect columns
+      const { data: sampleRows, error: selectErr } = await supabase
+        .from(tblName)
+        .select('*')
+        .limit(1);
+
+      let exists = false;
+      let cols = [];
+
+      if (!selectErr) {
+        exists = true;
+        console.info(`[Schema Discovery] Table '${tblName}' probe succeeded.`);
+        if (sampleRows && sampleRows.length > 0) {
+          Object.keys(sampleRows[0]).forEach(colName => {
+            const val = sampleRows[0][colName];
+            let type = typeof val;
+            if (val instanceof Date) type = 'timestamp';
+            else if (typeof val === 'number') type = Number.isInteger(val) ? 'integer' : 'numeric';
+            
+            // Map primary keys logically
+            let isPk = false;
+            if (tblName === 'Database' && (colName === 'DateAndTime' || colName === 'TagIndex')) {
+              isPk = true;
+            } else if (colName === 'id' || colName === 'TagIndex') {
+              isPk = true;
+            }
+            
+            cols.push({
+              name: colName,
+              type: type || 'text',
+              isPk
+            });
+          });
+        }
+        
+        // Ensure static schemas supply PK details/default columns if sample rows are empty
+        if (cols.length === 0) {
+          cols = STATIC_TABLE_SCHEMAS[tblName] || [{ name: 'id', type: 'text', isPk: true }];
+        }
+      } else {
+        const msg = selectErr.message || '';
+        const code = selectErr.code || '';
+        
+        // 42P01 is undefined_table, check for "does not exist" or "relation" in the error message
+        if (code === '42P01' || msg.toLowerCase().includes('does not exist') || msg.toLowerCase().includes('relation')) {
+          exists = false;
+          console.warn(`[Schema Discovery] Table '${tblName}' does not exist in the database (Code: ${code}, Msg: ${msg})`);
+        } else {
+          // It's a permission/RLS denial, but the table exists!
+          exists = true;
+          console.info(`[Schema Discovery] Table '${tblName}' exists but query was denied (RLS/Permissions). Fallback to static schema. Code: ${code}, Msg: ${msg}`);
+          cols = STATIC_TABLE_SCHEMAS[tblName] || [{ name: 'id', type: 'text', isPk: true }];
+        }
+      }
+
+      if (exists) {
+        // Query exact row count
+        let countVal = 0;
+        try {
+          const { count, error: countErr } = await supabase
+            .from(tblName)
+            .select('*', { count: 'exact', head: true });
+          if (countErr) {
+            console.error(`[Schema Discovery] Row count query failed for '${tblName}':`, countErr);
+          } else if (count !== null) {
+            countVal = count;
+          }
+        } catch (errCount) {
+          console.error(`[Schema Discovery] Exception during row count query for '${tblName}':`, errCount);
+        }
+
+        // Query last record timestamp if applicable
+        let lastTimestamp = null;
+        try {
+          const tsCol = cols.find(c => ['DateAndTime', 'timestamp', 'created_at', 'generated_at', 'last_modified', 'updated_at'].includes(c.name))?.name;
+          if (tsCol) {
+            const { data: latestRow, error: tsErr } = await supabase
+              .from(tblName)
+              .select(tsCol)
+              .order(tsCol, { ascending: false })
+              .limit(1);
+            if (tsErr) {
+              console.error(`[Schema Discovery] Last record timestamp query failed for '${tblName}' on column '${tsCol}':`, tsErr);
+            } else if (latestRow && latestRow.length > 0) {
+              lastTimestamp = latestRow[0][tsCol];
+            }
+          }
+        } catch (errTs) {
+          console.error(`[Schema Discovery] Exception during last record timestamp query for '${tblName}':`, errTs);
+        }
+
+        // Identify primary key column
+        const primaryKey = cols.find(c => c.isPk)?.name || cols[0]?.name || 'id';
+
+        discovered.push({
+          name: tblName,
+          schema: 'public',
+          recordCount: countVal,
+          primaryKey,
+          status: 'ACTIVE',
+          columns: cols,
+          lastRecordTimestamp: lastTimestamp
+        });
+      }
+    } catch (tblErr) {
+      console.error(`[Schema Discovery] Exception reflecting on table '${tblName}':`, tblErr);
+    }
+  }
+
+  if (discovered.length > 0) {
+    console.info(`[Schema Discovery] Dynamic discovery complete. Reflected on ${discovered.length} active tables.`);
+    return {
+      public: {
+        tables: discovered,
+        views: [],
+        procedures: []
+      }
+    };
+  }
+
+  return null;
+}
+
+// Static fallback metadata schemas for standard tables
+export const STATIC_TABLE_SCHEMAS = {
+  'Database': [
+    { name: 'DateAndTime', type: 'timestamp', isPk: true },
+    { name: 'Millitm', type: 'integer', isPk: false },
+    { name: 'TagIndex', type: 'integer', isPk: true },
+    { name: 'Val', type: 'numeric', isPk: false },
+    { name: 'Status', type: 'integer', isPk: false },
+    { name: 'Marker', type: 'text', isPk: false }
+  ],
+  'profiles': [
+    { name: 'id', type: 'uuid', isPk: true },
+    { name: 'email', type: 'text', isPk: false },
+    { name: 'name', type: 'text', isPk: false },
+    { name: 'role', type: 'text', isPk: false },
+    { name: 'plant_id', type: 'text', isPk: false },
+    { name: 'active', type: 'boolean', isPk: false }
+  ],
+  'plants': [
+    { name: 'id', type: 'text', isPk: true },
+    { name: 'name', type: 'text', isPk: false },
+    { name: 'location', type: 'text', isPk: false },
+    { name: 'capacity', type: 'integer', isPk: false },
+    { name: 'targetOee', type: 'integer', isPk: false }
+  ],
+  'tag_configurations': [
+    { name: 'TagIndex', type: 'integer', isPk: true },
+    { name: 'TagName', type: 'text', isPk: false },
+    { name: 'Unit', type: 'text', isPk: false },
+    { name: 'Description', type: 'text', isPk: false },
+    { name: 'DecimalPlaces', type: 'integer', isPk: false }
+  ],
+  'email_configuration': [
+    { name: 'id', type: 'text', isPk: true },
+    { name: 'host', type: 'text', isPk: false },
+    { name: 'port', type: 'integer', isPk: false },
+    { name: 'username', type: 'text', isPk: false },
+    { name: 'password', type: 'text', isPk: false },
+    { name: 'secure', type: 'boolean', isPk: false },
+    { name: 'logo_text', type: 'text', isPk: false },
+    { name: 'header_color', type: 'text', isPk: false },
+    { name: 'footer_text', type: 'text', isPk: false }
+  ],
+  'smtp_configurations': [
+    { name: 'id', type: 'uuid', isPk: true },
+    { name: 'name', type: 'text', isPk: false },
+    { name: 'host', type: 'text', isPk: false },
+    { name: 'port', type: 'integer', isPk: false },
+    { name: 'username', type: 'text', isPk: false },
+    { name: 'password', type: 'text', isPk: false },
+    { name: 'secure', type: 'boolean', isPk: false },
+    { name: 'is_active', type: 'boolean', isPk: false }
+  ],
+  'report_templates': [
+    { name: 'id', type: 'uuid', isPk: true },
+    { name: 'name', type: 'text', isPk: false },
+    { name: 'report_type', type: 'text', isPk: false },
+    { name: 'subject', type: 'text', isPk: false },
+    { name: 'is_default', type: 'boolean', isPk: false },
+    { name: 'logo_text', type: 'text', isPk: false },
+    { name: 'header_color', type: 'text', isPk: false },
+    { name: 'footer_text', type: 'text', isPk: false },
+    { name: 'email_body', type: 'text', isPk: false },
+    { name: 'summary_layout', type: 'text', isPk: false },
+    { name: 'pdf_layout', type: 'text', isPk: false },
+    { name: 'excel_layout', type: 'text', isPk: false },
+    { name: 'last_modified', type: 'timestamp with time zone', isPk: false }
+  ],
+  'scheduled_reports': [
+    { name: 'id', type: 'text', isPk: true },
+    { name: 'plant_id', type: 'text', isPk: false },
+    { name: 'report_type', type: 'text', isPk: false },
+    { name: 'frequency', type: 'text', isPk: false },
+    { name: 'time', type: 'text', isPk: false },
+    { name: 'email_recipients', type: 'text', isPk: false },
+    { name: 'enabled', type: 'boolean', isPk: false },
+    { name: 'last_run', type: 'timestamp', isPk: false },
+    { name: 'format_pdf', type: 'boolean', isPk: false },
+    { name: 'format_excel', type: 'boolean', isPk: false },
+    { name: 'report_mode', type: 'text', isPk: false },
+    { name: 'shift_number', type: 'integer', isPk: false },
+    { name: 'last_run_time', type: 'timestamp with time zone', isPk: false },
+    { name: 'next_run_time', type: 'timestamp with time zone', isPk: false },
+    { name: 'last_execution_status', type: 'text', isPk: false },
+    { name: 'records_included', type: 'integer', isPk: false },
+    { name: 'last_email_sent_to', type: 'text', isPk: false }
+  ],
+  'report_history': [
+    { name: 'id', type: 'text', isPk: true },
+    { name: 'name', type: 'text', isPk: false },
+    { name: 'type', type: 'text', isPk: false },
+    { name: 'date_range', type: 'text', isPk: false },
+    { name: 'shift', type: 'text', isPk: false },
+    { name: 'plant_id', type: 'text', isPk: false },
+    { name: 'generated_at', type: 'timestamp', isPk: false },
+    { name: 'created_by', type: 'text', isPk: false },
+    { name: 'trigger_time', type: 'text', isPk: false },
+    { name: 'records_processed', type: 'integer', isPk: false }
+  ],
+  'synchronization_logs': [
+    { name: 'id', type: 'bigint', isPk: true },
+    { name: 'timestamp', type: 'timestamp', isPk: false },
+    { name: 'status_type', type: 'text', isPk: false },
+    { name: 'log_message', type: 'text', isPk: false }
+  ],
+  'report_recipients': [
+    { name: 'id', type: 'uuid', isPk: true },
+    { name: 'email', type: 'text', isPk: false },
+    { name: 'name', type: 'text', isPk: false },
+    { name: 'role', type: 'text', isPk: false },
+    { name: 'active', type: 'boolean', isPk: false }
+  ],
+  'production_data': [
+    { name: 'id', type: 'text', isPk: true },
+    { name: 'plant_id', type: 'text', isPk: false },
+    { name: 'timestamp', type: 'timestamp with time zone', isPk: false },
+    { name: 'date', type: 'text', isPk: false },
+    { name: 'hour', type: 'integer', isPk: false },
+    { name: 'shift', type: 'text', isPk: false },
+    { name: 'target_parts', type: 'integer', isPk: false },
+    { name: 'actual_parts', type: 'integer', isPk: false },
+    { name: 'reject_parts', type: 'integer', isPk: false },
+    { name: 'uptime_minutes', type: 'integer', isPk: false },
+    { name: 'downtime_reason', type: 'text', isPk: false }
+  ],
+  'audit_logs': [
+    { name: 'id', type: 'uuid', isPk: true },
+    { name: 'timestamp', type: 'timestamp with time zone', isPk: false },
+    { name: 'user_email', type: 'text', isPk: false },
+    { name: 'ip_address', type: 'text', isPk: false },
+    { name: 'action', type: 'text', isPk: false },
+    { name: 'details', type: 'text', isPk: false },
+    { name: 'status', type: 'text', isPk: false }
+  ]
+};
+
+// Database table statistics helper
+export async function getDatabaseTableStats() {
+  const supabase = getSupabaseClient();
+  if (!supabase) return null;
+  
+  try {
+    console.info("[Stats Service] Querying statistics for table 'Database'...");
+    
+    // 1. Get row count
+    const { count: rowCount, error: countErr } = await supabase
+      .from('Database')
+      .select('*', { count: 'exact', head: true });
+    if (countErr) {
+      console.warn("[Stats Service] Row count query failed:", countErr.message);
+    }
+    
+    // 2. Get latest record timestamp
+    let latestTimestamp = null;
+    const { data: latestRows, error: tsErr } = await supabase
+      .from('Database')
+      .select('DateAndTime')
+      .order('DateAndTime', { ascending: false })
+      .limit(1);
+    if (tsErr) {
+      console.warn("[Stats Service] Latest timestamp query failed:", tsErr.message);
+    } else if (latestRows && latestRows.length > 0) {
+      latestTimestamp = latestRows[0].DateAndTime;
+    }
+    
+    // 3. Get TagIndex stats
+    const tagConfigs = await getTagConfigs();
+    const tagStats = [];
+    
+    for (const tag of tagConfigs) {
+      try {
+        // Count for this tag
+        const { count: tagCount } = await supabase
+          .from('Database')
+          .select('*', { count: 'exact', head: true })
+          .eq('TagIndex', tag.TagIndex);
+          
+        // Latest value and time for this tag
+        const { data: tagValRows } = await supabase
+          .from('Database')
+          .select('Val,DateAndTime')
+          .eq('TagIndex', tag.TagIndex)
+          .order('DateAndTime', { ascending: false })
+          .limit(1);
+          
+        tagStats.push({
+          TagIndex: tag.TagIndex,
+          TagName: tag.TagName,
+          Unit: tag.Unit || '',
+          RecordCount: tagCount || 0,
+          LatestValue: tagValRows && tagValRows.length > 0 ? tagValRows[0].Val : null,
+          LatestTime: tagValRows && tagValRows.length > 0 ? tagValRows[0].DateAndTime : null
+        });
+      } catch (errTag) {
+        console.warn(`[Stats Service] Failed to get stats for Tag ${tag.TagIndex}:`, errTag.message);
+      }
+    }
+    
+    return {
+      rowCount: rowCount || 0,
+      latestTimestamp,
+      tagStats
+    };
+  } catch (err) {
+    console.error("[Stats Service] Failed to query Database table stats:", err);
+    return null;
+  }
+}
+
+
 

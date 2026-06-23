@@ -1,6 +1,6 @@
 // src/components/UserManagement.jsx
 import { useState, useEffect, useCallback } from 'react';
-import { getUsers, saveUser, deleteUser, getPlants, getAuditLogs, deleteAuditLogs } from '../utils/db';
+import { getUsers, saveUser, deleteUser, getPlants, getAuditLogs, deleteAuditLogs, addAuditLog } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 
 /* ─── Icons ─────────────────────────────────────────────────────────── */
@@ -112,6 +112,7 @@ export default function UserManagement({ user }) {
   const [auditPlantFilter, setAuditPlantFilter] = useState('all');
 
   const isSuperAdmin = user?.role === 'Super Admin';
+  const isReadOnly = user?.role === 'Admin';
 
   /* ─── Load ───────────────────────────────────────────────────────── */
   const loadUsers = useCallback(async () => {
@@ -120,12 +121,12 @@ export default function UserManagement({ user }) {
     try {
       const [plist, allUsers, allLogs] = await Promise.all([getPlants(), getUsers(), getAuditLogs()]);
       setPlantsList(plist || []);
-      const visible = isSuperAdmin
+      const visible = (isSuperAdmin || isReadOnly)
         ? allUsers
         : allUsers.filter(u => u.plantId === user.plantId && u.role !== 'Super Admin');
       setUsersList(visible);
 
-      const visibleLogs = isSuperAdmin
+      const visibleLogs = (isSuperAdmin || isReadOnly)
         ? allLogs
         : allLogs.filter(log => log.plantId === user.plantId && log.role !== 'Super Admin');
       setAuditLogs(visibleLogs);
@@ -139,10 +140,13 @@ export default function UserManagement({ user }) {
     } finally {
       setLoading(false);
     }
-  }, [isSuperAdmin, user?.plantId]);
+  }, [isSuperAdmin, isReadOnly, user]);
 
   useEffect(() => {
-    loadUsers();
+    const timer = setTimeout(() => {
+      loadUsers();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [loadUsers]);
 
   /* ─── Open add/edit modal ────────────────────────────────────────── */
@@ -258,7 +262,6 @@ export default function UserManagement({ user }) {
 
   /* ─── Stats ──────────────────────────────────────────────────────── */
   const activeCount   = usersList.filter(u => u.active).length;
-  const inactiveCount = usersList.length - activeCount;
   const adminCount    = usersList.filter(u => ['Super Admin','Plant Admin'].includes(u.role)).length;
 
   // Audit trail statistics
@@ -437,17 +440,19 @@ export default function UserManagement({ user }) {
               <div>
                 <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text)' }}>Account Directory</div>
                 <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-                  {isSuperAdmin ? 'Full visibility — all plants and roles.' : `Plant-scoped view — ${plantsList.find(p => p.id === user?.plantId)?.name || 'your plant'}.`}
+                  {(isSuperAdmin || isReadOnly) ? 'Full visibility — all plants and roles.' : `Plant-scoped view — ${plantsList.find(p => p.id === user?.plantId)?.name || 'your plant'}.`}
                 </div>
               </div>
-              <button className="btn btn-primary btn-sm" onClick={openAdd} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <PlusIcon /> Add User
-              </button>
+              {!isReadOnly && (
+                <button className="btn btn-primary btn-sm" onClick={openAdd} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <PlusIcon /> Add User
+                </button>
+              )}
             </div>
 
             {/* Table */}
             <div className="table-responsive" style={{ maxHeight: 'none', border: 'none', borderRadius: 0 }}>
-              <table className="table">
+              <table className="table responsive-table">
                 <thead>
                   <tr>
                     <th>Name</th>
@@ -484,52 +489,69 @@ export default function UserManagement({ user }) {
                       : (plantsList.find(p => p.id === item.plantId)?.name || item.plantId || '—');
                     return (
                       <tr key={item.id} style={{ opacity: item.active ? 1 : 0.55 }}>
-                        <td style={{ color: 'var(--text)', fontWeight: 600 }}>
+                        <td data-label="Name" style={{ color: 'var(--text)', fontWeight: 600 }}>
                           {item.name}
                           {isMe && <span style={{ marginLeft: '6px', fontSize: '0.68rem', background: 'var(--accent-dim)', color: 'var(--accent)', padding: '2px 6px', borderRadius: '4px', fontWeight: 700 }}>YOU</span>}
                         </td>
-                        <td className="font-mono" style={{ fontSize: '0.82rem' }}>{item.email}</td>
-                        <td><RoleBadge role={item.role} /></td>
-                        <td style={{ fontSize: '0.85rem' }}>{plantName}</td>
-                        <td>
-                          <button
-                            onClick={() => handleToggleStatus(item)}
-                            disabled={isMe}
-                            style={{
+                        <td data-label="Email" className="font-mono" style={{ fontSize: '0.82rem' }}>{item.email}</td>
+                        <td data-label="Role"><RoleBadge role={item.role} /></td>
+                        <td data-label="Plant" style={{ fontSize: '0.85rem' }}>{plantName}</td>
+                        <td data-label="Status">
+                          {isReadOnly ? (
+                            <span style={{
                               display: 'inline-flex', alignItems: 'center', gap: '5px',
-                              padding: '4px 10px', borderRadius: '6px', border: 'none',
-                              fontSize: '0.75rem', fontWeight: 700, cursor: isMe ? 'not-allowed' : 'pointer',
+                              padding: '4px 10px', borderRadius: '6px',
+                              fontSize: '0.75rem', fontWeight: 700,
                               background: item.active ? 'var(--success-bg)' : 'var(--error-bg)',
-                              color: item.active ? 'var(--success)' : 'var(--error)',
-                              opacity: isMe ? 0.5 : 1,
-                              transition: 'opacity 0.15s'
-                            }}
-                            title={isMe ? 'Cannot change your own status' : `Click to ${item.active ? 'suspend' : 'activate'}`}
-                          >
-                            <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: 'currentColor', display: 'inline-block' }} />
-                            {item.active ? 'Active' : 'Suspended'}
-                          </button>
-                        </td>
-                        <td style={{ textAlign: 'right', paddingRight: '20px' }}>
-                          <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end' }}>
+                              color: item.active ? 'var(--success)' : 'var(--error)'
+                            }}>
+                              <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: 'currentColor', display: 'inline-block' }} />
+                              {item.active ? 'Active' : 'Suspended'}
+                            </span>
+                          ) : (
                             <button
-                              className="btn btn-secondary btn-sm"
-                              onClick={() => openEdit(item)}
-                              title="Edit user"
-                              style={{ display: 'flex', alignItems: 'center', gap: '5px' }}
-                            >
-                              <EditIcon /> Edit
-                            </button>
-                            <button
-                              className="btn btn-danger btn-sm"
-                              onClick={() => handleDeleteRequest(item)}
+                              onClick={() => handleToggleStatus(item)}
                               disabled={isMe}
-                              title={isMe ? 'Cannot delete your own account' : 'Delete user'}
-                              style={{ display: 'flex', alignItems: 'center', gap: '5px', opacity: isMe ? 0.4 : 1 }}
+                              style={{
+                                display: 'inline-flex', alignItems: 'center', gap: '5px',
+                                padding: '4px 10px', borderRadius: '6px', border: 'none',
+                                fontSize: '0.75rem', fontWeight: 700, cursor: isMe ? 'not-allowed' : 'pointer',
+                                background: item.active ? 'var(--success-bg)' : 'var(--error-bg)',
+                                color: item.active ? 'var(--success)' : 'var(--error)',
+                                opacity: isMe ? 0.5 : 1,
+                                transition: 'opacity 0.15s'
+                              }}
+                              title={isMe ? 'Cannot change your own status' : `Click to ${item.active ? 'suspend' : 'activate'}`}
                             >
-                              <TrashIcon /> Delete
+                              <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: 'currentColor', display: 'inline-block' }} />
+                              {item.active ? 'Active' : 'Suspended'}
                             </button>
-                          </div>
+                          )}
+                        </td>
+                        <td data-label="Actions" style={{ textAlign: 'right', paddingRight: '20px' }}>
+                          {isReadOnly ? (
+                            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>View Only</span>
+                          ) : (
+                            <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end' }}>
+                              <button
+                                className="btn btn-secondary btn-sm"
+                                onClick={() => openEdit(item)}
+                                title="Edit user"
+                                style={{ display: 'flex', alignItems: 'center', gap: '5px' }}
+                              >
+                                <EditIcon /> Edit
+                              </button>
+                              <button
+                                className="btn btn-danger btn-sm"
+                                onClick={() => handleDeleteRequest(item)}
+                                disabled={isMe}
+                                title={isMe ? 'Cannot delete your own account' : 'Delete user'}
+                                style={{ display: 'flex', alignItems: 'center', gap: '5px', opacity: isMe ? 0.4 : 1 }}
+                              >
+                                <TrashIcon /> Delete
+                              </button>
+                            </div>
+                          )}
                         </td>
                       </tr>
                     );
@@ -614,14 +636,16 @@ export default function UserManagement({ user }) {
               </div>
 
               {/* Action Buttons for Super Admin */}
-              {isSuperAdmin && (
+              {(isSuperAdmin || isReadOnly) && (
                 <div style={{ display: 'flex', gap: '10px' }}>
                   <button onClick={handleExportAuditLogs} className="btn btn-secondary" style={{ padding: '0 12px', height: '36px', fontSize: '0.8rem', cursor: 'pointer' }}>
                     📥 Export CSV
                   </button>
-                  <button onClick={handleDeleteAuditLogs} className="btn btn-secondary" style={{ padding: '0 12px', height: '36px', fontSize: '0.8rem', borderColor: 'rgba(239, 68, 68, 0.4)', color: '#EF4444', cursor: 'pointer' }}>
-                    🗑️ Clear Audit Trail
-                  </button>
+                  {!isReadOnly && (
+                    <button onClick={handleDeleteAuditLogs} className="btn btn-secondary" style={{ padding: '0 12px', height: '36px', fontSize: '0.8rem', borderColor: 'rgba(239, 68, 68, 0.4)', color: '#EF4444', cursor: 'pointer' }}>
+                      🗑️ Clear Audit Trail
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -633,7 +657,7 @@ export default function UserManagement({ user }) {
               🛡️ Database Audit Trail ({filteredLogs.length} matching)
             </div>
             <div className="table-responsive" style={{ border: 'none', borderRadius: 0 }}>
-              <table className="table">
+              <table className="table responsive-table">
                 <thead>
                   <tr>
                     <th>Timestamp</th>
@@ -660,9 +684,9 @@ export default function UserManagement({ user }) {
                     const plantName = log.plantId === 'all' ? 'System-wide' : (plantObj ? plantObj.name : (log.plantId || 'System'));
                     return (
                       <tr key={log.id || idx}>
-                        <td className="font-mono" style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{log.ts}</td>
-                        <td style={{ fontSize: '0.82rem', color: 'var(--accent)', fontWeight: 600 }}>{log.by}</td>
-                        <td style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                        <td data-label="Timestamp" className="font-mono" style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{log.ts}</td>
+                        <td data-label="User" style={{ fontSize: '0.82rem', color: 'var(--accent)', fontWeight: 600 }}>{log.by}</td>
+                        <td data-label="Role" style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
                           <span style={{
                             fontSize: '0.7rem',
                             padding: '2px 6px',
@@ -674,9 +698,9 @@ export default function UserManagement({ user }) {
                             {log.role}
                           </span>
                         </td>
-                        <td style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{plantName}</td>
-                        <td style={{ fontSize: '0.82rem', color: 'var(--text)', fontWeight: 600 }}>{log.action}</td>
-                        <td style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{log.details}</td>
+                        <td data-label="Plant" style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{plantName}</td>
+                        <td data-label="Action" style={{ fontSize: '0.82rem', color: 'var(--text)', fontWeight: 600 }}>{log.action}</td>
+                        <td data-label="Details" style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{log.details}</td>
                       </tr>
                     );
                   })}
@@ -796,6 +820,7 @@ export default function UserManagement({ user }) {
                       disabled={!isSuperAdmin}
                     >
                       {isSuperAdmin && <option value="Super Admin">Super Admin</option>}
+                      {isSuperAdmin && <option value="Admin">Admin (Read-Only)</option>}
                       <option value="Plant Admin">Plant Admin</option>
                       <option value="Operator">Operator</option>
                       <option value="Viewer">Viewer</option>
