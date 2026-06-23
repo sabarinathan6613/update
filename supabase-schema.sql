@@ -29,7 +29,7 @@ create table public.profiles (
     id uuid references auth.users on delete cascade primary key,
     email text unique not null,
     name text not null,
-    role text not null check (role in ('Super Admin', 'Plant Admin', 'User')),
+    role text not null check (role in ('Super Admin', 'Plant Admin', 'User', 'Admin', 'Viewer')),
     plant_id text not null, -- 'all' for Super Admin, or a specific plant_id
     active boolean not null default true
 );
