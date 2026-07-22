@@ -1,6 +1,6 @@
 // src/components/TagConfig.jsx
 import { useState, useEffect, useRef } from 'react';
-import { getTagConfigs, saveTagConfigs, getSettings, saveSettings, getHistorianData, getSampleStationMapping, saveSampleStationMapping, getSampleStationAssignments, saveSampleStationAssignments } from '../utils/db';
+import { getTagConfigs, saveTagConfigs, getSettings, saveSettings, getHistorianData, getSampleStationMappings, upsertSampleStationMapping, deleteSampleStationMapping } from '../utils/db';
 import { getSupabaseClient, getSupabaseConfig } from '../utils/supabaseClient';
 import { useSimulator } from '../utils/SimulatorContext';
 import { getLatestRecord } from '../utils/historianService';
@@ -114,11 +114,12 @@ export default function TagConfig({ user, isActive }) {
   const [allRecentRecords, setAllRecentRecords] = useState([]);
   const [loadingHistoryId, setLoadingHistoryId] = useState(null);
 
-  // ── Sample Station Mapping State ────────────────────────────────────────
-  // ssAssignments: live (unsaved) edits — { TagIndex: { circuit, role } }
-  const [ssAssignments, setSsAssignments] = useState({});
-  // savedSsAssignments: last persisted state loaded from DB
-  const [savedSsAssignments, setSavedSsAssignments] = useState({});
+  // ── Sample Station Mapping State (final architecture) ─────────────────────
+  // ssMappings: rows from sample_station_mappings cloud table
+  // Each row: { id, tag_id, equipment_name, circuit, role }
+  const [ssMappings, setSsMappings] = useState([]);
+  // rowEdits: live unsaved edits per tag_id: { [tagId]: { circuit, role } }
+  const [rowEdits, setRowEdits] = useState({});
   const [rowSaving, setRowSaving] = useState({});
   const [rowErrors, setRowErrors] = useState({});
   const [rowSuccess, setRowSuccess] = useState({});
@@ -133,28 +134,18 @@ export default function TagConfig({ user, isActive }) {
         const sysSettings = await getSettings();
         setSettings(sysSettings);
 
-        // Load saved sample station assignments from DB
+        // Load saved sample station mappings from cloud table (final architecture)
         try {
-          const saved = await getSampleStationAssignments();
-          // Convert the grouped format { sample_tag: [...], shift_id_tag: [...], ... }
-          // into a flat per-TagIndex map for easy UI lookups:
-          // { [TagIndex]: { circuit: 'lump'|'fines'|'', role: 'sample_tag'|'shift_id_tag'|... } }
-          const perTag = {};
-          const roleKeys = ['sample_tag', 'shift_id_tag', 'cumulative_tag', 'stockpile_tag'];
-          const tc = saved?.tag_circuits || {};
-          roleKeys.forEach(roleKey => {
-            (saved?.[roleKey] || []).forEach(t => {
-              const idx = Number(t.TagIndex);
-              perTag[idx] = {
-                circuit: tc[String(idx)] || t.Circuit || '',
-                role: roleKey
-              };
-            });
+          const mappings = await getSampleStationMappings();
+          setSsMappings(mappings || []);
+          // Initialise rowEdits from persisted data so dropdowns show saved values
+          const edits = {};
+          (mappings || []).forEach(m => {
+            edits[Number(m.tag_id)] = { circuit: m.circuit, role: m.role };
           });
-          setSsAssignments(perTag);
-          setSavedSsAssignments(perTag);
+          setRowEdits(edits);
         } catch (ssErr) {
-          console.warn('[TagConfig] Failed to load sample station assignments:', ssErr);
+          console.warn('[TagConfig] Failed to load sample station mappings:', ssErr);
         }
 
         const isConnected = getSupabaseConfig() !== null;
@@ -429,35 +420,35 @@ export default function TagConfig({ user, isActive }) {
 
 
 
-  // ── Sample Station Mapping Helpers ──────────────────────────────────────
+  // ── Sample Station Mapping Helpers (final architecture) ──────────────────
 
-  // Read the live (unsaved) circuit for a tag
+  // Read the live (possibly unsaved) circuit for a tag from rowEdits
   const getCircuitForTag = (tagIndex) => {
     const idx = Number(tagIndex);
-    return ssAssignments[idx]?.circuit || '';
+    return rowEdits[idx]?.circuit || '';
   };
 
-  // Read the live (unsaved) role for a tag
+  // Read the live (possibly unsaved) role for a tag from rowEdits
   const getRoleForTag = (tagIndex) => {
     const idx = Number(tagIndex);
-    return ssAssignments[idx]?.role || 'none';
+    return rowEdits[idx]?.role || 'none';
   };
 
-  // Read the persisted (saved) circuit for a tag from a snapshot object
-  const getCircuitForTagFromObj = (obj, tagIndex) => {
+  // Read persisted circuit from ssMappings (cloud DB snapshot)
+  const getCircuitForTagFromObj = (_obj, tagIndex) => {
     const idx = Number(tagIndex);
-    return obj?.[idx]?.circuit || '';
+    return ssMappings.find(m => Number(m.tag_id) === idx)?.circuit || '';
   };
 
-  // Read the persisted (saved) role for a tag from a snapshot object
-  const getRoleForTagFromObj = (obj, tagIndex) => {
+  // Read persisted role from ssMappings (cloud DB snapshot)
+  const getRoleForTagFromObj = (_obj, tagIndex) => {
     const idx = Number(tagIndex);
-    return obj?.[idx]?.role || 'none';
+    return ssMappings.find(m => Number(m.tag_id) === idx)?.role || 'none';
   };
 
   const handleCircuitSelect = (tag, value) => {
     const idx = Number(tag.TagIndex);
-    setSsAssignments(prev => ({
+    setRowEdits(prev => ({
       ...prev,
       [idx]: { ...(prev[idx] || { role: 'none' }), circuit: value }
     }));
@@ -465,7 +456,7 @@ export default function TagConfig({ user, isActive }) {
 
   const handleRoleSelect = (tag, value) => {
     const idx = Number(tag.TagIndex);
-    setSsAssignments(prev => ({
+    setRowEdits(prev => ({
       ...prev,
       [idx]: { ...(prev[idx] || { circuit: '' }), role: value }
     }));
@@ -473,11 +464,11 @@ export default function TagConfig({ user, isActive }) {
 
   const handleSaveRow = async (tag) => {
     const idx = Number(tag.TagIndex);
-    const current = ssAssignments[idx] || {};
-    const circuit = current.circuit || '';
-    const role = current.role || 'none';
+    const edit = rowEdits[idx] || {};
+    const circuit = edit.circuit || '';
+    const role = edit.role || 'none';
 
-    // Validate: both circuit and role must be set
+    // Validate: both circuit and a real role must be set
     if (!circuit || role === 'none') {
       setRowErrors(prev => ({ ...prev, [idx]: 'Select Circuit and Role first' }));
       setTimeout(() => setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; }), 3000);
@@ -489,44 +480,31 @@ export default function TagConfig({ user, isActive }) {
     setRowSuccess(prev => { const n = { ...prev }; delete n[idx]; return n; });
 
     try {
-      // Load the current full assignment object from DB
-      const existing = await getSampleStationAssignments();
-      const roleKeys = ['sample_tag', 'shift_id_tag', 'cumulative_tag', 'stockpile_tag'];
-      // Remove this tag from all role arrays
-      roleKeys.forEach(rk => {
-        if (Array.isArray(existing[rk])) {
-          existing[rk] = existing[rk].filter(t => Number(t.TagIndex) !== idx);
-        } else {
-          existing[rk] = [];
-        }
+      // Write to cloud DB and read back to confirm
+      const saved = await upsertSampleStationMapping({
+        tag_id: idx,
+        equipment_name: tag.TagName,
+        circuit,
+        role
       });
-      // Add to the correct role array
-      if (role !== 'none') {
-        if (!Array.isArray(existing[role])) existing[role] = [];
-        existing[role].push({ TagIndex: idx, TagName: tag.TagName, Circuit: circuit });
-      }
-      // Update tag_circuits map
-      if (!existing.tag_circuits) existing.tag_circuits = {};
-      existing.tag_circuits[String(idx)] = circuit;
 
-      await saveSampleStationAssignments(existing);
-
-      // Update local saved snapshot
-      setSavedSsAssignments(prev => ({
-        ...prev,
-        [idx]: { circuit, role }
-      }));
+      // Update local snapshot with confirmed DB row
+      setSsMappings(prev => {
+        const withoutThis = prev.filter(m => Number(m.tag_id) !== idx);
+        return [...withoutThis, saved];
+      });
 
       setRowSuccess(prev => ({ ...prev, [idx]: 'Saved' }));
-      setTimeout(() => setRowSuccess(prev => { const n = { ...prev }; delete n[idx]; return n; }), 2500);
+      setTimeout(() => setRowSuccess(prev => { const n = { ...prev }; delete n[idx]; return n; }), 3000);
     } catch (err) {
       console.error('[handleSaveRow] Save failed:', err);
-      setRowErrors(prev => ({ ...prev, [idx]: 'Save failed' }));
-      setTimeout(() => setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; }), 4000);
+      setRowErrors(prev => ({ ...prev, [idx]: err.message || 'Save failed' }));
+      setTimeout(() => setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; }), 5000);
     } finally {
       setRowSaving(prev => { const n = { ...prev }; delete n[idx]; return n; });
     }
   };
+
 
   const handleDeleteTag = async (tagIndex) => {
     if (isReadOnly) return;
@@ -1361,30 +1339,31 @@ export default function TagConfig({ user, isActive }) {
                           const currentRole = getRoleForTag(tag.TagIndex);
                           const currentCircuit = getCircuitForTag(tag.TagIndex);
 
-                          const savedRole = getRoleForTagFromObj(savedSsAssignments, tag.TagIndex);
-                          const savedCircuit = getCircuitForTagFromObj(savedSsAssignments, tag.TagIndex);
+                          const savedRole = getRoleForTagFromObj(null, tag.TagIndex);
+                          const savedCircuit = getCircuitForTagFromObj(null, tag.TagIndex);
 
                           // Enable save button only when row has unsaved modifications
                           const hasRowChanges = (currentRole !== savedRole) || (currentCircuit !== savedCircuit);
                           const numIdx = Number(tag.TagIndex);
 
                           // Calculate status text and color
-                          // "Saved" only if circuit AND role are both valid in the persisted state
-                          const isSavedComplete = savedCircuit !== '' && savedRole !== 'none';
-                          let statusText = isSavedComplete ? 'Saved' : 'Incomplete';
-                          let statusColor = isSavedComplete ? 'var(--success)' : '#94A3B8';
+                          // "Saved" = DB record exists with valid circuit AND role, no pending edits
+                          const dbRecord = ssMappings.find(m => Number(m.tag_id) === Number(tag.TagIndex));
+                          const isSavedComplete = dbRecord && dbRecord.circuit && dbRecord.role && dbRecord.role !== 'none';
+                          let statusText = isSavedComplete ? 'Saved' : (dbRecord ? 'Incomplete' : 'Unassigned');
+                          let statusColor = isSavedComplete ? 'var(--success)' : 'var(--text-muted)';
                           if (rowSaving[numIdx]) {
                             statusText = 'Saving...';
                             statusColor = 'var(--accent)';
                           } else if (rowErrors[numIdx]) {
                             statusText = 'Failed';
                             statusColor = 'var(--error)';
+                          } else if (rowSuccess[numIdx]) {
+                            statusText = 'Saved';
+                            statusColor = 'var(--success)';
                           } else if (hasRowChanges) {
                             statusText = 'Unsaved';
                             statusColor = '#94A3B8';
-                          } else if (currentRole === 'none' && currentCircuit === '') {
-                            statusText = 'Unassigned';
-                            statusColor = 'var(--text-muted)';
                           }
 
                           return (
@@ -1436,11 +1415,10 @@ export default function TagConfig({ user, isActive }) {
                                   disabled={isReadOnly || rowSaving[numIdx]}
                                   style={{ height: '32px', fontSize: '0.78rem', maxWidth: '240px', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}
                                 >
-                                  <option value="sample_tag">Sample Tag</option>
-                                  <option value="shift_id_tag">Shift ID</option>
-                                  <option value="cumulative_tag">Shift Cumulative Tonnes</option>
-                                  <option value="stockpile_tag">Stockpile Tonnes</option>
                                   <option value="none">Unassigned</option>
+                                  <option value="sample_tag">Sample Tag</option>
+                                  <option value="shift_id">Shift ID</option>
+                                  <option value="stockpile_tonnes">Stockpile Tonnes</option>
                                 </select>
                               </td>
                               <td style={{ padding: '10px 14px', verticalAlign: 'middle' }}>

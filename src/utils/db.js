@@ -3134,3 +3134,96 @@ export async function saveSampleStationMapping(mappings) {
     console.error("Failed backing up sample station mapping to system settings:", backupErr);
   }
 }
+
+// ─── FINAL Sample Station Architecture ─────────────────────────────────────
+// Single source of truth: sample_station_mappings table in Supabase.
+// Three roles only: sample_tag | shift_id | stockpile_tonnes
+// (Sample Tag's own historian value = Shift Cumulative Tonnes — no 4th role needed)
+
+/**
+ * Read all rows from sample_station_mappings.
+ * Returns array of { id, tag_id, equipment_name, circuit, role }.
+ * circuit is always lowercase: 'lump' | 'fines'
+ * role is always lowercase: 'sample_tag' | 'shift_id' | 'stockpile_tonnes'
+ */
+export async function getSampleStationMappings() {
+  const supabase = getSupabaseClient();
+  if (!supabase) return [];
+  try {
+    const { data, error } = await supabase
+      .from('sample_station_mappings')
+      .select('id, tag_id, equipment_name, circuit, role, updated_at')
+      .order('tag_id', { ascending: true });
+
+    if (error) {
+      console.error('[getSampleStationMappings] query failed:', error.message);
+      return [];
+    }
+    return data || [];
+  } catch (err) {
+    console.error('[getSampleStationMappings] exception:', err);
+    return [];
+  }
+}
+
+/**
+ * Insert or update a single row in sample_station_mappings.
+ * Uses ON CONFLICT (tag_id) DO UPDATE.
+ * Reads the row back from the database to confirm persistence.
+ * Throws on failure so the caller can set FAILED status.
+ *
+ * @param {{ tag_id: number, equipment_name: string, circuit: string, role: string }} mapping
+ * @returns {Promise<{ id, tag_id, equipment_name, circuit, role, updated_at }>}
+ */
+export async function upsertSampleStationMapping({ tag_id, equipment_name, circuit, role }) {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error('Supabase client is not initialized');
+
+  const payload = {
+    tag_id: Number(tag_id),
+    equipment_name: String(equipment_name),
+    circuit: String(circuit).toLowerCase(),
+    role: String(role).toLowerCase(),
+    updated_at: new Date().toISOString()
+  };
+
+  const { error: upsertErr } = await supabase
+    .from('sample_station_mappings')
+    .upsert(payload, { onConflict: 'tag_id' });
+
+  if (upsertErr) {
+    console.error('[upsertSampleStationMapping] upsert failed:', upsertErr.message);
+    throw new Error(upsertErr.message);
+  }
+
+  // Read the row back to confirm it was written correctly
+  const { data: readback, error: readErr } = await supabase
+    .from('sample_station_mappings')
+    .select('id, tag_id, equipment_name, circuit, role, updated_at')
+    .eq('tag_id', Number(tag_id))
+    .single();
+
+  if (readErr || !readback) {
+    console.error('[upsertSampleStationMapping] readback failed:', readErr?.message);
+    throw new Error('Save appeared to succeed but readback failed: ' + (readErr?.message || 'no data'));
+  }
+
+  console.log('[upsertSampleStationMapping] SUCCESS:', readback);
+  return readback;
+}
+
+/**
+ * Remove a tag from sample_station_mappings (set to Unassigned).
+ */
+export async function deleteSampleStationMapping(tag_id) {
+  const supabase = getSupabaseClient();
+  if (!supabase) throw new Error('Supabase client is not initialized');
+  const { error } = await supabase
+    .from('sample_station_mappings')
+    .delete()
+    .eq('tag_id', Number(tag_id));
+  if (error) {
+    console.error('[deleteSampleStationMapping] failed:', error.message);
+    throw new Error(error.message);
+  }
+}

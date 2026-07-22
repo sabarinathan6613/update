@@ -1,6 +1,6 @@
 // src/components/Dashboard.jsx
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { getTagConfigs, getSettings, saveTagConfigs, getSampleStationAssignments, writeSampleStationDatalogRow, getSampleStationDatalog } from '../utils/db';
+import { getTagConfigs, getSettings, saveTagConfigs, getSampleStationMappings } from '../utils/db';
 import { getSupabaseClient } from '../utils/supabaseClient';
 import { getLatestRecord, getRecordsInRange, getTotalCount } from '../utils/historianService';
 import { useSimulator } from '../utils/SimulatorContext';
@@ -321,9 +321,8 @@ export default function Dashboard({ onNavigate, isActive }) {
   const [totalRecordsCount, setTotalRecordsCount] = useState(0);
   const [latestIngestionTime, setLatestIngestionTime] = useState(null);
   const [selectedKpis, setSelectedKpis] = useState([]);
-  // Sample Station: single-row config + persisted datalog rows
-  const [ssAssignments, setSsAssignments] = useState({});
-  const [sampleDatalogRows, setSampleDatalogRows] = useState([]);
+  // Sample Station: flat array from sample_station_mappings cloud table
+  const [ssMappings, setSsMappings] = useState([]);
 
   // ── Fetch data ───────────────────────────────────────────────────────────
   const loadInitialConfig = useCallback(async () => {
@@ -351,13 +350,11 @@ export default function Dashboard({ onNavigate, isActive }) {
       const finalConfigs = migratedAny ? migratedConfigs : configs;
       setTagConfigs(finalConfigs);
 
-      // Load sample station assignments (single-row config) and datalog rows
-      const [assignmentData, datalogData] = await Promise.all([
-        getSampleStationAssignments(),
-        getSampleStationDatalog(15)
-      ]);
-      setSsAssignments(assignmentData || {});
-      setSampleDatalogRows(datalogData || []);
+      // Load sample station configuration from cloud table (final architecture)
+      const mappings = await getSampleStationMappings();
+      setSsMappings(mappings || []);
+      console.log(`[Dashboard] Loaded ${(mappings || []).length} sample station mapping(s) from cloud table:`,
+        (mappings || []).map(m => `TagID=${m.tag_id} ${m.equipment_name} → ${m.circuit}/${m.role}`));
     } catch (e) {
       console.error("Failed to load initial dashboard config:", e);
     }
@@ -387,16 +384,8 @@ export default function Dashboard({ onNavigate, isActive }) {
       const downtimeTagsList = tagConfigs.filter(c => c.downtime_datalog_enabled === true || c.DowntimeDatalog === true);
       const downtimeTagIndexes = downtimeTagsList.map(c => c.TagIndex);
 
-      const sampleStationTagIndexes = [];
-      Object.values(ssAssignments || {}).forEach(list => {
-        if (Array.isArray(list)) {
-          list.forEach(item => {
-            if (item.TagIndex !== undefined && item.TagIndex !== null) {
-              sampleStationTagIndexes.push(Number(item.TagIndex));
-            }
-          });
-        }
-      });
+      // Collect sample station tag IDs from the cloud config table (final architecture)
+      const sampleStationTagIndexes = (ssMappings || []).map(m => Number(m.tag_id)).filter(Boolean);
 
       const allQueryTagIndexes = [...new Set([
         ...dashboardTagIndexes,
@@ -480,7 +469,7 @@ export default function Dashboard({ onNavigate, isActive }) {
     } finally {
       setLoading(false);
     }
-  }, [tagConfigs, chartStart, chartEnd, loadInitialConfig, ssAssignments]);
+  }, [tagConfigs, chartStart, chartEnd, loadInitialConfig, ssMappings]);
 
   const handleManualRefreshDashboard = useCallback(async () => {
     await loadInitialConfig();
@@ -613,117 +602,106 @@ export default function Dashboard({ onNavigate, isActive }) {
     return c;
   };
 
-  // Sample Station rows: derived from the SAME historianRecords already loaded for Production Data.
-  // ssAssignments defines which TagIndex → circuit + role. No extra DB query needed.
+  // ─── FINAL Sample Station Row Builder ──────────────────────────────────────
+  // Reads configuration from ssMappings (cloud table).
+  // Each row is anchored to a Sample Tag historian event.
+  // Shift Cum. Tonnes = Sample Tag's own value (no separate tag needed).
+  // Shift ID + Stockpile Tonnes = latest value at-or-before sample timestamp.
   const sampleRows = useMemo(() => {
+    if (!ssMappings || ssMappings.length === 0) return [];
     if (!historianRecords || historianRecords.length === 0) return [];
-    if (!ssAssignments) return [];
 
-    const tc = ssAssignments.tag_circuits || {};
+    // Build a fast lookup: tagId → sorted-desc array of records
+    const tagRecordsMap = {};
+    historianRecords.forEach(r => {
+      const idx = Number(r.TagIndex);
+      if (!tagRecordsMap[idx]) tagRecordsMap[idx] = [];
+      tagRecordsMap[idx].push(r);
+    });
+    // Sort each tag's records descending by timestamp (once, for fast binary-search-style lookup)
+    Object.keys(tagRecordsMap).forEach(idx => {
+      tagRecordsMap[idx].sort((a, b) =>
+        new Date(b.DateAndTime).getTime() - new Date(a.DateAndTime).getTime()
+      );
+    });
+
+    // Helper: find the latest record for tagId at or before refTs (milliseconds)
+    const latestAtOrBefore = (tagId, refTs) => {
+      const recs = tagRecordsMap[Number(tagId)] || [];
+      for (const r of recs) { // already sorted desc
+        const t = new Date(r.DateAndTime).getTime();
+        if (!isNaN(t) && t <= refTs) return r;
+      }
+      return null;
+    };
+
     const resolvedRows = [];
 
-    const circuits = ['lump', 'fines'];
-    for (const circuit of circuits) {
-      // Collect tag indexes per role for this circuit
-      const sampleTagIndexes = (ssAssignments.sample_tag || [])
-        .filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit)
-        .map(t => Number(t.TagIndex));
+    for (const circuit of ['lump', 'fines']) {
+      // Config for this circuit
+      const circuitMappings = ssMappings.filter(m => m.circuit === circuit);
 
-      if (sampleTagIndexes.length === 0) continue;
+      const sampleTagConfigs = circuitMappings.filter(m => m.role === 'sample_tag');
+      const shiftIdConfig    = circuitMappings.find(m  => m.role === 'shift_id');
+      const stockpileConfig  = circuitMappings.find(m  => m.role === 'stockpile_tonnes');
 
-      const shiftIdIndexes = (ssAssignments.shift_id_tag || [])
-        .filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit)
-        .map(t => Number(t.TagIndex));
+      if (sampleTagConfigs.length === 0) continue; // No sample tag → no rows for this circuit
 
-      const cumIndexes = (ssAssignments.cumulative_tag || [])
-        .filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit)
-        .map(t => Number(t.TagIndex));
+      for (const stConfig of sampleTagConfigs) {
+        const sampleTagId = Number(stConfig.tag_id);
+        const equipmentName = stConfig.equipment_name;
+        const sampleRecs = tagRecordsMap[sampleTagId] || [];
 
-      const stockIndexes = (ssAssignments.stockpile_tag || [])
-        .filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit)
-        .map(t => Number(t.TagIndex));
+        console.log(`[SampleStation] ${circuit.toUpperCase()} sample tag "${equipmentName}" (ID=${sampleTagId}): ${sampleRecs.length} records in window`);
 
-      // Group all historianRecords by TagIndex for fast lookup
-      const tagRecordsMap = {};
-      historianRecords.forEach(r => {
-        const idx = Number(r.TagIndex);
-        if (!tagRecordsMap[idx]) tagRecordsMap[idx] = [];
-        tagRecordsMap[idx].push(r);
-      });
-
-      // Each record of a sample tag creates one dashboard row
-      sampleTagIndexes.forEach(sampleIdx => {
-        const sampleRecs = tagRecordsMap[sampleIdx] || [];
-        sampleRecs.forEach(sampleRec => {
+        for (const sampleRec of sampleRecs) {
           const tSample = new Date(sampleRec.DateAndTime).getTime();
-          if (isNaN(tSample)) return;
+          if (isNaN(tSample)) continue;
 
-          // Resolve Shift ID — latest record at or before sample timestamp
+          // SHIFT CUM. TONNES = Sample Tag's OWN value (no separate tag)
+          const shiftCumTonnes = sampleRec.Val !== null && sampleRec.Val !== undefined
+            ? sampleRec.Val
+            : null;
+
+          // SHIFT ID = latest value at or before sample timestamp
           let resolvedShiftId = '—';
-          let bestShiftTime = 0;
-          shiftIdIndexes.forEach(idx => {
-            (tagRecordsMap[idx] || []).forEach(r => {
-              const t = new Date(r.DateAndTime).getTime();
-              if (t <= tSample && t > bestShiftTime) {
-                // Keep string values (e.g. "A", "B") as-is
-                resolvedShiftId = r.Val !== null && r.Val !== undefined ? String(r.Val) : '—';
-                bestShiftTime = t;
-              }
-            });
-          });
+          if (shiftIdConfig) {
+            const shiftRec = latestAtOrBefore(shiftIdConfig.tag_id, tSample);
+            if (shiftRec && shiftRec.Val !== null && shiftRec.Val !== undefined) {
+              resolvedShiftId = String(shiftRec.Val);
+            }
+          }
 
-          // Resolve Shift Cumulative Tonnes — latest at or before sample timestamp
-          let resolvedCumTonnes = null;
-          let bestCumTime = 0;
-          cumIndexes.forEach(idx => {
-            (tagRecordsMap[idx] || []).forEach(r => {
-              const t = new Date(r.DateAndTime).getTime();
-              if (t <= tSample && t > bestCumTime) {
-                const parsed = parseFloat(r.Val);
-                if (!isNaN(parsed)) {
-                  resolvedCumTonnes = parsed;
-                  bestCumTime = t;
-                }
-              }
-            });
-          });
-
-          // Resolve Stockpile Tonnes — latest at or before sample timestamp
+          // STOCKPILE TONNES = latest value at or before sample timestamp
           let resolvedStockpile = null;
-          let bestStockTime = 0;
-          stockIndexes.forEach(idx => {
-            (tagRecordsMap[idx] || []).forEach(r => {
-              const t = new Date(r.DateAndTime).getTime();
-              if (t <= tSample && t > bestStockTime) {
-                const parsed = parseFloat(r.Val);
-                if (!isNaN(parsed)) {
-                  resolvedStockpile = parsed;
-                  bestStockTime = t;
-                }
-              }
-            });
-          });
+          if (stockpileConfig) {
+            const stockRec = latestAtOrBefore(stockpileConfig.tag_id, tSample);
+            if (stockRec && stockRec.Val !== null && stockRec.Val !== undefined) {
+              const parsed = parseFloat(stockRec.Val);
+              if (!isNaN(parsed)) resolvedStockpile = parsed;
+            }
+          }
 
-          const eqConfig = tagConfigs.find(c => Number(c.TagIndex) === sampleIdx);
-          const equipmentName = eqConfig ? eqConfig.TagName : `Tag #${sampleIdx}`;
+          const eqTagConfig = tagConfigs.find(c => Number(c.TagIndex) === sampleTagId);
 
           resolvedRows.push({
             timestamp: sampleRec.DateAndTime,
             tagName: equipmentName,
             shift_id: resolvedShiftId,
-            shift_cumulative_tonnes: resolvedCumTonnes,
+            shift_cumulative_tonnes: shiftCumTonnes,
             stockpile_tonnes: resolvedStockpile,
             material: circuit,
-            decimalPlaces: eqConfig?.DecimalPlaces ?? 2
+            decimalPlaces: eqTagConfig?.DecimalPlaces ?? 2
           });
-        });
-      });
+        }
+      }
     }
 
-    // Sort by timestamp desc, latest 30
+    // Sort by timestamp descending, latest 50
     resolvedRows.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-    return resolvedRows.slice(0, 30);
-  }, [historianRecords, ssAssignments, tagConfigs]);
+    console.log(`[SampleStation] Built ${resolvedRows.length} total rows (lump + fines)`);
+    return resolvedRows.slice(0, 50);
+  }, [historianRecords, ssMappings, tagConfigs]);
 
   const getRowMaterialType = (row) => {
     if (row.material) return row.material.toLowerCase();
@@ -741,19 +719,15 @@ export default function Dashboard({ onNavigate, isActive }) {
     return sampleRows.filter(r => getRowMaterialType(r) === 'fines');
   }, [sampleRows]);
 
+  // Has valid config = at least one sample_tag mapping exists for this circuit in cloud table
   const hasLumpMappings = useMemo(() => {
-    const tc = ssAssignments.tag_circuits || {};
-    const hasCircuitMap = Object.keys(tc).some(tagIdx => tc[tagIdx] === 'lump');
-    const hasSampleTag = (ssAssignments.sample_tag || []).some(t => (tc[String(t.TagIndex)] || t.Circuit) === 'lump');
-    return hasCircuitMap || hasSampleTag;
-  }, [ssAssignments]);
+    return ssMappings.some(m => m.circuit === 'lump' && m.role === 'sample_tag');
+  }, [ssMappings]);
 
   const hasFinesMappings = useMemo(() => {
-    const tc = ssAssignments.tag_circuits || {};
-    const hasCircuitMap = Object.keys(tc).some(tagIdx => tc[tagIdx] === 'fines');
-    const hasSampleTag = (ssAssignments.sample_tag || []).some(t => (tc[String(t.TagIndex)] || t.Circuit) === 'fines');
-    return hasCircuitMap || hasSampleTag;
-  }, [ssAssignments]);
+    return ssMappings.some(m => m.circuit === 'fines' && m.role === 'sample_tag');
+  }, [ssMappings]);
+
 
   const sampleMappedCount = useMemo(() => {
     return tableData.filter(t => t.activeStatus !== false && t.sampleDatalog).length;
