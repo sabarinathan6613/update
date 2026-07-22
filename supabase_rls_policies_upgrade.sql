@@ -102,10 +102,10 @@ CREATE POLICY "Allow admin modify email_configuration" ON public.email_configura
     FOR ALL TO authenticated USING (public.get_user_role() IN ('Super Admin', 'Plant Admin'));
 
 -- SYNCHRONIZATION LOGS policies
-CREATE POLICY "Allow authenticated read synchronization_logs" ON public.synchronization_logs
-    FOR SELECT TO authenticated USING (true);
-CREATE POLICY "Allow Super Admin modify synchronization_logs" ON public.synchronization_logs
-    FOR ALL TO authenticated USING (public.get_user_role() = 'Super Admin');
+CREATE POLICY "Allow all read synchronization_logs" ON public.synchronization_logs
+    FOR SELECT USING (true);
+CREATE POLICY "Allow all insert synchronization_logs" ON public.synchronization_logs
+    FOR INSERT WITH CHECK (true);
 
 -- AUDIT LOGS policies
 CREATE POLICY "Allow admin read audit_logs" ON public.audit_logs

@@ -97,10 +97,13 @@ async function writeLog(message, statusType = 'SUCCESS') {
 
   if (supabase) {
     try {
-      await supabase.from('synchronization_logs').insert({
+      const { error } = await supabase.from('synchronization_logs').insert({
         status_type: statusType,
         log_message: message
       });
+      if (error) {
+        console.error(`\x1b[31m[LOGGING ERROR] Failed to push log to Supabase: ${error.message}\x1b[0m`);
+      }
     } catch (err) {
       console.error(`\x1b[31m[LOGGING ERROR] Failed to push log to Supabase: ${err.message}\x1b[0m`);
     }
@@ -276,9 +279,29 @@ async function runSynchronizationCycle() {
   }
 }
 
+// Track last scheduler run time
+let lastSchedulerTrigger = 0;
+
 // Start continuous polling loop
 console.log(`\x1b[32m[SYNC ENGINE] Started polling bridge. Polling interval: ${config.pollIntervalMs / 1000}s\x1b[0m`);
-let pollInterval = setInterval(runSynchronizationCycle, config.pollIntervalMs);
+let pollInterval = setInterval(async () => {
+  await runSynchronizationCycle();
+  
+  // Throttle scheduler runs to once every minute
+  const nowTime = Date.now();
+  if (nowTime - lastSchedulerTrigger >= 60000) {
+    lastSchedulerTrigger = nowTime;
+    try {
+      const targetUrl = 'https://skadomation.vercel.app/api/run-scheduler';
+      console.log(`[SYNC-BRIDGE] Triggering automatic email scheduler at: ${targetUrl}`);
+      const schedRes = await fetch(targetUrl, { method: 'POST' });
+      const schedData = await schedRes.json();
+      console.log(`[SYNC-BRIDGE] Scheduler dispatch result:`, schedData);
+    } catch (schedErr) {
+      console.error(`[SYNC-BRIDGE] Failed to trigger scheduler:`, schedErr.message);
+    }
+  }
+}, config.pollIntervalMs);
 
 // Trigger immediately on startup
 runSynchronizationCycle();

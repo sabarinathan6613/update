@@ -3,6 +3,8 @@ import { useState, useEffect, useMemo, useCallback } from 'react';
 import { getSettings, saveSettings, discoverDatabaseStructure, STATIC_TABLE_SCHEMAS } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 import { getSupabaseConfig, getSupabaseClient } from '../utils/supabaseClient';
+import { useRefresh } from '../utils/useRefresh';
+import RefreshButton from './RefreshButton';
 
 const CLOUD_PROVIDERS = [
   { id: 'azure-pg', name: 'Microsoft Azure PostgreSQL', icon: '🔷', dbType: 'PostgreSQL' },
@@ -95,6 +97,7 @@ export default function CloudSync({ user }) {
   const [autoReconnect, setAutoReconnect] = useState(true);
   const [auditLogs, setAuditLogs] = useState([]);
   const [previewRows, setPreviewRows] = useState([]);
+  const [showResetMappingConfirm, setShowResetMappingConfirm] = useState(false);
 
   // Telemetry Monitor live tracking (shifting array of latest latency points)
   const [latencyHistory, setLatencyHistory] = useState([]);
@@ -403,58 +406,65 @@ export default function CloudSync({ user }) {
   }, [selectedTable, refreshTrigger, supabaseUrl, supabaseAnonKey]);
 
   // Load existing configuration settings
+  const fetchCloudSyncData = useCallback(async () => {
+    let settings = null;
+    try {
+      settings = await getSettings();
+      if (settings) {
+        if (settings.cloudDbHost) setDbHost(settings.cloudDbHost);
+        if (settings.cloudDbPort) setDbPort(settings.cloudDbPort);
+        if (settings.cloudDbName) setDbName(settings.cloudDbName);
+        if (settings.cloudDbUser) setDbUser(settings.cloudDbUser);
+        
+        if (settings.selectedTable) setSelectedTable(settings.selectedTable);
+        if (settings.columnMappings) setColumnMappings(settings.columnMappings);
+        if (settings.isSyncEnabled !== undefined) setIsSyncEnabled(settings.isSyncEnabled);
+        if (settings.syncInterval) setSyncInterval(settings.syncInterval);
+        if (settings.discoveredDbStructure) setDiscoveredDbStructure(settings.discoveredDbStructure);
+      }
+    } catch (err) {
+      console.error("Failed to load settings in CloudSync:", err);
+      throw err;
+    }
+
+    try {
+      const config = getSupabaseConfig();
+      if (config && config.url && config.anonKey) {
+        setSupabaseUrl(config.url);
+        setSupabaseAnonKey(config.anonKey);
+        setDbHost(config.url);
+        setTestSuccess(true);
+        setDiscoveryComplete(true);
+        
+        const hasDbStructure = settings?.discoveredDbStructure && Object.keys(settings.discoveredDbStructure).length > 0;
+        if (!hasDbStructure) {
+          console.info("[CloudSync] Auto-scanning database structures...");
+          await scanConnectedDatabase(config.url, config.anonKey);
+        }
+      } else if (settings?.supabaseUrl && settings.supabaseUrl !== 'your-supabase-url') {
+        setSupabaseUrl(settings.supabaseUrl);
+        setSupabaseAnonKey(settings.supabaseAnonKey);
+        setDbHost(settings.supabaseUrl);
+        setTestSuccess(true);
+        setDiscoveryComplete(true);
+        if (!settings.discoveredDbStructure) {
+          await scanConnectedDatabase(settings.supabaseUrl, settings.supabaseAnonKey);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to initialize database config in CloudSync:", err);
+      throw err;
+    }
+  }, [scanConnectedDatabase]);
+
+  const { isRefreshing, refreshToast, handleRefresh } = useRefresh(fetchCloudSyncData, 'CloudSync');
+
   useEffect(() => {
-    const loadSettingsData = async () => {
-      let settings = null;
-      try {
-        settings = await getSettings();
-        if (settings) {
-          if (settings.cloudDbHost) setDbHost(settings.cloudDbHost);
-          if (settings.cloudDbPort) setDbPort(settings.cloudDbPort);
-          if (settings.cloudDbName) setDbName(settings.cloudDbName);
-          if (settings.cloudDbUser) setDbUser(settings.cloudDbUser);
-          
-          if (settings.selectedTable) setSelectedTable(settings.selectedTable);
-          if (settings.columnMappings) setColumnMappings(settings.columnMappings);
-          if (settings.isSyncEnabled !== undefined) setIsSyncEnabled(settings.isSyncEnabled);
-          if (settings.syncInterval) setSyncInterval(settings.syncInterval);
-          if (settings.discoveredDbStructure) setDiscoveredDbStructure(settings.discoveredDbStructure);
-        }
-      } catch (err) {
-        console.error("Failed to load settings in CloudSync:", err);
-      }
+    fetchCloudSyncData().catch(() => {});
+  }, [fetchCloudSyncData, refreshTrigger]);
 
-      try {
-        const config = getSupabaseConfig();
-        if (config) {
-          setSupabaseUrl(config.url);
-          setSupabaseAnonKey(config.anonKey);
-          setDbHost(config.url);
-          setTestSuccess(true);
-          setDiscoveryComplete(true);
-          
-          const hasDbStructure = settings?.discoveredDbStructure && Object.keys(settings.discoveredDbStructure).length > 0;
-          if (!hasDbStructure) {
-            console.info("[CloudSync] Auto-scanning database structures...");
-            scanConnectedDatabase(config.url, config.anonKey);
-          }
-        } else if (settings?.supabaseUrl && settings.supabaseUrl !== 'your-supabase-url') {
-          setSupabaseUrl(settings.supabaseUrl);
-          setSupabaseAnonKey(settings.supabaseAnonKey);
-          setDbHost(settings.supabaseUrl);
-          setTestSuccess(true);
-          setDiscoveryComplete(true);
-          if (!settings.discoveredDbStructure) {
-            scanConnectedDatabase(settings.supabaseUrl, settings.supabaseAnonKey);
-          }
-        }
-      } catch (err) {
-        console.error("Failed to initialize database config in CloudSync:", err);
-      }
-    };
-    loadSettingsData();
-
-    // Latency simulator
+  // Latency simulator
+  useEffect(() => {
     if (isNetworkOnline) {
       const interval = setInterval(() => {
         setLatency(prev => {
@@ -470,7 +480,7 @@ export default function CloudSync({ user }) {
       }, 0);
       return () => clearTimeout(timer);
     }
-  }, [isNetworkOnline, scanConnectedDatabase]);
+  }, [isNetworkOnline]);
 
   const handleProviderSelect = (prov) => {
     setSelectedProvider(prov);
@@ -646,6 +656,39 @@ export default function CloudSync({ user }) {
       alert("Error saving column mapping: " + e.message);
     }
   };
+  const handleResetMapping = async () => {
+    if (isReadOnly) return;
+    try {
+      const currentSets = await getSettings();
+      const newSets = {
+        ...currentSets,
+        selectedTable: "",
+        columnMappings: {
+          timestampCol: "",
+          tagCol: "",
+          valueCol: "",
+          statusCol: "",
+          alarmCol: ""
+        }
+      };
+      await saveSettings(newSets);
+      setSelectedTable("");
+      setColumnMappings({
+        timestampCol: "",
+        tagCol: "",
+        valueCol: "",
+        statusCol: "",
+        alarmCol: ""
+      });
+      addAuditLog("Reset/Deleted custom database column mapping configuration", "SUCCESS");
+      alert("Database Mapping Configuration successfully deleted/reset.");
+      setShowResetMappingConfirm(false);
+      setWizardStep(4);
+    } catch (e) {
+      console.error("Failed to reset mapping settings:", e);
+      alert("Error resetting column mapping: " + e.message);
+    }
+  };
 
   const handleSaveSyncSettings = async () => {
     if (isReadOnly) return;
@@ -699,67 +742,72 @@ export default function CloudSync({ user }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
       
       {/* Sub Tabs Header */}
-      <div style={{ display: 'flex', borderBottom: '1px solid var(--border)', gap: '16px', marginBottom: '8px' }} className="no-print">
-        <button
-          onClick={() => setActiveTab('wizard')}
-          style={{
-            padding: '10px 4px',
-            border: 'none',
-            background: 'transparent',
-            color: activeTab === 'wizard' ? 'var(--secondary)' : 'var(--text-muted)',
-            fontWeight: activeTab === 'wizard' ? 600 : 500,
-            borderBottom: activeTab === 'wizard' ? '2px solid var(--secondary)' : 'none',
-            cursor: 'pointer',
-            fontSize: '0.9rem'
-          }}
-        >
-          🔌 Connection Wizard
-        </button>
-        <button
-          onClick={() => setActiveTab('explorer')}
-          style={{
-            padding: '10px 4px',
-            border: 'none',
-            background: 'transparent',
-            color: activeTab === 'explorer' ? 'var(--secondary)' : 'var(--text-muted)',
-            fontWeight: activeTab === 'explorer' ? 600 : 500,
-            borderBottom: activeTab === 'explorer' ? '2px solid var(--secondary)' : 'none',
-            cursor: 'pointer',
-            fontSize: '0.9rem'
-          }}
-        >
-          📁 Database Explorer
-        </button>
-        <button
-          onClick={() => setActiveTab('monitor')}
-          style={{
-            padding: '10px 4px',
-            border: 'none',
-            background: 'transparent',
-            color: activeTab === 'monitor' ? 'var(--secondary)' : 'var(--text-muted)',
-            fontWeight: activeTab === 'monitor' ? 600 : 500,
-            borderBottom: activeTab === 'monitor' ? '2px solid var(--secondary)' : 'none',
-            cursor: 'pointer',
-            fontSize: '0.9rem'
-          }}
-        >
-          📈 Monitor & Stats
-        </button>
-        <button
-          onClick={() => setActiveTab('logs')}
-          style={{
-            padding: '10px 4px',
-            border: 'none',
-            background: 'transparent',
-            color: activeTab === 'logs' ? 'var(--secondary)' : 'var(--text-muted)',
-            fontWeight: activeTab === 'logs' ? 600 : 500,
-            borderBottom: activeTab === 'logs' ? '2px solid var(--secondary)' : 'none',
-            cursor: 'pointer',
-            fontSize: '0.9rem'
-          }}
-        >
-          📋 Transaction Logs
-        </button>
+      <div style={{ display: 'flex', borderBottom: '1px solid var(--border)', gap: '16px', marginBottom: '8px', justifyContent: 'space-between', alignItems: 'center' }} className="no-print">
+        <div style={{ display: 'flex', gap: '16px' }}>
+          <button
+            onClick={() => setActiveTab('wizard')}
+            style={{
+              padding: '10px 4px',
+              border: 'none',
+              background: 'transparent',
+              color: activeTab === 'wizard' ? 'var(--secondary)' : 'var(--text-muted)',
+              fontWeight: activeTab === 'wizard' ? 600 : 500,
+              borderBottom: activeTab === 'wizard' ? '2px solid var(--secondary)' : 'none',
+              cursor: 'pointer',
+              fontSize: '0.9rem'
+            }}
+          >
+            🔌 Connection Wizard
+          </button>
+          <button
+            onClick={() => setActiveTab('explorer')}
+            style={{
+              padding: '10px 4px',
+              border: 'none',
+              background: 'transparent',
+              color: activeTab === 'explorer' ? 'var(--secondary)' : 'var(--text-muted)',
+              fontWeight: activeTab === 'explorer' ? 600 : 500,
+              borderBottom: activeTab === 'explorer' ? '2px solid var(--secondary)' : 'none',
+              cursor: 'pointer',
+              fontSize: '0.9rem'
+            }}
+          >
+            📁 Database Explorer
+          </button>
+          <button
+            onClick={() => setActiveTab('monitor')}
+            style={{
+              padding: '10px 4px',
+              border: 'none',
+              background: 'transparent',
+              color: activeTab === 'monitor' ? 'var(--secondary)' : 'var(--text-muted)',
+              fontWeight: activeTab === 'monitor' ? 600 : 500,
+              borderBottom: activeTab === 'monitor' ? '2px solid var(--secondary)' : 'none',
+              cursor: 'pointer',
+              fontSize: '0.9rem'
+            }}
+          >
+            📈 Monitor & Stats
+          </button>
+          <button
+            onClick={() => setActiveTab('logs')}
+            style={{
+              padding: '10px 4px',
+              border: 'none',
+              background: 'transparent',
+              color: activeTab === 'logs' ? 'var(--secondary)' : 'var(--text-muted)',
+              fontWeight: activeTab === 'logs' ? 600 : 500,
+              borderBottom: activeTab === 'logs' ? '2px solid var(--secondary)' : 'none',
+              cursor: 'pointer',
+              fontSize: '0.9rem'
+            }}
+          >
+            📋 Transaction Logs
+          </button>
+        </div>
+        <div style={{ paddingBottom: '4px' }}>
+          <RefreshButton isRefreshing={isRefreshing} onClick={handleRefresh} toast={refreshToast} id="refresh-btn-cloudsync" />
+        </div>
       </div>
 
       {/* 1. Connection Wizard Tab */}
@@ -1483,6 +1531,11 @@ export default function CloudSync({ user }) {
                 </div>
 
                 <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '24px', gap: '12px' }}>
+                  {!isReadOnly && selectedTable && (
+                    <button className="btn btn-danger" onClick={() => setShowResetMappingConfirm(true)} style={{ marginRight: 'auto' }}>
+                      🗑️ Reset Mapping
+                    </button>
+                  )}
                   <button className="btn btn-secondary" onClick={() => setWizardStep(5)}>« Back</button>
                   {isReadOnly ? (
                     <button className="btn btn-primary" onClick={() => setWizardStep(7)}>Continue »</button>
@@ -2069,6 +2122,32 @@ export default function CloudSync({ user }) {
             </div>
           </div>
 
+        </div>
+      )}
+      {showResetMappingConfirm && (
+        <div className="modal-overlay" style={{ zIndex: 1200 }}>
+          <div className="modal-container" style={{ maxWidth: '400px', width: '100%', borderRadius: 'var(--radius-md)', overflow: 'hidden' }}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '16px 20px',
+              borderBottom: '1px solid var(--border)',
+              background: 'var(--surface)',
+            }}>
+              <h3 style={{ color: 'var(--error)', margin: 0, fontSize: '1rem', fontWeight: 700 }}>⚠ Confirm Action</h3>
+              <button onClick={() => setShowResetMappingConfirm(false)} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', fontSize: '1.4rem', cursor: 'pointer', lineHeight: 1 }}>×</button>
+            </div>
+            <div style={{ padding: '20px 24px', background: 'var(--card-bg)' }}>
+              <p style={{ color: 'var(--text)', fontSize: '0.9rem', lineHeight: 1.6, margin: '0 0 20px' }}>
+                Are you sure you want to reset/delete the database column mapping configuration? This action cannot be undone.
+              </p>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <button className="btn btn-secondary" onClick={() => setShowResetMappingConfirm(false)} style={{ flex: 1 }}>Cancel</button>
+                <button className="btn btn-danger" onClick={handleResetMapping} style={{ flex: 1 }}>Delete</button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 

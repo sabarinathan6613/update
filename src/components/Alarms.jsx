@@ -1,7 +1,9 @@
 // src/components/Alarms.jsx
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { getPlants, getHistorianData, getTagConfigs } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
+import { useRefresh } from '../utils/useRefresh';
+import RefreshButton from './RefreshButton';
 
 export default function Alarms() {
   const { currentPlantId, refreshTrigger } = useSimulator();
@@ -20,55 +22,59 @@ export default function Alarms() {
   });
 
   // Load plants and fetch alarms from database historian records
+  const fetchAlarmData = useCallback(async () => {
+    const plist = await getPlants();
+    setPlantsList(plist);
+
+    try {
+      const records = await getHistorianData({ limit: 1000 });
+      const configs = await getTagConfigs();
+      const configMap = {};
+      configs.forEach(c => { configMap[c.TagIndex] = c; });
+
+      // Filter database records for non-normal quality (Status !== 192) or explicit Marker alerts
+      const anomalies = records.filter(r => r.Status !== 192 || (r.Marker && r.Marker.trim() !== ''));
+
+      // Map historian records directly to structured alarm events
+      const mappedAlarms = anomalies.map(r => {
+        const config = configMap[r.TagIndex] || { TagName: `Tag Index ${r.TagIndex}`, Unit: '' };
+        const isAcked = acknowledgedIds.includes(`alarm-${r.DateAndTime}-${r.TagIndex}`);
+        
+        let severity = 'INFO';
+        if (r.Status === 0) severity = 'CRITICAL';
+        else if (r.Status === 128) severity = 'WARNING';
+        else if (r.Marker && r.Marker.toUpperCase().includes('FAIL')) severity = 'CRITICAL';
+
+        const reason = r.Marker 
+          ? `${config.TagName}: ${r.Marker}`
+          : `${config.TagName} Status Fault (Code ${r.Status})`;
+
+        return {
+          id: `alarm-${r.DateAndTime}-${r.TagIndex}`,
+          plantId: currentPlantId, // Scope dynamically to active selected plant for supervisor view
+          time: new Date(r.DateAndTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          timestamp: r.DateAndTime,
+          reason: reason,
+          severity: severity,
+          acknowledged: isAcked,
+          duration: Math.min(60, Math.floor((Date.now() - new Date(r.DateAndTime).getTime()) / 60000)) || 5, // time difference in mins
+          shift: new Date(r.DateAndTime).getHours() >= 8 && new Date(r.DateAndTime).getHours() < 16 ? 'Shift A' : 'Shift B'
+        };
+      });
+
+      setActiveAlarms(mappedAlarms.filter(a => !a.acknowledged));
+      setHistoryData(mappedAlarms);
+    } catch (err) {
+      console.error("Failed to query historian database for alarms:", err);
+      throw err;
+    }
+  }, [currentPlantId, acknowledgedIds]);
+
+  const { isRefreshing, refreshToast, handleRefresh } = useRefresh(fetchAlarmData, 'Alarms');
+
   useEffect(() => {
-    const loadAlarmData = async () => {
-      const plist = await getPlants();
-      setPlantsList(plist);
-
-      try {
-        const records = await getHistorianData({ limit: 1000 });
-        const configs = await getTagConfigs();
-        const configMap = {};
-        configs.forEach(c => { configMap[c.TagIndex] = c; });
-
-        // Filter database records for non-normal quality (Status !== 192) or explicit Marker alerts
-        const anomalies = records.filter(r => r.Status !== 192 || (r.Marker && r.Marker.trim() !== ''));
-
-        // Map historian records directly to structured alarm events
-        const mappedAlarms = anomalies.map(r => {
-          const config = configMap[r.TagIndex] || { TagName: `Tag Index ${r.TagIndex}`, Unit: '' };
-          const isAcked = acknowledgedIds.includes(`alarm-${r.DateAndTime}-${r.TagIndex}`);
-          
-          let severity = 'INFO';
-          if (r.Status === 0) severity = 'CRITICAL';
-          else if (r.Status === 128) severity = 'WARNING';
-          else if (r.Marker && r.Marker.toUpperCase().includes('FAIL')) severity = 'CRITICAL';
-
-          const reason = r.Marker 
-            ? `${config.TagName}: ${r.Marker}`
-            : `${config.TagName} Status Fault (Code ${r.Status})`;
-
-          return {
-            id: `alarm-${r.DateAndTime}-${r.TagIndex}`,
-            plantId: currentPlantId, // Scope dynamically to active selected plant for supervisor view
-            time: new Date(r.DateAndTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-            timestamp: r.DateAndTime,
-            reason: reason,
-            severity: severity,
-            acknowledged: isAcked,
-            duration: Math.min(60, Math.floor((Date.now() - new Date(r.DateAndTime).getTime()) / 60000)) || 5, // time difference in mins
-            shift: new Date(r.DateAndTime).getHours() >= 8 && new Date(r.DateAndTime).getHours() < 16 ? 'Shift A' : 'Shift B'
-          };
-        });
-
-        setActiveAlarms(mappedAlarms.filter(a => !a.acknowledged));
-        setHistoryData(mappedAlarms);
-      } catch (err) {
-        console.error("Failed to query historian database for alarms:", err);
-      }
-    };
-    loadAlarmData();
-  }, [currentPlantId, refreshTrigger, acknowledgedIds]);
+    fetchAlarmData().catch(() => {});
+  }, [fetchAlarmData, refreshTrigger]);
 
   // Filter alarms based on current active plant selection in Layout
   const filteredActiveAlarms = useMemo(() => {
@@ -109,6 +115,24 @@ export default function Alarms() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+      
+      {/* ── Page Header ─────────────────────── */}
+      <div className="page-header">
+        <div>
+          <h2 style={{ margin: 0, fontSize: '1.55rem', fontWeight: 700, color: 'var(--text)', letterSpacing: '-0.3px' }}>Industrial Alarm Logs & Diagnostics</h2>
+          <p style={{ margin: '4px 0 0', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+            Real-time process anomaly logging, alarm state acknowledgements, and telemetry event history.
+          </p>
+        </div>
+        <div className="page-header-actions">
+          <RefreshButton
+            isRefreshing={isRefreshing}
+            onClick={handleRefresh}
+            toast={refreshToast}
+            id="refresh-btn-alarms"
+          />
+        </div>
+      </div>
       
       {/* Sub navigation tabs */}
       <div style={{ display: 'flex', borderBottom: '1px solid var(--border)', gap: '16px', marginBottom: '8px' }} className="no-print">

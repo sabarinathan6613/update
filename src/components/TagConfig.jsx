@@ -1,8 +1,10 @@
 // src/components/TagConfig.jsx
-import { useState, useEffect } from 'react';
-import { getTagConfigs, saveTagConfigs, getSettings, saveSettings, getHistorianData } from '../utils/db';
+import { useState, useEffect, useRef } from 'react';
+import { getTagConfigs, saveTagConfigs, getSettings, saveSettings, getHistorianData, getSampleStationMapping, saveSampleStationMapping } from '../utils/db';
 import { getSupabaseClient, getSupabaseConfig } from '../utils/supabaseClient';
 import { useSimulator } from '../utils/SimulatorContext';
+import { getLatestRecord } from '../utils/historianService';
+import ScrollableTagList from './ScrollableTagList';
 
 /* ─── SVG Icon Components ─────────────────────────────────────────── */
 const EditIcon = () => (
@@ -60,21 +62,35 @@ const SavingSpinner = () => (
 );
 
 /* ─── ToggleSwitch helper ─────────────────────────────────────────── */
-function ToggleSwitch({ id, checked, onChange, disabled }) {
+function ToggleSwitch({ id, checked, onChange, disabled, loading }) {
   return (
-    <label className="toggle-switch" htmlFor={id} style={{ opacity: disabled ? 0.55 : 1, cursor: disabled ? 'not-allowed' : 'pointer' }}>
-      <input id={id} type="checkbox" checked={checked} onChange={disabled ? undefined : onChange} disabled={disabled} />
-      <span className="toggle-track" />
-    </label>
+    <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
+      <label className="toggle-switch" htmlFor={id} style={{ opacity: loading ? 0.5 : disabled ? 0.55 : 1, cursor: (disabled || loading) ? 'not-allowed' : 'pointer' }}>
+        <input id={id} type="checkbox" checked={checked} onChange={(disabled || loading) ? undefined : onChange} disabled={disabled || loading} />
+        <span className="toggle-track" />
+      </label>
+      {loading && (
+        <div style={{ position: 'absolute', display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>
+          <SavingSpinner />
+        </div>
+      )}
+    </div>
   );
 }
 
 /* ═══════════════════════════════════════════════════════════════════ */
-export default function TagConfig({ user }) {
-  const { refreshTrigger, dbConnectionStatus } = useSimulator();
-  const isReadOnly = user?.role === 'Admin';
+export default function TagConfig({ user, isActive }) {
+  const { refreshTrigger, dbConnectionStatus, setRefreshTrigger } = useSimulator();
+  const tableContainerRef = useRef(null);
+  const initialScrollSetRef = useRef(false);
+  const isSuperAdmin = user?.role === 'Super Admin';
+  const isAdmin = user?.role === 'Admin';
+  const canAddOrDelete = isSuperAdmin;
+  const canEditOrToggle = isSuperAdmin || isAdmin;
+  const isReadOnly = !canEditOrToggle;
   const [activeTab, setActiveTab]     = useState('tags');
   const [tagConfigs, setTagConfigs]   = useState([]);
+  const [isLoadingData, setIsLoadingData] = useState(true);
   const [dashboardTags, setDashboardTags] = useState([]);
   const [showModal, setShowModal]     = useState(false);
   const [editingTag, setEditingTag]   = useState(null);
@@ -86,28 +102,18 @@ export default function TagConfig({ user }) {
   const [settings, setSettings]       = useState({});
 
   // Interactive visibility toggles states
-  const [savingToggleId, setSavingToggleId] = useState(null);
+  const [savingKeys, setSavingKeys] = useState(new Set());
   const [saveStatusMsg, setSaveStatusMsg] = useState(null);
-
-  // History and Test mapping modal states
-  const [viewingHistoryTag, setViewingHistoryTag] = useState(null);
-  const [allRecentRecords, setAllRecentRecords] = useState([]);
-  const [loadingHistoryId, setLoadingHistoryId] = useState(null);
-  const [testingMappingId, setTestingMappingId] = useState(null);
-  const [testResult, setTestResult] = useState(null);
-
-  const [dbError, setDbError] = useState(null);
 
   /* ── Load data ──────────────────────────────────────────────────── */
   useEffect(() => {
     const loadConfigData = async () => {
       setDbError(null);
       try {
-        const configs  = await getTagConfigs();
+        const configs  = await getTagConfigs({ forceRefresh: true });
         setTagConfigs(configs.sort((a, b) => a.TagIndex - b.TagIndex));
         const sysSettings = await getSettings();
         setSettings(sysSettings);
-        setDashboardTags(sysSettings.dashboardTags || []);
 
         const isConnected = getSupabaseConfig() !== null;
         const supabase = getSupabaseClient();
@@ -121,10 +127,12 @@ export default function TagConfig({ user }) {
         console.error('loadConfigData error:', err);
       }
     };
+
     loadConfigData();
   }, [refreshTrigger]);
 
   useEffect(() => {
+    if (!isActive) return;
     const checkTagStatuses = async () => {
       if (tagConfigs.length === 0) return;
       const newStatuses = {};
@@ -132,46 +140,61 @@ export default function TagConfig({ user }) {
       const newCounts = {};
 
       try {
-        const allData = await getHistorianData();
-        const latestRecordByTag = {};
+        const isConnected = getSupabaseConfig() !== null;
+        const supabase = getSupabaseClient();
+        if (isConnected && supabase && settings) {
+          const tableName = settings.selectedTable || 'Database';
+          const tagCol = settings.columnMappings?.tagCol || 'TagIndex';
 
-        allData.forEach(r => {
-          if (r.TagIndex !== undefined && r.TagIndex !== null) {
-            newCounts[r.TagIndex] = (newCounts[r.TagIndex] || 0) + 1;
-            if (!latestRecordByTag[r.TagIndex]) {
-              latestRecordByTag[r.TagIndex] = r;
+          for (const tag of tagConfigs) {
+            const index = tag.TagIndex;
+            if (index === undefined || index === null || isNaN(index) || index < 0) {
+              newStatuses[index] = 'Invalid TagIndex';
+              continue;
             }
-          }
-        });
 
-        const now = Date.now();
-        tagConfigs.forEach(tag => {
-          const index = tag.TagIndex;
-          if (index === undefined || index === null || isNaN(index) || index < 0) {
-            newStatuses[index] = 'Invalid TagIndex';
-            return;
-          }
+            const strIdx = String(index).trim();
+            const targetIndexes = [index, strIdx, `T${strIdx}`, `t${strIdx}`];
+            if (!isNaN(index)) {
+              targetIndexes.push(parseInt(index, 10));
+            }
+            const uniqueIndexes = [...new Set(targetIndexes)].filter(x => x !== null && x !== undefined && x !== '');
 
-          const record = latestRecordByTag[index];
-          if (!record) {
-            newStatuses[index] = 'No Data Found';
-          } else {
-            newPreviews[index] = {
-              val: record.Val,
-              timestamp: record.DateAndTime,
-              status: record.Status
-            };
-            const recTime = new Date(record.DateAndTime).getTime();
-            const ageSeconds = (now - recTime) / 1000;
-            if (record.Status === 0) {
-              newStatuses[index] = 'Sync Error';
-            } else if (ageSeconds <= 60) {
-              newStatuses[index] = 'Active';
+            // 1. Query latest record from the actual database
+            const latestRecord = await getLatestRecord(supabase, tableName, index, settings.columnMappings || {}, false, settings);
+
+            // 2. Query exact count of rows for this tag index
+            const { count, error: countErr } = await supabase
+              .from(tableName)
+              .select('*', { count: 'exact', head: true })
+              .in(tagCol, uniqueIndexes);
+
+            if (countErr) {
+              console.warn(`[TagConfig Status Check] Count query failed for TagIndex ${index}:`, countErr);
+            }
+
+            if (latestRecord) {
+              newPreviews[index] = {
+                val: latestRecord.Val,
+                timestamp: latestRecord.DateAndTime,
+                status: latestRecord.Status
+              };
+              const recTime = new Date(latestRecord.DateAndTime).getTime();
+              const ageSeconds = (Date.now() - recTime) / 1000;
+              if (latestRecord.Status === 0) {
+                newStatuses[index] = 'Sync Error';
+              } else if (ageSeconds <= 60) {
+                newStatuses[index] = 'Active';
+              } else {
+                newStatuses[index] = 'Connected';
+              }
             } else {
-              newStatuses[index] = 'Connected';
+              newStatuses[index] = 'No Data Found';
             }
+
+            newCounts[index] = count || 0;
           }
-        });
+        }
       } catch (err) {
         console.error("Error checking tag statuses:", err);
         tagConfigs.forEach(tag => {
@@ -184,7 +207,7 @@ export default function TagConfig({ user }) {
       setLastSyncTime(new Date());
     };
     checkTagStatuses();
-  }, [tagConfigs, refreshTrigger]);
+  }, [tagConfigs, refreshTrigger, settings, isActive]);
 
   /* ── Handlers ───────────────────────────────────────────────────── */
   const handleEditOpen = (tag) => {
@@ -202,6 +225,11 @@ export default function TagConfig({ user }) {
       DashboardVisible: false,
       TrendsVisible: false,
       ReportsVisible: false,
+      SampleDatalog: false,
+      DowntimeDatalog: false,
+      IncludeInPDF: true,
+      IncludeInExcel: true,
+      ActiveStatus: true,
       isNew: true
     });
     setShowModal(true);
@@ -211,6 +239,10 @@ export default function TagConfig({ user }) {
     e.preventDefault();
     if (isReadOnly) return;
     if (editingTag.isNew) {
+      if (!canAddOrDelete) {
+        alert('Unauthorized: You do not have permission to add new tags.');
+        return;
+      }
       const indexNum = parseInt(editingTag.TagIndex);
       if (isNaN(indexNum)) { alert('Tag Index must be a valid number.'); return; }
       if (tagConfigs.some(t => t.TagIndex === indexNum)) {
@@ -223,10 +255,16 @@ export default function TagConfig({ user }) {
         Unit: editingTag.Unit,
         Description: editingTag.Description,
         DecimalPlaces: editingTag.DecimalPlaces,
-        DashboardVisible: editingTag.DashboardVisible,
-        TrendsVisible: editingTag.TrendsVisible,
-        ReportsVisible: editingTag.ReportsVisible
+        DashboardVisible: editingTag.DashboardVisible ?? false,
+        TrendsVisible: editingTag.TrendsVisible ?? false,
+        ReportsVisible: editingTag.ReportsVisible ?? false,
+        SampleDatalog: editingTag.SampleDatalog ?? false,
+        DowntimeDatalog: editingTag.DowntimeDatalog ?? false,
+        IncludeInPDF: editingTag.IncludeInPDF ?? true,
+        IncludeInExcel: editingTag.IncludeInExcel ?? true,
+        ActiveStatus: editingTag.ActiveStatus ?? true
       };
+
       const updatedConfigs = [...tagConfigs, newTag].sort((a, b) => a.TagIndex - b.TagIndex);
       setTagConfigs(updatedConfigs);
       await saveTagConfigs(updatedConfigs);
@@ -309,6 +347,43 @@ export default function TagConfig({ user }) {
       }, 4000);
     }
   };
+
+  const handleSampleColumnChange = async (tagIndex, columnName) => {
+    if (isReadOnly) return;
+    const updatedConfigs = tagConfigs.map(t => {
+      if (t.TagIndex === tagIndex) {
+        return { ...t, SampleColumn: columnName };
+      }
+      return t;
+    });
+    setTagConfigs(updatedConfigs);
+    setSavingToggleId(`${tagIndex}-SampleColumn`);
+    setSaveStatusMsg(null);
+
+    try {
+      await saveTagConfigs(updatedConfigs);
+      setSavingToggleId(null);
+      setSaveStatusMsg({
+        type: 'success',
+        text: `Updated Sample Column for Tag #${tagIndex} to "${columnName}".`
+      });
+      setTimeout(() => {
+        setSaveStatusMsg(prev => (prev && prev.text.includes(tagIndex.toString()) && prev.text.includes('Sample Column')) ? null : prev);
+      }, 3000);
+    } catch (err) {
+      console.error("Failed to save Sample Column:", err);
+      setSavingToggleId(null);
+      setSaveStatusMsg({
+        type: 'error',
+        text: `Failed to update Sample Column for Tag #${tagIndex}.`
+      });
+      setTimeout(() => {
+        setSaveStatusMsg(prev => (prev && prev.text.includes(tagIndex.toString())) ? null : prev);
+      }, 4000);
+    }
+  };
+
+
 
   const handleDeleteTag = async (tagIndex) => {
     if (isReadOnly) return;
@@ -453,6 +528,104 @@ export default function TagConfig({ user }) {
     flexShrink:     0,
   };
 
+  const renderToggle = (tag, field) => {
+    const isSaving = savingToggleId === `${tag.TagIndex}-${field}`;
+    if (isSaving) {
+      return (
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '24px' }}>
+          <SavingSpinner />
+        </div>
+      );
+    }
+    let checked = false;
+    if (field === 'DashboardKPI') {
+      checked = tag.DashboardKPI !== undefined ? tag.DashboardKPI : !!tag.DashboardVisible;
+    } else if (field === 'IncludeInPDF') {
+      checked = tag.IncludeInPDF !== undefined ? tag.IncludeInPDF : !!tag.ReportsVisible;
+    } else if (field === 'IncludeInExcel') {
+      checked = tag.IncludeInExcel !== undefined ? tag.IncludeInExcel : !!tag.ReportsVisible;
+    } else if (field === 'ActiveStatus') {
+      checked = tag.ActiveStatus !== undefined ? tag.ActiveStatus : true;
+    } else if (field === 'DashboardVisible') {
+      checked = !!tag.DashboardVisible;
+    } else {
+      checked = !!tag[field];
+    }
+
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+        <ToggleSwitch
+          id={`tbl-${field}-${tag.TagIndex}`}
+          checked={checked}
+          onChange={() => handleToggleVisibility(tag.TagIndex, field)}
+          disabled={isReadOnly}
+        />
+      </div>
+    );
+  };
+
+  const renderSampleDatalogCell = (tag) => {
+    const isSaving = savingToggleId === `${tag.TagIndex}-SampleDatalog`;
+    const isSavingCol = savingToggleId === `${tag.TagIndex}-SampleColumn`;
+
+    if (isSaving) {
+      return (
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '24px' }}>
+          <SavingSpinner />
+        </div>
+      );
+    }
+
+    const checked = !!tag.SampleDatalog;
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', justifyContent: 'center' }}>
+        <ToggleSwitch
+          id={`tbl-SampleDatalog-${tag.TagIndex}`}
+          checked={checked}
+          onChange={() => handleToggleVisibility(tag.TagIndex, 'SampleDatalog')}
+          disabled={isReadOnly}
+        />
+        {isSavingCol ? (
+          <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '28px' }}>
+            <SavingSpinner />
+          </div>
+        ) : (
+          <select
+            className="form-control"
+            style={{
+              fontSize: '0.78rem',
+              padding: '4px 8px',
+              height: '28px',
+              minWidth: '160px',
+              marginTop: '4px',
+              border: '1px solid var(--border)',
+              borderRadius: '4px',
+              background: 'var(--card-bg)',
+              color: 'var(--text)',
+              opacity: checked ? 1 : 0.5,
+              cursor: checked ? 'pointer' : 'not-allowed',
+              textAlignLast: 'center'
+            }}
+            value={checked ? (tag.SampleColumn || 'Not Assigned') : 'Not Assigned'}
+            disabled={!checked || isReadOnly}
+            onChange={async (e) => {
+              await handleSampleColumnChange(tag.TagIndex, e.target.value);
+            }}
+          >
+            <option value="Not Assigned">Not Assigned</option>
+            <option value="Shift ID">Shift ID</option>
+            <option value="Shift Cumulative Tonnes">Shift Cumulative Tonnes</option>
+            <option value="Stockpile Tonnes">Stockpile Tonnes</option>
+            <option value="FingerID">FingerID</option>
+            <option value="CutID">CutID</option>
+            <option value="Material">Material</option>
+          </select>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '0' }}>
 
@@ -492,44 +665,7 @@ export default function TagConfig({ user }) {
         }
       `}</style>
 
-      {/* ── Sub-tab navigation ──────────────────────────────────────── */}
-      <div
-        className="no-print"
-        style={{ display: 'flex', borderBottom: '1px solid var(--border)', gap: '4px', marginBottom: '24px' }}
-      >
-        {[
-          { key: 'tags', label: '⚙️ Tag Configuration Parameters' },
-          {
-            key: 'kpis',
-            label: `📊 Dashboard KPI Selection (${dashboardTags.filter(id => eligibleKpiTags.some(t => t.TagIndex === id)).length} Selected)`
-          }
-        ].map(tab => (
-          <button
-            key={tab.key}
-            onClick={() => setActiveTab(tab.key)}
-            style={{
-              padding:       '10px 16px',
-              border:        'none',
-              borderBottom:  activeTab === tab.key ? '2px solid var(--secondary)' : '2px solid transparent',
-              background:    'transparent',
-              color:         activeTab === tab.key ? 'var(--secondary)' : 'var(--text-muted)',
-              fontWeight:    activeTab === tab.key ? 600 : 500,
-              cursor:        'pointer',
-              fontSize:      '0.875rem',
-              transition:    'color 0.15s',
-              whiteSpace:    'nowrap',
-            }}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
-
-      {/* ══════════════════════════════════════════════════════════════
-          TAB 1 — Tag Configuration
-      ══════════════════════════════════════════════════════════════ */}
-      {activeTab === 'tags' && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
 
           {/* Page header */}
           <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px', flexWrap: 'wrap' }}>
@@ -568,7 +704,7 @@ export default function TagConfig({ user }) {
                   {dbConnectionStatus}
                 </span>
               </div>
-              {!isReadOnly && (
+              {canAddOrDelete && (
                 <button
                   onClick={handleAddNewOpen}
                   className="btn btn-primary"
@@ -713,7 +849,22 @@ export default function TagConfig({ user }) {
 
           {/* Table card */}
           <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
-            {tagConfigs.length === 0 ? (
+            {isLoadingData ? (
+              <div style={{
+                display:        'flex',
+                flexDirection:  'column',
+                alignItems:     'center',
+                justifyContent: 'center',
+                padding:        '72px 24px',
+                gap:            '14px',
+                textAlign:      'center',
+              }}>
+                <SavingSpinner />
+                <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                  Loading tag configurations...
+                </span>
+              </div>
+            ) : tagConfigs.length === 0 ? (
               /* Empty state */
               <div style={{
                 display:        'flex',
@@ -733,7 +884,7 @@ export default function TagConfig({ user }) {
                     Add your first tag to begin mapping historian data channels.
                   </p>
                 </div>
-                {!isReadOnly && (
+                {canAddOrDelete && (
                   <button
                     onClick={handleAddNewOpen}
                     className="btn btn-primary"
@@ -745,7 +896,7 @@ export default function TagConfig({ user }) {
               </div>
             ) : (
               /* Data table */
-              <div className="table-responsive" style={{ overflowX: 'auto', width: '100%', maxHeight: '550px', background: 'var(--card-bg)' }}>
+              <ScrollableTagList className="table-responsive" style={{ overflowX: 'auto', width: '100%', maxHeight: '550px', background: 'var(--card-bg)' }}>
                 <table className="table" style={{ borderCollapse: 'collapse', width: '100%', minWidth: '1350px' }}>
                   <thead>
                     <tr>
@@ -832,8 +983,12 @@ export default function TagConfig({ user }) {
 
                         {/* LAST VALUE */}
                         <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', fontFamily: 'var(--mono)', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap', textAlign: 'right' }}>
-                          {previews[tag.TagIndex] !== undefined && previews[tag.TagIndex].val !== null ? (
-                            `${previews[tag.TagIndex].val.toFixed(tag.DecimalPlaces ?? 2)}`
+                          {previews[tag.TagIndex] !== undefined && previews[tag.TagIndex].val !== null && previews[tag.TagIndex].val !== undefined ? (
+                            typeof previews[tag.TagIndex].val === 'number' ? (
+                              `${previews[tag.TagIndex].val.toFixed(tag.DecimalPlaces ?? 2)}`
+                            ) : (
+                              `${previews[tag.TagIndex].val}`
+                            )
                           ) : (
                             <span style={{ opacity: 0.35 }}>—</span>
                           )}
@@ -865,7 +1020,7 @@ export default function TagConfig({ user }) {
                               bg = 'rgba(16, 185, 129, 0.1)';
                               color = 'var(--success)';
                               border = '1px solid rgba(16, 185, 129, 0.25)';
-                            } else if (status === 'No Data Found') {
+                            } else if (status === 'No Data Found' || status.startsWith('No records')) {
                               bg = 'rgba(245, 158, 11, 0.1)';
                               color = 'var(--warning)';
                               border = '1px solid rgba(245, 158, 11, 0.25)';
@@ -1019,85 +1174,175 @@ export default function TagConfig({ user }) {
                     ))}
                   </tbody>
                 </table>
-              </div>
+              </ScrollableTagList>
             )}
           </div>
-        </div>
-      )}
-
-      {/* ══════════════════════════════════════════════════════════════
-          TAB 2 — Dashboard KPI Selection
-      ══════════════════════════════════════════════════════════════ */}
-      {activeTab === 'kpis' && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-
-          {/* Header */}
-          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px', flexWrap: 'wrap' }}>
-            <div>
-              <h2 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 700, color: 'var(--text)', letterSpacing: '-0.01em' }}>
-                Dashboard KPI Annunciators
-              </h2>
-              <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                Select up to 5 dashboard-visible tags to display as KPI cards.
-              </p>
-            </div>
-            {!isReadOnly && (
-              <button onClick={handleSaveDashboardKpis} className="btn btn-primary" style={{ flexShrink: 0 }}>
-                💾 Save KPI Selection
-              </button>
-            )}
-          </div>
-
-          <div className="card" style={{ padding: '24px' }}>
-            {eligibleKpiTags.length === 0 ? (
-              <div style={{ padding: '40px 0', textAlign: 'center' }}>
-                <p style={{ fontSize: '0.9rem', color: 'var(--text)', margin: 0 }}>No dashboard-visible tags found.</p>
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '6px' }}>
-                  Go to "Tag Configuration Parameters" and enable Dashboard visibility on at least one tag.
+          
+          {/* ── Sample Station Mapping Table ─────────────────── */}
+          {tagConfigs.some(t => t.SampleDatalog || t.sample_datalog_enabled || t.sample_station) && (
+            <div className="card" style={{ marginTop: '24px', padding: '20px', overflow: 'visible' }}>
+              <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '10px', marginBottom: '16px' }}>
+                <h3 style={{ margin: 0, fontSize: '0.95rem', fontWeight: 700, color: 'var(--text)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                  📋 SAMPLE STATION MAPPING
+                </h3>
+                <p style={{ margin: '4px 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                  Assign roles to Sample Station-enabled tags. Multiple tags can be assigned as Sample Tags.
                 </p>
               </div>
-            ) : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '12px' }}>
-                {eligibleKpiTags.map((tag) => {
-                  const isSelected = dashboardTags.includes(tag.TagIndex);
+
+              {(() => {
+                const enabledSampleTags = tagConfigs.filter(t => (t.ActiveStatus !== false) && (t.SampleDatalog || t.sample_datalog_enabled || t.sample_station));
+
+                if (enabledSampleTags.length === 0) {
                   return (
-                    <div
-                      key={tag.TagIndex}
-                      onClick={() => handleKpiToggle(tag.TagIndex)}
-                      style={{
-                        padding:         '16px',
-                        borderRadius:    'var(--radius-sm)',
-                        border:          isSelected ? '1.5px solid var(--secondary)' : '1px solid var(--border)',
-                        backgroundColor: isSelected ? 'rgba(14,165,233,0.06)' : 'var(--background)',
-                        cursor:          'pointer',
-                        transition:      'all 0.15s',
-                        display:         'flex',
-                        alignItems:      'center',
-                        justifyContent:  'space-between',
-                      }}
-                    >
-                      <div>
-                        <span className="tag-pill" style={{ marginBottom: '6px', display: 'inline-block' }}>
-                          #{tag.TagIndex}
-                        </span>
-                        <strong style={{ display: 'block', color: 'var(--text)', fontSize: '0.9rem', marginTop: '4px' }}>
-                          {tag.TagName}
-                        </strong>
-                        {tag.Unit && (
-                          <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>{tag.Unit}</span>
-                        )}
-                      </div>
-                      <span style={{ fontSize: '1.1rem', color: isSelected ? 'var(--secondary)' : 'var(--border)', flexShrink: 0 }}>
-                        {isSelected ? '✓' : '○'}
-                      </span>
+                    <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.82rem', fontStyle: 'italic' }}>
+                      No Sample Station tags enabled. Enable the Sample Station toggle for historian tags in the table above to configure roles.
                     </div>
                   );
-                })}
-              </div>
-            )}
-          </div>
+                }
+
+                return (
+                  <div className="table-responsive" style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+                    <table className="table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+                      <thead>
+                        <tr style={{ background: 'var(--surface)', borderBottom: '1px solid var(--border)' }}>
+                          <th style={{ padding: '10px 14px', textAlign: 'left', fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>TAG</th>
+                          <th style={{ padding: '10px 14px', textAlign: 'left', fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>CIRCUIT</th>
+                          <th style={{ padding: '10px 14px', textAlign: 'left', fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>ROLE</th>
+                          <th style={{ padding: '10px 14px', textAlign: 'left', fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>STATUS</th>
+                          <th style={{ padding: '10px 14px', textAlign: 'left', fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>ACTION</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {enabledSampleTags.map((tag) => {
+                          const currentRole = getRoleForTag(tag.TagIndex);
+                          const currentCircuit = getCircuitForTag(tag.TagIndex);
+
+                          const savedRole = getRoleForTagFromObj(savedSsAssignments, tag.TagIndex);
+                          const savedCircuit = getCircuitForTagFromObj(savedSsAssignments, tag.TagIndex);
+
+                          // Enable save button only when row has unsaved modifications
+                          const hasRowChanges = (currentRole !== savedRole) || (currentCircuit !== savedCircuit);
+                          const numIdx = Number(tag.TagIndex);
+
+                          // Calculate status text and color
+                          let statusText = 'Saved';
+                          let statusColor = 'var(--success)';
+                          if (rowSaving[numIdx]) {
+                            statusText = 'Saving...';
+                            statusColor = 'var(--accent)';
+                          } else if (rowErrors[numIdx]) {
+                            statusText = 'Failed';
+                            statusColor = 'var(--error)';
+                          } else if (hasRowChanges) {
+                            statusText = 'Unsaved';
+                            statusColor = '#94A3B8';
+                          } else if (currentRole === 'none' && currentCircuit === '') {
+                            statusText = 'Unassigned';
+                            statusColor = 'var(--text-muted)';
+                          }
+
+                          return (
+                            <tr key={tag.TagIndex} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+                              <td style={{ padding: '10px 14px', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)' }}>
+                                <span style={{ fontFamily: 'var(--mono)', fontSize: '0.72rem', color: 'var(--text-muted)', marginRight: '6px' }}>[{tag.TagIndex}]</span>
+                                {tag.TagName}
+                              </td>
+                              <td style={{ padding: '10px 14px' }}>
+                                <select
+                                  value={currentCircuit}
+                                  onChange={(e) => handleCircuitSelect(tag, e.target.value)}
+                                  disabled={isReadOnly || rowSaving[numIdx]}
+                                  style={{
+                                    height: '30px',
+                                    fontSize: '0.75rem',
+                                    fontWeight: 700,
+                                    maxWidth: '130px',
+                                    cursor: isReadOnly ? 'not-allowed' : 'pointer',
+                                    borderRadius: '4px',
+                                    padding: '0 8px',
+                                    background: currentCircuit === 'lump'
+                                      ? 'rgba(22,163,74,0.12)'
+                                      : currentCircuit === 'fines'
+                                        ? 'rgba(245,158,11,0.12)'
+                                        : 'var(--surface)',
+                                    color: currentCircuit === 'lump'
+                                      ? '#16A34A'
+                                      : currentCircuit === 'fines'
+                                        ? '#F59E0B'
+                                        : 'var(--text-muted)',
+                                    border: `1px solid ${currentCircuit === 'lump'
+                                      ? 'rgba(22,163,74,0.35)'
+                                      : currentCircuit === 'fines'
+                                        ? 'rgba(245,158,11,0.35)'
+                                        : 'var(--border)'}`
+                                  }}
+                                >
+                                  <option value="">Select Circuit</option>
+                                  <option value="lump">LUMP</option>
+                                  <option value="fines">FINES</option>
+                                </select>
+                              </td>
+                              <td style={{ padding: '10px 14px' }}>
+                                <select
+                                  className="form-control"
+                                  value={currentRole}
+                                  onChange={(e) => handleRoleSelect(tag, e.target.value)}
+                                  disabled={isReadOnly || rowSaving[numIdx]}
+                                  style={{ height: '32px', fontSize: '0.78rem', maxWidth: '240px', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}
+                                >
+                                  <option value="sample_tag">Sample Tag</option>
+                                  <option value="shift_id_tag">Shift ID</option>
+                                  <option value="cumulative_tag">Shift Cumulative Tonnes</option>
+                                  <option value="stockpile_tag">Stockpile Tonnes</option>
+                                  <option value="none">Unassigned</option>
+                                </select>
+                              </td>
+                              <td style={{ padding: '10px 14px', verticalAlign: 'middle' }}>
+                                <span style={{ fontSize: '0.72rem', fontWeight: 700, color: statusColor, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                                  {statusText}
+                                </span>
+                              </td>
+                              <td style={{ padding: '10px 14px', verticalAlign: 'middle' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                  <button
+                                    onClick={() => handleSaveRow(tag)}
+                                    disabled={!hasRowChanges || rowSaving[numIdx] || isReadOnly}
+                                    className="btn btn-primary"
+                                    style={{
+                                      padding: '4px 12px',
+                                      fontSize: '0.72rem',
+                                      fontWeight: 'bold',
+                                      cursor: (!hasRowChanges || rowSaving[numIdx]) ? 'not-allowed' : 'pointer',
+                                      opacity: (!hasRowChanges || rowSaving[numIdx]) ? 0.55 : 1
+                                    }}
+                                  >
+                                    {rowSaving[numIdx] ? 'Saving...' : 'Save'}
+                                  </button>
+                                  {rowSuccess[numIdx] && (
+                                    <span style={{ fontSize: '0.72rem', color: 'var(--success)', fontWeight: 600 }}>
+                                      ✅ {rowSuccess[numIdx]}
+                                    </span>
+                                  )}
+                                  {rowErrors[numIdx] && (
+                                    <span style={{ fontSize: '0.72rem', color: 'var(--error)', fontWeight: 600 }}>
+                                      ⚠️ {rowErrors[numIdx]}
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
         </div>
-      )}
+
 
       {/* ══════════════════════════════════════════════════════════════
           MODAL — Add / Edit Tag
@@ -1170,8 +1415,8 @@ export default function TagConfig({ user }) {
                 />
               </div>
 
-              {/* Unit + Decimal Places */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+              {/* Unit + Material Type + Decimal Places */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '12px' }}>
                 <div className="form-group" style={{ marginBottom: 0 }}>
                   <label className="form-label" htmlFor="modal-tag-unit">Unit</label>
                   <input
@@ -1182,6 +1427,19 @@ export default function TagConfig({ user }) {
                     value={editingTag.Unit}
                     onChange={e => setEditingTag({ ...editingTag, Unit: e.target.value })}
                   />
+                </div>
+                <div className="form-group" style={{ marginBottom: 0 }}>
+                  <label className="form-label" htmlFor="modal-tag-material">Material Type</label>
+                  <select
+                    id="modal-tag-material"
+                    className="form-control"
+                    value={editingTag.MaterialType || 'None'}
+                    onChange={e => setEditingTag({ ...editingTag, MaterialType: e.target.value })}
+                  >
+                    <option value="None">None</option>
+                    <option value="Lump">Lump</option>
+                    <option value="Fines">Fines</option>
+                  </select>
                 </div>
                 <div className="form-group" style={{ marginBottom: 0 }}>
                   <label className="form-label" htmlFor="modal-tag-decimals">Decimal Places</label>
@@ -1210,6 +1468,8 @@ export default function TagConfig({ user }) {
                   placeholder="Brief description of this data channel"
                 />
               </div>
+
+
 
               {/* Visibility toggles */}
               <div style={{
@@ -1245,7 +1505,43 @@ export default function TagConfig({ user }) {
                 </div>
               </div>
 
-              {/* Modal footer */}
+              {/* Sample Column Mapping — only when Sample Datalog is ON */}
+              {editingTag.SampleDatalog && (
+                <div style={{
+                  padding: '14px 16px',
+                  borderRadius: 'var(--radius-sm)',
+                  border: '1px solid rgba(14,165,233,0.35)',
+                  background: 'rgba(14,165,233,0.04)',
+                }}>
+                  <p style={{ margin: '0 0 10px', fontSize: '0.78rem', fontWeight: 600, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+                    Sample Station Column Mapping
+                  </p>
+                  <div className="form-group" style={{ marginBottom: 0 }}>
+                    <label className="form-label" htmlFor="modal-sample-col">
+                      Map this tag to Sample Station column
+                    </label>
+                    <select
+                      id="modal-sample-col"
+                      className="form-control"
+                      value={editingTag.SampleColumn || 'Not Assigned'}
+                      onChange={e => setEditingTag({ ...editingTag, SampleColumn: e.target.value })}
+                    >
+                      <option value="Not Assigned">Not Assigned</option>
+                      <option value="Shift ID">Shift ID</option>
+                      <option value="Shift Cumulative Tonnes">Shift Cumulative Tonnes</option>
+                      <option value="Stockpile Tonnes">Stockpile Tonnes</option>
+                      <option value="FingerID">FingerID</option>
+                      <option value="CutID">CutID</option>
+                      <option value="Material">Material</option>
+                    </select>
+                    <p style={{ margin: '6px 0 0', fontSize: '0.73rem', color: 'var(--text-muted)' }}>
+                      This tag's value will populate the selected column in the Sample Station Datalog table.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+
               <div style={{
                 display:       'flex',
                 gap:           '10px',
@@ -1467,9 +1763,9 @@ export default function TagConfig({ user }) {
           zIndex: 1000,
           padding: '12px 18px',
           borderRadius: 'var(--radius-sm)',
-          background: saveStatusMsg.type === 'success' ? '#0d2a1f' : '#2d1414',
-          border: saveStatusMsg.type === 'success' ? '1px solid var(--success)' : '1px solid var(--error)',
-          color: saveStatusMsg.type === 'success' ? 'var(--success)' : 'var(--error)',
+          background: saveStatusMsg.type === 'success' ? '#0d2a1f' : saveStatusMsg.type === 'info' ? '#07253d' : '#2d1414',
+          border: saveStatusMsg.type === 'success' ? '1px solid var(--success)' : saveStatusMsg.type === 'info' ? '1px solid var(--secondary, #0EA5E9)' : '1px solid var(--error)',
+          color: saveStatusMsg.type === 'success' ? 'var(--success)' : saveStatusMsg.type === 'info' ? 'var(--secondary, #0EA5E9)' : 'var(--error)',
           boxShadow: 'var(--shadow-md)',
           display: 'flex',
           alignItems: 'center',
@@ -1478,7 +1774,7 @@ export default function TagConfig({ user }) {
           fontSize: '0.85rem',
           fontWeight: 500
         }}>
-          <span>{saveStatusMsg.type === 'success' ? '✅' : '❌'}</span>
+          <span>{saveStatusMsg.type === 'success' ? '✅' : saveStatusMsg.type === 'info' ? 'ℹ️' : '❌'}</span>
           <span>{saveStatusMsg.text}</span>
           <button
             onClick={() => setSaveStatusMsg(null)}

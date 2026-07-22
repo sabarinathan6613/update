@@ -709,198 +709,36 @@ export default function Layout({ user, onLogout, activeTab, setActiveTab, childr
             </div>
           </div>
 
-          {/* Center: Global Search */}
-          <div style={{ flex: 1, maxWidth: '220px', position: 'relative' }} ref={globalSearchRef}>
-            <div style={{ position: 'relative' }}>
-              <span style={{
-                position: 'absolute',
-                left: '9px',
-                top: '50%',
-                transform: 'translateY(-50%)',
-                opacity: 0.4,
-                display: 'flex',
-                alignItems: 'center',
-                pointerEvents: 'none',
-              }}>
-                <IconSearch />
-              </span>
-              <input
-                type="text"
-                placeholder="Search views..."
-                value={globalSearch}
-                onChange={(e) => { setGlobalSearch(e.target.value); setShowGlobalResults(true); }}
-                onFocus={() => setShowGlobalResults(true)}
-                style={{
-                  width: '100%',
-                  padding: '7px 10px 7px 30px',
-                  fontSize: '0.8rem',
-                  backgroundColor: 'var(--background)',
-                  border: '1px solid var(--border)',
-                  borderRadius: 'var(--radius-sm)',
-                  color: 'var(--text)',
-                  outline: 'none',
-                  boxSizing: 'border-box',
-                }}
-              />
-            </div>
-            {showGlobalResults && globalSearch && (
-              <div className="card" style={{
-                position: 'absolute',
-                top: '38px',
-                left: 0,
-                right: 0,
-                backgroundColor: 'var(--surface)',
-                border: '1px solid var(--border)',
-                borderRadius: 'var(--radius-sm)',
-                boxShadow: 'var(--shadow-lg)',
-                padding: '6px 0',
-                zIndex: 190,
-                maxHeight: '200px',
-                overflowY: 'auto',
-              }}>
-                {searchResults.length === 0 ? (
-                  <div style={{ padding: '8px 12px', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                    No matching view found.
-                  </div>
-                ) : (
-                  searchResults.map((res, i) => (
-                    <div
-                      key={i}
-                      onClick={() => {
-                        setActiveTab(res.targetTab);
-                        setGlobalSearch('');
-                        setShowGlobalResults(false);
-                      }}
-                      style={{
-                        padding: '8px 12px',
-                        fontSize: '0.78rem',
-                        color: 'var(--text)',
-                        cursor: 'pointer',
-                        borderBottom: '1px solid var(--border-subtle)',
-                      }}
-                      onMouseOver={(e) => e.currentTarget.style.backgroundColor = 'var(--primary-hover)'}
-                      onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
-                    >
-                      {res.label}
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Right: Sync Monitor Indicators + Actions + Bell */}
+          {/* Right: Actions */}
           <div className="header-status-indicators" style={{ display: 'flex', alignItems: 'center', gap: '18px', marginLeft: 'auto', flexWrap: 'wrap' }}>
-
-            {/* 1. Cloud Status */}
-            <div className="header-status-item" title="Cloud Gateway Connection Status">
-              <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
-                Cloud Status
-              </span>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '5px', marginTop: '2px' }}>
+            {['dashboard', 'trends', 'tagConfig'].includes(activeTab) && (
+              <button
+                onClick={handleManualRefresh}
+                disabled={isRefreshing}
+                className="btn btn-secondary"
+                style={{
+                  padding: '6px 10px',
+                  fontSize: '0.78rem',
+                  borderRadius: 'var(--radius-sm)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  border: '1px solid rgba(59, 130, 246, 0.3)',
+                  backgroundColor: 'rgba(59, 130, 246, 0.05)'
+                }}
+                title="Purge cache and refresh telemetry data now"
+              >
                 <span style={{
-                  width: '6px', height: '6px', borderRadius: '50%',
-                  backgroundColor: isNetworkOnline ? 'var(--success)' : 'var(--error)',
-                  boxShadow: isNetworkOnline ? '0 0 6px var(--success)' : '0 0 6px var(--error)',
-                  display: 'inline-block',
-                }} />
-                <span style={{ fontSize: '0.72rem', fontWeight: 700, color: isNetworkOnline ? 'var(--success)' : 'var(--error)' }}>
-                  {isNetworkOnline ? 'ONLINE' : 'OFFLINE'}
-                </span>
-              </div>
-            </div>
-
-            {/* 2. Database Status */}
-            <div className="header-status-item" title="Historian Database Health">
-              <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
-                Database Status
-              </span>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '5px', marginTop: '2px' }}>
-                <span className={`live-indicator ${dbConnectionStatus === 'Reconnecting' ? 'warning' : dbConnectionStatus === 'Disconnected' ? 'error' : ''}`} style={{
-                  backgroundColor: dbConnectionStatus === 'Connected' ? 'var(--success)' : dbConnectionStatus === 'Syncing' ? 'var(--info)' : dbConnectionStatus === 'Reconnecting' ? 'var(--warning)' : 'var(--error)',
-                  boxShadow: `0 0 6px ${dbConnectionStatus === 'Connected' ? 'var(--success)' : dbConnectionStatus === 'Syncing' ? 'var(--info)' : dbConnectionStatus === 'Reconnecting' ? 'var(--warning)' : 'var(--error)'}`
-                }} />
-                <span style={{
-                  fontSize: '0.72rem',
-                  fontWeight: 700,
-                  color: dbConnectionStatus === 'Connected' ? 'var(--success)' : dbConnectionStatus === 'Syncing' ? 'var(--info)' : dbConnectionStatus === 'Reconnecting' ? 'var(--warning)' : 'var(--error)'
+                  display: 'inline-flex',
+                  animation: isRefreshing ? 'spin 1s linear infinite' : 'none'
                 }}>
-                  {dbConnectionStatus.toUpperCase()}
+                  <IconRefresh />
                 </span>
-              </div>
-            </div>
-
-            {/* 3. Last Sync */}
-            <div className="header-status-item optional" title="Last Successful Synchronization">
-              <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
-                Last Sync
-              </span>
-              <span className="font-mono" style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text)', marginTop: '2px' }}>
-                {lastSyncTime}
-              </span>
-            </div>
-
-            {/* 4. Queue Buffer */}
-            <div className="header-status-item optional" title="Queued records in local SQL spool buffer">
-              <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
-                Queue Buffer
-              </span>
-              <span className="font-mono" style={{ fontSize: '0.72rem', fontWeight: 700, marginTop: '2px', color: localBuffer.length > 0 ? 'var(--warning)' : 'var(--text-muted)' }}>
-                {localBuffer.length} rows
-              </span>
-            </div>
-
-            {/* 5. Total Records */}
-            <div className="header-status-item optional" title="Total telemetry records in database">
-              <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
-                Total Records
-              </span>
-              <span className="font-mono" style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--secondary)', marginTop: '2px' }}>
-                {totalSyncedRecords.toLocaleString()}
-              </span>
-            </div>
-
-            {/* 6. Intelligent Refresh Timing */}
-            {['dashboard', 'tagConfig', 'explorer', 'reports'].includes(activeTab) && (
-              <>
-                <div className="header-status-item optional" title="Last database refresh">
-                  <span className="header-status-label" style={{ fontSize: '0.6rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
-                    Last Updated
-                  </span>
-                  <span className="font-mono" style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--success)', marginTop: '2px' }}>
-                    {formatTime(lastUpdated)}
-                  </span>
-                </div>
-
-                <button
-                  onClick={handleManualRefresh}
-                  disabled={isRefreshing}
-                  className="btn btn-secondary"
-                  style={{
-                    padding: '6px 10px',
-                    fontSize: '0.78rem',
-                    borderRadius: 'var(--radius-sm)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '5px',
-                    border: '1px solid rgba(59, 130, 246, 0.3)',
-                    backgroundColor: 'rgba(59, 130, 246, 0.05)'
-                  }}
-                  title="Purge cache and refresh telemetry data now"
-                >
-                  <span style={{
-                    display: 'inline-flex',
-                    animation: isRefreshing ? 'spin 1s linear infinite' : 'none'
-                  }}>
-                    <IconRefresh />
-                  </span>
-                  Refresh Now
-                </button>
-              </>
+                Refresh
+              </button>
             )}
-
-
           </div>
+
         </header>
 
         {/* Content */}

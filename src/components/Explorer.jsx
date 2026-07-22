@@ -1,8 +1,12 @@
 // src/components/Explorer.jsx
-import { useState, useEffect, useMemo, useRef } from 'react';
-import { getHistorianData, getTagConfigs, getSettings, discoverDatabaseStructure, getDatabaseTableStats } from '../utils/db';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { getTagConfigs, getSettings, discoverDatabaseStructure, getDatabaseTableStats } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
 import { getSupabaseClient } from '../utils/supabaseClient';
+import { useRefresh } from '../utils/useRefresh';
+import RefreshButton from './RefreshButton';
+import { getRawRows, getLatestRecord } from '../utils/historianService';
+import { formatTimestampToPlantTime, toLocalInput, parseTimestampToMs } from '../utils/timeService';
 
 /* ─────────────────────────────────────────────
    Inline styles (scoped to this component)
@@ -466,8 +470,8 @@ function SortArrow({ field, sortField, sortDirection }) {
 /* ─────────────────────────────────────────────
    Main Component
    ───────────────────────────────────────────── */
-export default function Explorer() {
-  const { refreshTrigger } = useSimulator();
+export default function Explorer({ isActive }) {
+  const { refreshTrigger, currentPlantId, chartStart, chartEnd } = useSimulator();
 
   // ── State ──────────────────────────────────
   const [data, setData]               = useState([]);
@@ -493,12 +497,20 @@ export default function Explorer() {
   const [endDateFilter, setEndDateFilter]     = useState('');
 
   const [currentPage, setCurrentPage]         = useState(1);
+  const [filteredTotalCount, setFilteredTotalCount] = useState(0);
   const [sortField, setSortField]             = useState('DateAndTime');
   const [sortDirection, setSortDirection]     = useState('desc');
   const itemsPerPage = 50;
 
+  // Align Explorer time filter state with centralized time range
+  useEffect(() => {
+    if (chartStart) setStartDateFilter(toLocalInput(new Date(chartStart)));
+    if (chartEnd) setEndDateFilter(toLocalInput(new Date(chartEnd)));
+  }, [chartStart, chartEnd]);
+
   // ── Load config & discover structure dynamically ──
   useEffect(() => {
+    if (!isActive) return;
     const loadConfigAndTable = async () => {
       const configs = await getTagConfigs();
       setTagConfigs(configs.sort((a, b) => a.TagIndex - b.TagIndex));
@@ -526,12 +538,12 @@ export default function Explorer() {
       }
     };
     loadConfigAndTable();
-  }, [refreshTrigger]);
+  }, [refreshTrigger, isActive]);
 
   // Update selected table count and metadata dynamically when active table changes
   const hasNoDiscoveredTables = discoveredTables.length === 0;
   useEffect(() => {
-    if (!dbTable) return;
+    if (!isActive || !dbTable) return;
     const updateSelectedTableMetadata = async () => {
       const supabase = getSupabaseClient();
       if (!supabase) return;
@@ -576,10 +588,11 @@ export default function Explorer() {
       }
     };
     updateSelectedTableMetadata();
-  }, [dbTable, refreshTrigger, hasNoDiscoveredTables]);
+  }, [dbTable, refreshTrigger, hasNoDiscoveredTables, isActive]);
 
   // Fetch detailed TagIndex statistics when Database table is selected
   useEffect(() => {
+    if (!isActive) return;
     if (dbTable !== 'Database') {
       const timer = setTimeout(() => {
         setDbStats(null);
@@ -601,7 +614,7 @@ export default function Explorer() {
       fetchStats();
     }, 0);
     return () => clearTimeout(timer);
-  }, [dbTable, refreshTrigger]);
+  }, [dbTable, refreshTrigger, isActive]);
 
   const activeTableObj = useMemo(() => {
     return discoveredTables.find(t => t.name === dbTable);
@@ -612,25 +625,98 @@ export default function Explorer() {
   }, [activeTableObj]);
 
   // ── Fetch historian data ────────────────────
-  useEffect(() => {
-    const fetchTableData = async () => {
-      if (!autoRefresh && data.length > 0) return;
+  const fetchTableData = useCallback(async (isManual = false) => {
+    const rangeFrom = (currentPage - 1) * itemsPerPage;
+    const rangeTo = rangeFrom + itemsPerPage - 1;
+    
+    const needsLoader = data.length === 0 || isManual;
+    if (needsLoader) {
       setLoading(true);
-      try {
-        const queryParams = { limit, tableName: dbTable };
-        if (selectedTag !== 'all')   queryParams.tagIndexes = [parseInt(selectedTag)];
-        if (startDateFilter)         queryParams.startDate = new Date(startDateFilter).toISOString();
-        if (endDateFilter)           queryParams.endDate   = new Date(endDateFilter).toISOString();
-        const result = await getHistorianData(queryParams);
-        setData(result);
-      } catch (err) {
-        console.error('Failed to query historian data in Explorer:', err);
-      } finally {
-        setLoading(false);
+    }
+    try {
+      const supabase = getSupabaseClient();
+      const settings = await getSettings();
+      const mappings = settings?.columnMappings || {};
+      const isAlarmInt = settings?.selectedTable === 'Database';
+      const tagCol = mappings.tagCol || 'TagIndex';
+      const tsCol = mappings.timestampCol || 'DateAndTime';
+      
+      let targetIndexes = undefined;
+      if (selectedTag !== 'all') {
+        const parsedTagIndex = /^\d+$/.test(selectedTag) ? parseInt(selectedTag, 10) : selectedTag;
+        targetIndexes = [parsedTagIndex];
       }
-    };
-    fetchTableData();
-  }, [dbTable, selectedTag, limit, startDateFilter, endDateFilter, autoRefresh, refreshTrigger, data.length]);
+      
+      const startISO = startDateFilter ? new Date(startDateFilter).toISOString() : null;
+      const endISO = endDateFilter ? new Date(endDateFilter).toISOString() : null;
+      
+      // 1. Fetch exact count of filtered records server-side via lightweight HEAD select count query
+      let countQuery = supabase.from(dbTable).select('*', { count: 'exact', head: true });
+      if (targetIndexes && targetIndexes.length > 0) {
+        // Resolve T0/0 string/numeric targets
+        const uniqueIndexes = [];
+        targetIndexes.forEach(idx => {
+          const str = String(idx).trim();
+          uniqueIndexes.push(idx);
+          uniqueIndexes.push(str);
+          uniqueIndexes.push(`T${str}`);
+          uniqueIndexes.push(`t${str}`);
+          if (!isNaN(idx)) uniqueIndexes.push(parseInt(str, 10));
+        });
+        const finalIndexes = [...new Set(uniqueIndexes)].filter(Boolean);
+        countQuery = countQuery.in(tagCol, finalIndexes);
+      }
+      
+      // Parse timezone separator
+      if (startISO) {
+        const separator = startISO.includes('T') ? 'T' : ' ';
+        const plantTz = settings?.plantTimezone || settings?.timezone || 'Asia/Kolkata';
+        const formattedStart = startISO; // formatToDbTimestamp isn't exported directly, we can use the raw timestamp
+        countQuery = countQuery.gte(tsCol, formattedStart);
+      }
+      if (endISO) {
+        const formattedEnd = endISO;
+        countQuery = countQuery.lte(tsCol, formattedEnd);
+      }
+      
+      const { count: filteredCount, error: countErr } = await countQuery;
+      if (!countErr && filteredCount !== null) {
+        setFilteredTotalCount(filteredCount);
+      } else {
+        setFilteredTotalCount(activeTableObj?.recordCount || 0);
+      }
+      
+      // 2. Fetch page results
+      const result = await getRawRows(
+        supabase,
+        dbTable,
+        targetIndexes,
+        startISO,
+        endISO,
+        null, // limit
+        'desc',
+        mappings,
+        isAlarmInt,
+        settings,
+        rangeFrom,
+        rangeTo
+      );
+      setData(result);
+    } catch (err) {
+      console.error('Failed to query historian data in Explorer:', err);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, [dbTable, selectedTag, startDateFilter, endDateFilter, currentPage, itemsPerPage]);
+
+  const { isRefreshing, refreshToast, handleRefresh } = useRefresh(() => fetchTableData(true), 'Explorer');
+
+  useEffect(() => {
+    if (isActive) {
+      fetchTableData(false).catch(() => {});
+    }
+  }, [fetchTableData, refreshTrigger, currentPage, isActive]);
 
   // ── Tag map ────────────────────────────────
   const tagMap = useMemo(() => {
@@ -671,8 +757,8 @@ export default function Explorer() {
       if (aVal == null) return 1;
       if (bVal == null) return -1;
       if (sortField === 'DateAndTime') {
-        aVal = new Date(aVal).getTime();
-        bVal = new Date(bVal).getTime();
+        aVal = parseTimestampToMs(aVal);
+        bVal = parseTimestampToMs(bVal);
       }
       if (aVal < bVal) return sortDirection === 'asc' ? -1 : 1;
       if (aVal > bVal) return sortDirection === 'asc' ?  1 : -1;
@@ -682,12 +768,10 @@ export default function Explorer() {
   }, [data, selectedStatus, searchQuery, sortField, sortDirection, tagMap]);
 
   // ── Pagination ─────────────────────────────
-  const totalPages   = Math.max(1, Math.ceil(processedData.length / itemsPerPage));
+  const totalPages   = Math.max(1, Math.ceil(filteredTotalCount / itemsPerPage));
   const paginatedData = useMemo(() => {
-    const page     = currentPage > totalPages ? 1 : currentPage;
-    const startIdx = (page - 1) * itemsPerPage;
-    return processedData.slice(startIdx, startIdx + itemsPerPage);
-  }, [processedData, currentPage, totalPages]);
+    return processedData;
+  }, [processedData]);
 
   const handlePageChange = (page) => {
     if (page >= 1 && page <= totalPages) setCurrentPage(page);
@@ -703,7 +787,7 @@ export default function Explorer() {
   // ── CSV Export ─────────────────────────────
   const handleExportCSV = () => {
     if (processedData.length === 0) { alert('No rows available to export.'); return; }
-    const headers = ['DateAndTime','Millitm','TagIndex','TagName','Value','Unit','Status','Marker'];
+    const headers = ['DateAndTime','Millitm','TagIndex','TagName','Value','Unit','Marker'];
     const csvRows = [headers.join(',')];
     processedData.forEach(row => {
       const meta = tagMap[row.TagIndex] || {};
@@ -711,7 +795,7 @@ export default function Explorer() {
         `"${row.DateAndTime}"`, row.Millitm, row.TagIndex,
         `"${(meta.TagName || `Tag ${row.TagIndex}`).replace(/"/g,'""')}"`,
         row.Val, `"${(meta.Unit || '').replace(/"/g,'""')}"`,
-        row.Status, `"${(row.Marker || '').replace(/"/g,'""')}"`
+        `"${(row.Marker || '').replace(/"/g,'""')}"`
       ].join(','));
     });
     const link = document.createElement('a');
@@ -723,14 +807,14 @@ export default function Explorer() {
   // ── Excel Export ───────────────────────────
   const handleExportExcel = () => {
     if (processedData.length === 0) { alert('No rows available to export.'); return; }
-    const headers = ['Date & Time','Millitm (ms)','Tag Index','Tag Name','Value','Unit','Quality Status','Marker'];
+    const headers = ['Date & Time','Millitm (ms)','Tag Index','Equipment Name','Value','Unit','Marker'];
     const rows = [headers.join('\t')];
     processedData.forEach(row => {
       const meta = tagMap[row.TagIndex] || {};
       rows.push([
         row.DateAndTime, row.Millitm, row.TagIndex,
         meta.TagName || `Tag ${row.TagIndex}`, row.Val, meta.Unit || '',
-        row.Status === 192 ? `Good (192)` : `Bad (${row.Status})`, row.Marker || ''
+        row.Marker || ''
       ].join('\t'));
     });
     const link = document.createElement('a');
@@ -741,8 +825,7 @@ export default function Explorer() {
 
   // ── Helpers ────────────────────────────────
   const fmtTime = (raw) => {
-    const d = new Date(raw);
-    return isNaN(d.getTime()) ? raw : d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
+    return formatTimestampToPlantTime(raw, currentPlantId);
   };
 
   const isConnected = useMemo(() => {
@@ -794,7 +877,8 @@ export default function Explorer() {
           </span>
         </div>
 
-        <div style={S.exportRow}>
+        <div style={{ ...S.exportRow, gap: '8px', display: 'flex', alignItems: 'center' }}>
+          <RefreshButton isRefreshing={isRefreshing} onClick={handleRefresh} toast={refreshToast} id="refresh-btn-explorer" />
           <button className="exp-sm-btn" style={S.smBtn} onClick={handleExportCSV} title="Export to CSV">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             CSV
@@ -963,20 +1047,6 @@ export default function Explorer() {
               </select>
             </div>
 
-            {/* Quality filter */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-              <span style={S.filterLabel}>Quality</span>
-              <select
-                className="exp-filter-select"
-                style={S.filterSelect}
-                value={selectedStatus}
-                onChange={e => { setSelectedStatus(e.target.value); setCurrentPage(1); }}
-              >
-                <option value="all">All</option>
-                <option value="192">Good (192)</option>
-                <option value="0">Bad (0)</option>
-              </select>
-            </div>
 
             <div style={S.filterDivider} />
 
@@ -1175,8 +1245,7 @@ export default function Explorer() {
                 <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
                 </svg>
-                <p style={{ margin: 0, fontSize: '0.88rem', color: 'var(--text-muted)' }}>No records found for the selected filters</p>
-                <p style={{ margin: 0, fontSize: '0.75rem', color: 'var(--text-dim)' }}>Adjust filters or check that the simulator is pushing data.</p>
+                <p style={{ margin: 0, fontSize: '0.88rem', color: 'var(--text-muted)' }}>No records are available for the selected time range.</p>
               </div>
             ) : (
               <table style={S.stickyTable}>
@@ -1227,11 +1296,8 @@ export default function Explorer() {
                               </span>
                             );
                           } else if (isMainHistorian && isStatusCol) {
-                            const isGood = displayVal === 192;
                             renderedEl = (
-                              <span style={isGood ? S.qBadgeGood : S.qBadgeBad}>
-                                {isGood ? 'Good (192)' : `Bad (${displayVal})`}
-                              </span>
+                              <span style={S.tdMono}>{displayVal}</span>
                             );
                           } else if (isMainHistorian && isAlarmCol) {
                             renderedEl = displayVal ? (
@@ -1277,11 +1343,11 @@ export default function Explorer() {
           </div>
 
           {/* ── Pagination bar ─────────────────── */}
-          {processedData.length > 0 && (
+          {filteredTotalCount > 0 && (
             <div style={S.paginationBar}>
               <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontFamily: 'var(--mono)' }}>
-                {Math.min(processedData.length, (currentPage - 1) * itemsPerPage + 1)}–
-                {Math.min(processedData.length, currentPage * itemsPerPage)} / {processedData.length.toLocaleString()} rows
+                {Math.min(filteredTotalCount, (currentPage - 1) * itemsPerPage + 1)}–
+                {Math.min(filteredTotalCount, currentPage * itemsPerPage)} / {filteredTotalCount.toLocaleString()} rows
               </span>
 
               <div style={{ display: 'flex', gap: '5px', alignItems: 'center' }}>

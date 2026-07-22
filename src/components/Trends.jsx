@@ -1,22 +1,23 @@
 /* eslint-disable react-hooks/preserve-manual-memoization */
 // src/components/Trends.jsx
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { getHistorianData, getTagConfigs, getSettings } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
-import { getSupabaseClient } from '../utils/supabaseClient';
+import { formatTimestampToPlantTime, parseTimestampToMs } from '../utils/timeService';
+import { normalizeTagIndex } from '../utils/historianService';
+import ScrollableTagList from './ScrollableTagList';
 
-/* ─── colour palette for overlaid tag series ─── */
 const TAG_COLORS = [
-  '#00E5FF', // cyan
-  '#69FF47', // lime
-  '#FFB300', // amber
-  '#FF4B6E', // rose
-  '#B388FF', // lavender
-  '#FF7043', // deep-orange
-  '#40C4FF', // light-blue
-  '#E040FB', // purple
-  '#00E676', // green
-  '#FFCA28', // yellow
+  '#2563EB', // Professional blue
+  '#0D9488', // Teal
+  '#16A34A', // Green
+  '#D97706', // Amber/Orange
+  '#4F46E5', // Indigo
+  '#7C3AED', // Violet
+  '#0891B2', // Cyan-blue
+  '#DB2777', // Muted pink
+  '#475569', // Slate
+  '#1E3A5F', // Dark blue
 ];
 
 /* ─── tiny utility: format a Date for datetime-local input ─── */
@@ -27,10 +28,104 @@ function toLocalInput(date) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+const tagIndexMatch = (a, b) => normalizeTagIndex(a) === normalizeTagIndex(b);
+
+// 1. Min-Max Decimation Algorithm to prevent dense visual clutter and vertical blobs
+function decimatePoints(records, chartBounds, drawWidth) {
+  if (records.length <= 1000) return records; // Only decimate if we have dense datasets
+
+  // Divide the X range into drawWidth buckets (1 bucket per pixel column)
+  const numBuckets = Math.min(drawWidth, 800);
+  const buckets = Array.from({ length: numBuckets }, () => []);
+  const xMin = chartBounds.xMin;
+  const rangeX = chartBounds.rangeX;
+
+  if (rangeX <= 0) return records;
+
+  records.forEach(r => {
+    const ms = parseTimestampToMs(r.DateAndTime);
+    const pct = (ms - xMin) / rangeX;
+    let bIdx = Math.floor(pct * numBuckets);
+    if (bIdx < 0) bIdx = 0;
+    if (bIdx >= numBuckets) bIdx = numBuckets - 1;
+    buckets[bIdx].push(r);
+  });
+
+  const decimated = [];
+  buckets.forEach(bucketRecs => {
+    if (bucketRecs.length === 0) return;
+    if (bucketRecs.length <= 2) {
+      decimated.push(...bucketRecs);
+      return;
+    }
+
+    // Find min and max records in this bucket column to preserve peaks & valleys
+    let minRec = bucketRecs[0];
+    let maxRec = bucketRecs[0];
+    let minVal = Number(minRec.Val);
+    let maxVal = Number(maxRec.Val);
+
+    for (let i = 1; i < bucketRecs.length; i++) {
+      const v = Number(bucketRecs[i].Val);
+      if (!isNaN(v)) {
+        if (v < minVal) {
+          minVal = v;
+          minRec = bucketRecs[i];
+        }
+        if (v > maxVal) {
+          maxVal = v;
+          maxRec = bucketRecs[i];
+        }
+      }
+    }
+
+    const minMs = parseTimestampToMs(minRec.DateAndTime);
+    const maxMs = parseTimestampToMs(maxRec.DateAndTime);
+
+    if (minMs < maxMs) {
+      decimated.push(minRec);
+      if (minRec !== maxRec) {
+        decimated.push(maxRec);
+      }
+    } else {
+      decimated.push(maxRec);
+      if (minRec !== maxRec) {
+        decimated.push(minRec);
+      }
+    }
+  });
+
+  return decimated;
+}
+
+// 2. Dynamic Sampling Gap Threshold based on 3x the median interval of the dataset
+function getSamplingGapThreshold(records) {
+  if (records.length <= 2) return 24 * 60 * 60 * 1000;
+  
+  const diffs = [];
+  for (let i = 1; i < records.length; i++) {
+    const prevMs = parseTimestampToMs(records[i - 1].DateAndTime);
+    const currMs = parseTimestampToMs(records[i].DateAndTime);
+    const d = currMs - prevMs;
+    if (d > 0) {
+      diffs.push(d);
+    }
+  }
+  
+  if (diffs.length === 0) return 24 * 60 * 60 * 1000;
+  
+  diffs.sort((a, b) => a - b);
+  const median = diffs[Math.floor(diffs.length / 2)];
+  
+  // Return 3x the median sampling interval, min 15 seconds to prevent noise
+  return Math.max(15000, median * 3);
+}
 
 
-export default function Trends() {
+
+export default function Trends({ isActive }) {
   const { refreshTrigger, dbConnectionStatus, localBuffer } = useSimulator();
+  const isRefreshing = false;
 
   /* ── tag configs & selection ── */
   const [tagConfigs, setTagConfigs]       = useState([]);
@@ -52,6 +147,39 @@ export default function Trends() {
     historianDataRef.current = historianData;
   }, [historianData]);
   const [loading, setLoading]             = useState(false);
+  const [liveScroll, setLiveScroll]       = useState(true);
+  const [freezeTime, setFreezeTime]       = useState(null);
+  const [scaleMode, setScaleMode]         = useState('auto');
+  const [manualMin, setManualMin]         = useState('0');
+  const [manualMax, setManualMax]         = useState('100');
+
+  // Double-buffering states to prevent chart flashing blank during loading
+  const [renderedSelectedTags, setRenderedSelectedTags] = useState([]);
+  const [renderedHistorianData, setRenderedHistorianData] = useState([]);
+  const [renderedFocusedTagIdx, setRenderedFocusedTagIdx] = useState(null);
+
+  useEffect(() => {
+    if (!loading) {
+      setRenderedSelectedTags(selectedTags);
+      setRenderedHistorianData(historianData);
+      setRenderedFocusedTagIdx(focusedTagIdx);
+    }
+  }, [selectedTags, historianData, focusedTagIdx, loading]);
+
+  const [chartStart, setChartStart] = useState(() => new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+  const [chartEnd, setChartEnd] = useState(() => new Date().toISOString());
+
+  const [activeChartStart, setActiveChartStart] = useState(() => new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+  const [activeChartEnd, setActiveChartEnd] = useState(() => new Date().toISOString());
+
+  // Debounced effect to sync UI zoom/pan/custom bounds to active query range
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setActiveChartStart(chartStart);
+      setActiveChartEnd(chartEnd);
+    }, 450);
+    return () => clearTimeout(handler);
+  }, [chartStart, chartEnd]);
 
   /* ── diagnostics ── */
   const [diagnostics, setDiagnostics] = useState({
@@ -60,6 +188,7 @@ export default function Trends() {
     selectedTagsLabel: '',
     dateRangeLabel:    '',
   });
+  const [debugInfo, setDebugInfo] = useState(null);
 
   /* ── tooltip / crosshair ── */
   const [hoveredData, setHoveredData] = useState(null);
@@ -104,55 +233,15 @@ export default function Trends() {
     return () => clearTimeout(timer);
   }, [selectedTags, focusedTagIdx]);
 
-  // Temporary diagnostics loop to log query status to server
-  useEffect(() => {
-    const runDiagnostics = async () => {
-      try {
-        const s = await getSettings();
-        const configs = await getTagConfigs();
-        const rawHistory = await getHistorianData({ limit: 10 });
-        
-        let rawSupabaseRows = [];
-        const supabase = getSupabaseClient();
-        if (supabase) {
-          const tableName = s.selectedTable || 'Database';
-          const { data } = await supabase.from(tableName).select('*').limit(5);
-          rawSupabaseRows = data || [];
-        }
 
-        await fetch('/api/log-diagnostics', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            settings: s,
-            configs,
-            rawHistory,
-            rawSupabaseRows,
-            localTime: new Date().toString(),
-            timePreset,
-            customStart,
-            customEnd,
-            selectedTags,
-            dbConnectionStatus,
-            localBufferLength: localBuffer.length
-          })
-        });
-      } catch (err) {
-        console.error("Failed to run diagnostics:", err);
-      }
-    };
-    runDiagnostics();
-  }, [refreshTrigger, selectedTags, timePreset, customStart, customEnd, dbConnectionStatus, localBuffer.length]);
 
   /* ════════════════════════════════════════════
      Computed time range with Zoom and Pan state
   ════════════════════════════════════════════ */
-  const [chartStart, setChartStart] = useState(() => new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
-  const [chartEnd, setChartEnd] = useState(() => new Date().toISOString());
 
   const timeRange = useMemo(() => {
-    return { startDate: chartStart, endDate: chartEnd };
-  }, [chartStart, chartEnd]);
+    return { startDate: activeChartStart, endDate: activeChartEnd };
+  }, [activeChartStart, activeChartEnd]);
 
   /* ─── Pre-populate custom datetime picker inputs on selection ─── */
   useEffect(() => {
@@ -183,7 +272,7 @@ export default function Trends() {
         let end   = now;
         switch (timePreset) {
           case '1h':  start = new Date(now.getTime() - 1  * 60 * 60 * 1000); break;
-          case '6h':  start = new Date(now.getTime() - 6  * 60 * 60 * 1000); break;
+          case '12h': start = new Date(now.getTime() - 12 * 60 * 60 * 1000); break;
           case '24h': start = new Date(now.getTime() - 24 * 60 * 60 * 1000); break;
           case '7d':  start = new Date(now.getTime() - 7  * 24 * 60 * 60 * 1000); break;
           case '30d': start = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000); break;
@@ -197,8 +286,8 @@ export default function Trends() {
   }, [timePreset, customStart, customEnd, refreshTrigger]);
 
   const handleZoom = (factor) => {
-    const tStart = Date.parse(chartStart);
-    const tEnd = Date.parse(chartEnd);
+    const tStart = parseTimestampToMs(activeChartStart);
+    const tEnd = parseTimestampToMs(activeChartEnd);
     if (isNaN(tStart) || isNaN(tEnd)) return;
     const duration = tEnd - tStart;
     const center = tStart + duration / 2;
@@ -210,8 +299,8 @@ export default function Trends() {
   };
 
   const handlePan = (direction) => {
-    const tStart = Date.parse(chartStart);
-    const tEnd = Date.parse(chartEnd);
+    const tStart = parseTimestampToMs(activeChartStart);
+    const tEnd = parseTimestampToMs(activeChartEnd);
     if (isNaN(tStart) || isNaN(tEnd)) return;
     const duration = tEnd - tStart;
     const shift = duration * 0.2 * direction;
@@ -229,7 +318,7 @@ export default function Trends() {
       alert("No data available to export.");
       return;
     }
-    let csvContent = 'Timestamp,Tag Index,Tag Name,Value,Unit,Quality Status,Marker\r\n';
+    let csvContent = 'Timestamp,Tag Index,Equipment Name,Value,Unit,Quality Status,Marker\r\n';
     selectedTags.forEach(tagIdx => {
       const records = tagSeriesData[tagIdx] || [];
       records.forEach(row => {
@@ -263,6 +352,7 @@ export default function Trends() {
   ════════════════════════════════════════════ */
   useEffect(() => {
     const fetch = async () => {
+      if (!isActive) return;
       if (selectedTags.length === 0) {
         setHistorianData([]);
         setDiagnostics(p => ({
@@ -287,13 +377,24 @@ export default function Trends() {
 
       const t0 = performance.now();
       try {
-        // Query records belonging to the selected TagIndex within the selected time range
-        const data = await getHistorianData({
-          tagIndexes: selectedTags,
-          startDate: timeRange.startDate,
-          endDate: timeRange.endDate,
-          sort: 'asc'
-        });
+        const supabase = getSupabaseClient();
+        const settings = await getSettings();
+        const tableName = settings?.selectedTable || 'Database';
+        const mappings = settings?.columnMappings || {};
+        const isAlarmInt = settings?.selectedTable === 'Database';
+
+        const data = await getRecordsInRange(
+          supabase,
+          tableName,
+          selectedTags,
+          timeRange.startDate,
+          timeRange.endDate,
+          mappings,
+          'asc',
+          isAlarmInt,
+          settings,
+          3000 // Server-side cap of 3000 rows max to save egress
+        );
         const ms = Math.round(performance.now() - t0);
         setHistorianData(data);
         
@@ -303,13 +404,20 @@ export default function Trends() {
         };
 
         // Audit logging as requested
-        console.log(`[Trend Range Audit] Preset/Trigger: ${timePreset || 'custom'}`);
-        console.log(`* Start Date: ${timeRange.startDate}`);
-        console.log(`* End Date:   ${timeRange.endDate}`);
-        console.log(`* TagIndexes: ${selectedTags.join(', ')}`);
-        console.log(`* Total Records Returned: ${data.length}`);
+        const sortedDesc = [...data].sort((a, b) => parseTimestampToMs(b.DateAndTime) - parseTimestampToMs(a.DateAndTime));
+        const latestTime = sortedDesc.length > 0 ? sortedDesc[0].DateAndTime : 'None';
+        const latestId = sortedDesc.length > 0 ? sortedDesc[0].ID : 'N/A';
+
+        console.log(`[Trend Refresh Audit]
+  - Query Table: "Database" (or custom mapped table)
+  - Start Date: "${timeRange.startDate}"
+  - End Date: "${timeRange.endDate}"
+  - TagIndexes: ${selectedTags.join(', ')}
+  - Row Count: ${data.length}
+  - Latest Timestamp: "${latestTime}"
+  - Latest ID: ${latestId}`);
         selectedTags.forEach(tagIdx => {
-          const count = data.filter(r => r.TagIndex === tagIdx).length;
+          const count = data.filter(r => tagIndexMatch(r.TagIndex, tagIdx)).length;
           console.log(`  - TagIndex ${tagIdx} (${tagMap[tagIdx]?.TagName || 'Unknown'}): ${count} records`);
         });
 
@@ -325,7 +433,7 @@ export default function Trends() {
       }
     };
     fetch();
-  }, [selectedTags, tagMap, timeRange.startDate, timeRange.endDate, refreshTrigger, timePreset]);
+  }, [selectedTags, tagMap, timeRange.startDate, timeRange.endDate, refreshTrigger, timePreset, isActive]);
 
   /* ════════════════════════════════════════════
      Filtered tag list for left panel
@@ -362,9 +470,13 @@ export default function Trends() {
         }
       }
     } else {
-      // Single Tag Mode: selects only this tag
-      setSelectedTags([tagIndex]);
-      setFocusedTagIdx(tagIndex);
+      if (selectedTags.includes(tagIndex)) {
+        setSelectedTags([]);
+        setFocusedTagIdx(null);
+      } else {
+        setSelectedTags([tagIndex]);
+        setFocusedTagIdx(tagIndex);
+      }
     }
   };
 
@@ -391,7 +503,7 @@ export default function Trends() {
       const seenTimes = new Set();
       series[idx] = historianData
         .filter(r => {
-          if (r.TagIndex !== idx) return false;
+          if (!tagIndexMatch(r.TagIndex, idx)) return false;
           const tMs = Date.parse(r.DateAndTime);
           if (isNaN(tMs)) return false;
           return tMs >= startMs && tMs <= endMs;
@@ -426,67 +538,93 @@ export default function Trends() {
   }, [tagSeriesData, selectedTags, timeRange]);
 
   const chartBounds = useMemo(() => {
-    const xMin = Date.parse(timeRange.startDate);
-    const xMax = Date.parse(timeRange.endDate);
+    const xMin = parseTimestampToMs(timeRange.startDate);
+    const xMax = parseTimestampToMs(timeRange.endDate);
     return { xMin, xMax, rangeX: xMax - xMin };
   }, [timeRange]);
 
   const localBounds = useMemo(() => {
     const bounds = {};
-    selectedTags.forEach(idx => {
-      let yMin = Infinity;
-      let yMax = -Infinity;
-      const records = tagSeriesData[idx] || [];
-
-      records.forEach(r => {
-        if (r.Val < yMin) yMin = r.Val;
-        if (r.Val > yMax) yMax = r.Val;
-      });
-
-      if (yMin === Infinity) {
-        bounds[idx] = { yMin: 0, yMax: 100, rangeY: 100 };
+    renderedSelectedTags.forEach(idx => {
+      if (scaleMode === 'manual') {
+        const minVal = parseFloat(manualMin) || 0;
+        const maxVal = parseFloat(manualMax) || 100;
+        const range = maxVal - minVal;
+        bounds[idx] = { yMin: minVal, yMax: maxVal, rangeY: range > 0 ? range : 100 };
       } else {
-        const diff = yMax - yMin;
-        const padding = diff === 0 ? 10 : diff * 0.08;
-        yMin -= padding;
-        yMax += padding;
-        bounds[idx] = { yMin, yMax, rangeY: yMax - yMin };
+        let yMin = Infinity;
+        let yMax = -Infinity;
+        const records = tagSeriesData[idx] || [];
+
+        records.forEach(r => {
+          if (r.Val < yMin) yMin = r.Val;
+          if (r.Val > yMax) yMax = r.Val;
+        });
+
+        if (yMin === Infinity) {
+          bounds[idx] = { yMin: 0, yMax: 100, rangeY: 100 };
+        } else {
+          const diff = yMax - yMin;
+          const padding = diff === 0 ? (Math.abs(yMin) === 0 ? 1.0 : Math.abs(yMin) * 0.1) : diff * 0.08;
+          const finalMin = yMin - padding;
+          const finalMax = yMax + padding;
+          bounds[idx] = { yMin: finalMin, yMax: finalMax, rangeY: finalMax - finalMin };
+        }
       }
     });
     return bounds;
-  }, [tagSeriesData, selectedTags]);
+  }, [tagSeriesData, renderedSelectedTags, scaleMode, manualMin, manualMax]);
 
   /* ── SVG canvas constants ── */
   const svgWidth     = 800;
-  const svgHeight    = 320;
-  const paddingLeft  = 58;
-  const paddingRight = 20;
-  const paddingTop   = 20;
-  const paddingBottom = 44;
+  const svgHeight    = 380;
+  const paddingLeft  = 68;
+  const paddingRight = 30;
+  const paddingTop   = 30;
+  const paddingBottom = 50;
   const drawWidth    = svgWidth  - paddingLeft - paddingRight;
   const drawHeight   = svgHeight - paddingTop  - paddingBottom;
+
+  const maxGapMs = useMemo(() => {
+    switch (timePreset) {
+      case '1h':  return 5 * 60 * 1000;       // 5 mins
+      case '6h':  return 30 * 60 * 1000;      // 30 mins
+      case '24h': return 2 * 60 * 60 * 1000;  // 2 hours
+      case '7d':  return 12 * 60 * 60 * 1000; // 12 hours
+      case '30d': return 48 * 60 * 60 * 1000; // 48 hours
+      default: {
+        const diff = chartBounds.rangeX;
+        return diff > 0 ? diff * 0.1 : 24 * 60 * 60 * 1000; // 10% of custom duration
+      }
+    }
+  }, [timePreset, chartBounds]);
 
   const tagSeriesPoints = useMemo(() => {
     const pts = {};
     selectedTags.forEach(idx => {
       const records = tagSeriesData[idx] || [];
       const bounds = localBounds[idx] || { yMin: 0, yMax: 100, rangeY: 100 };
-      // Plot every valid historical record scaled independently to fill vertical space
-      pts[idx] = records.map(r => {
-        const ms  = Date.parse(r.DateAndTime);
+      
+      // Decimate dataset for display (draws the Min-Max envelope keeping peaks visible)
+      const visibleRecords = decimatePoints(records, chartBounds, drawWidth, timePreset);
+
+      pts[idx] = visibleRecords.map(r => {
+        const ms  = parseTimestampToMs(r.DateAndTime);
         const pX  = chartBounds.rangeX > 0 ? (ms - chartBounds.xMin) / chartBounds.rangeX : 0;
         const pY  = bounds.rangeY > 0 ? (r.Val - bounds.yMin) / bounds.rangeY : 0.5;
+        const offset = 8;
         return {
-          x: paddingLeft + pX * drawWidth,
+          x: paddingLeft + offset + pX * (drawWidth - 2 * offset),
           y: paddingTop  + drawHeight - pY * drawHeight,
           val: r.Val,
           timestamp: r.DateAndTime,
           status: r.Status,
+          record: r
         };
       });
     });
     return pts;
-  }, [selectedTags, tagSeriesData, chartBounds, localBounds, drawWidth, drawHeight]);
+  }, [selectedTags, tagSeriesData, chartBounds, localBounds, drawWidth, drawHeight, timePreset]);
 
   /* ── Series statistics ── */
   const seriesStats = useMemo(() => {
@@ -522,8 +660,8 @@ export default function Trends() {
 
   /* ── Grid ticks ── */
   const gridTicks = useMemo(() => {
-    const yTicks = Array.from({ length: 5 }, (_, i) => {
-      const ratio = i / 4;
+    const yTicks = Array.from({ length: 7 }, (_, i) => {
+      const ratio = i / 6;
       const focusedBounds = localBounds[focusedTagIdx] || { yMin: 0, rangeY: 100 };
       return {
         val: focusedBounds.yMin + ratio * focusedBounds.rangeY,
@@ -548,40 +686,109 @@ export default function Trends() {
   /* ── Mouse interactions ── */
   const handleMouseMove = e => {
     if (!chartRef.current || historianData.length === 0) return;
-    const rect    = chartRef.current.getBoundingClientRect();
-    const mouseX  = e.clientX - rect.left;
-    const ratioX  = (mouseX - paddingLeft) / drawWidth;
-    const targetMs = chartBounds.xMin + ratioX * chartBounds.rangeX;
+    const rect = chartRef.current.getBoundingClientRect();
+    if (rect.width === 0) return;
+    const mouseX = (e.clientX - rect.left) * (800 / rect.width);
 
+    // Get the range of plotted points across all selected tags
+    let earliestX = paddingLeft;
+    let latestX = paddingLeft + drawWidth;
+    let hasPoints = false;
+
+    selectedTags.forEach(tagIdx => {
+      const pts = tagSeriesPoints[tagIdx] || [];
+      if (pts.length > 0) {
+        hasPoints = true;
+        const x1 = pts[0].x;
+        const x2 = pts[pts.length - 1].x;
+        if (x1 < earliestX) earliestX = x1;
+        if (x2 > latestX) latestX = x2;
+      }
+    });
+
+    if (!hasPoints) {
+      setHoveredData(null);
+      return;
+    }
+
+    // 1. If mouse is outside the bounds of plotted data, hide the tooltip immediately
+    if (mouseX < earliestX - 5 || mouseX > latestX + 5) {
+      setHoveredData(null);
+      return;
+    }
+
+    // 2. Search all plotted points across all selected tags to find the closest one to the cursor X position
+    let bestPt = null;
+    let minDx = Infinity;
+
+    selectedTags.forEach(tagIdx => {
+      const pts = tagSeriesPoints[tagIdx] || [];
+      pts.forEach(p => {
+        const dx = Math.abs(p.x - mouseX);
+        if (dx < minDx) {
+          minDx = dx;
+          bestPt = p;
+        }
+      });
+    });
+
+    if (!bestPt) {
+      setHoveredData(null);
+      return;
+    }
+
+    // 3. Find corresponding records for all tags at/near this snapped timestamp
     const hoverValues = [];
-    let closestTimeMs = 0, closestTimestamp = '', minDist = Infinity;
+    const targetMs = parseTimestampToMs(bestPt.timestamp);
 
     selectedTags.forEach((tagIdx, i) => {
       const records = tagSeriesData[tagIdx] || [];
       if (!records.length) return;
-      let best = records[0], bestDiff = Math.abs(Date.parse(records[0].DateAndTime) - targetMs);
+      
+      let bestRec = records[0];
+      let bestRecIndex = 0;
+      let minDiff = Math.abs(parseTimestampToMs(records[0].DateAndTime) - targetMs);
+      
       for (let j = 1; j < records.length; j++) {
-        const d = Math.abs(Date.parse(records[j].DateAndTime) - targetMs);
-        if (d < bestDiff) { bestDiff = d; best = records[j]; }
+        const diff = Math.abs(parseTimestampToMs(records[j].DateAndTime) - targetMs);
+        if (diff < minDiff) {
+          minDiff = diff;
+          bestRec = records[j];
+          bestRecIndex = j;
+        }
       }
-      if (bestDiff < minDist) {
-        minDist = bestDiff;
-        closestTimeMs = Date.parse(best.DateAndTime);
-        closestTimestamp = best.DateAndTime;
-      }
-      const cfg = tagMap[tagIdx] || { TagName: `Tag ${tagIdx}`, Unit: '' };
-      hoverValues.push({ tagIndex: tagIdx, name: cfg.TagName, unit: cfg.Unit, val: best.Val, color: TAG_COLORS[i % TAG_COLORS.length] });
+
+      const bounds = localBounds[tagIdx] || { yMin: 0, yMax: 100, rangeY: 100 };
+      const pY = bounds.rangeY > 0 ? (bestRec.Val - bounds.yMin) / bounds.rangeY : 0.5;
+      const yCoord = paddingTop + drawHeight - pY * drawHeight;
+
+      const cfg = tagConfigs.find(t => normalizeTagIndex(t.TagIndex) === normalizeTagIndex(tagIdx)) || { TagName: `Tag ${tagIdx}`, Unit: '' };
+      const statusLabel = bestRec.Status === 192 ? 'GOOD' : `BAD (${bestRec.Status || 0})`;
+      
+      hoverValues.push({
+        tagIndex: `T${tagIdx}`,
+        name: cfg.TagName || cfg.tagName || `Tag ${tagIdx}`,
+        unit: cfg.Unit || cfg.unit || '',
+        val: bestRec.Val,
+        time: formatTimestampToPlantTime(bestRec.DateAndTime, currentPlantId),
+        quality: statusLabel,
+        color: TAG_COLORS[i % TAG_COLORS.length],
+        y: yCoord,
+        index: bestRecIndex + 1,
+        recordId: bestRec.id || bestRec.Id || 'N/A'
+      });
     });
 
-    const lineX = chartBounds.rangeX > 0
-      ? paddingLeft + ((closestTimeMs - chartBounds.xMin) / chartBounds.rangeX) * drawWidth
-      : paddingLeft;
+    setHoveredData({
+      x: bestPt.x,
+      timestamp: bestPt.timestamp,
+      values: hoverValues,
+      empty: false
+    });
+  };
 
-    if (mouseX >= paddingLeft && mouseX <= paddingLeft + drawWidth) {
-      setHoveredData({ x: lineX, timestamp: closestTimestamp, values: hoverValues });
-    } else {
-      setHoveredData(null);
-    }
+  const handleMouseLeave = () => {
+    setHoveredData(null);
   };
 
   /* ════════════════════════════════════════════
@@ -590,12 +797,10 @@ export default function Trends() {
   const visibleTagsTotal = tagConfigs.filter(t => t.TrendsVisible).length;
 
   const PRESET_BUTTONS = [
-    { key: '1h',     label: '1H'     },
-    { key: '6h',     label: '6H'     },
-    { key: '24h',    label: '24H'    },
-    { key: '7d',     label: '7D'     },
-    { key: '30d',    label: '30D'    },
-    { key: 'custom', label: 'Custom' },
+    { key: '1h',     label: '1 Hour'   },
+    { key: '12h',    label: '12 Hours' },
+    { key: '24h',    label: '24 Hours' },
+    { key: 'custom', label: 'Custom Range' },
   ];
 
   return (
@@ -606,76 +811,91 @@ export default function Trends() {
       ═══════════════════════════════════════ */}
       <div className="trends-left-panel">
 
-        {/* Sticky Header & Search Wrapper */}
+        {/* Container 1: Header, Compare, Count, Search */}
         <div style={{
-          position: 'sticky',
-          top: 0,
-          zIndex: 10,
+          flexShrink: 0,
           backgroundColor: 'var(--surface)',
           borderBottom: '1px solid var(--border)',
         }}>
           {/* Panel header */}
           <div style={{
-            padding: '12px 16px 10px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            height: '60px',
+            padding: '0 16px',
             borderBottom: '1px solid var(--border)',
             flexShrink: 0,
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '8px'
+            gap: '16px'
           }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--secondary)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-                </svg>
-                <span style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--text)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
-                  Tag Directory
-                </span>
-              </div>
-              {/* Compare Mode Toggle Switch */}
-              <label className="toggle-switch" style={{ fontSize: '0.72rem', fontWeight: 600, color: 'var(--text-muted)' }}>
+            {/* Title section */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--secondary)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+              </svg>
+              <span style={{ fontSize: '13px', fontWeight: 700, color: 'var(--text)', letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                Trends
+              </span>
+            </div>
+            
+            {/* Compare Toggle Switch */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+              <span style={{ fontSize: '11px', fontWeight: 600, color: '#4B5563', textTransform: 'uppercase', letterSpacing: '0.02em' }}>Compare</span>
+              <label className="toggle-switch" style={{ margin: 0 }}>
                 <input 
                   type="checkbox" 
                   checked={compareMode}
                   onChange={(e) => handleCompareModeToggle(e.target.checked)} 
                 />
                 <div className="toggle-track"></div>
-                <span>Compare</span>
               </label>
             </div>
-            <p style={{ margin: 0, fontSize: '0.68rem', color: 'var(--text-muted)' }}>
-              {visibleTagsTotal} tag{visibleTagsTotal !== 1 ? 's' : ''} available · {selectedTags.length} selected
+          </div>
+
+          {/* Status Text (with 12px margin below header) */}
+          <div style={{ padding: '12px 16px 0', flexShrink: 0 }}>
+            <p style={{ margin: 0, fontSize: '11px', color: '#6B7280', fontWeight: 500 }}>
+              {visibleTagsTotal} equipment item{visibleTagsTotal !== 1 ? 's' : ''} available · {selectedTags.length} selected
             </p>
           </div>
 
           {/* Search */}
-          <div style={{ padding: '10px 12px', flexShrink: 0 }}>
+          <div style={{ padding: '12px 16px', flexShrink: 0 }}>
             <div style={{ position: 'relative' }}>
               <svg
-                width="13" height="13" viewBox="0 0 24 24" fill="none"
-                stroke="var(--text-muted)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
-                style={{ position: 'absolute', left: '9px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}
+                width="14" height="14" viewBox="0 0 24 24" fill="none"
+                stroke="var(--text-muted)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}
               >
                 <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
               </svg>
               <input
                 type="text"
                 className="form-control"
-                placeholder="Search tags..."
+                placeholder="Search equipment..."
                 value={tagSearchQuery}
                 onChange={e => setTagSearchQuery(e.target.value)}
                 autoComplete="off"
                 autoCorrect="off"
                 autoCapitalize="off"
                 spellCheck="false"
-                style={{ paddingLeft: '28px', fontSize: '0.76rem', height: '32px' }}
+                style={{ 
+                  paddingLeft: '34px', 
+                  fontSize: '0.8rem', 
+                  height: '40px',
+                  borderRadius: '10px',
+                  border: '1px solid #E5E7EB',
+                  backgroundColor: 'var(--surface)',
+                  width: '100%',
+                  transition: 'all 0.15s ease'
+                }}
               />
             </div>
           </div>
         </div>
 
-        {/* Tag list */}
-        <div style={{ padding: '6px 8px' }}>
+        {/* Container 2: Tag cards (ONLY this area scrolls) */}
+        <ScrollableTagList style={{ padding: '6px 16px 16px' }}>
           {visibleTagsTotal === 0 ? (
             <div style={{ padding: '32px 16px', textAlign: 'center' }}>
               <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" strokeWidth="1.5" style={{ marginBottom: '10px', opacity: 0.4 }}>
@@ -705,20 +925,30 @@ export default function Trends() {
                   style={{
                     display: 'flex',
                     alignItems: 'center',
-                    gap: '9px',
-                    padding: '7px 8px',
-                    borderRadius: '6px',
+                    gap: '12px',
+                    padding: '12px 16px',
+                    borderRadius: '10px',
                     cursor: 'pointer',
-                    marginBottom: '2px',
-                    border: isChecked ? `1px solid ${lineColor}28` : '1px solid transparent',
-                    backgroundColor: isChecked ? `${lineColor}10` : 'transparent',
-                    transition: 'background-color 0.12s, border-color 0.12s',
+                    marginBottom: '8px',
+                    border: isChecked ? '1px solid rgba(37,99,235,0.08)' : '1px solid #E5E7EB',
+                    borderLeft: isChecked ? `4px solid ${lineColor}` : '4px solid transparent',
+                    backgroundColor: isChecked ? `${lineColor}0a` : 'var(--surface)',
+                    boxShadow: isChecked ? '0 2px 4px rgba(37,99,235,0.02)' : 'none',
+                    transition: 'all 150ms ease',
                   }}
                   onMouseEnter={e => {
-                    if (!isChecked) e.currentTarget.style.backgroundColor = 'var(--primary-hover)';
+                    e.currentTarget.style.transform = 'translateY(-1px)';
+                    e.currentTarget.style.boxShadow = '0 4px 6px rgba(0,0,0,0.04)';
+                    if (!isChecked) {
+                      e.currentTarget.style.borderColor = '#D1D5DB';
+                    }
                   }}
                   onMouseLeave={e => {
-                    e.currentTarget.style.backgroundColor = isChecked ? `${lineColor}10` : 'transparent';
+                    e.currentTarget.style.transform = 'none';
+                    e.currentTarget.style.boxShadow = isChecked ? '0 2px 4px rgba(37,99,235,0.02)' : 'none';
+                    if (!isChecked) {
+                      e.currentTarget.style.borderColor = '#E5E7EB';
+                    }
                   }}
                 >
                   {/* Checkbox */}
@@ -726,33 +956,42 @@ export default function Trends() {
                     type="checkbox"
                     checked={isChecked}
                     onChange={() => {}}
-                    onClick={e => e.stopPropagation()}
-                    style={{ cursor: 'pointer', accentColor: lineColor || 'var(--secondary)', flexShrink: 0 }}
+                    style={{ 
+                      cursor: 'pointer', 
+                      accentColor: lineColor || 'var(--secondary)', 
+                      flexShrink: 0,
+                      width: '15px',
+                      height: '15px',
+                      marginTop: '1px'
+                    }}
                   />
 
                   {/* Tag index badge */}
-                  <span style={{
+                  <div style={{
                     flexShrink: 0,
-                    fontSize: '0.58rem',
+                    width: '26px',
+                    height: '26px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: '0.74rem',
                     fontFamily: 'var(--mono)',
                     fontWeight: 700,
-                    padding: '1px 5px',
-                    borderRadius: '3px',
-                    backgroundColor: isChecked ? `${lineColor}22` : 'var(--primary)',
-                    color: isChecked ? lineColor : 'var(--text-muted)',
-                    border: isChecked ? `1px solid ${lineColor}44` : '1px solid transparent',
-                    letterSpacing: '0.03em',
+                    borderRadius: '6px',
+                    backgroundColor: isChecked ? lineColor : '#F3F4F6',
+                    color: isChecked ? '#FFFFFF' : '#6B7280',
+                    transition: 'all 150ms ease'
                   }}>
                     {tag.TagIndex}
-                  </span>
+                  </div>
 
                   {/* Tag info */}
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <span style={{
                       display: 'block',
-                      fontSize: '0.74rem',
+                      fontSize: '13px',
                       fontWeight: 600,
-                      color: isChecked ? 'var(--text)' : 'var(--text-muted)',
+                      color: isChecked ? 'var(--text)' : '#374151',
                       whiteSpace: 'nowrap',
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
@@ -760,8 +999,8 @@ export default function Trends() {
                       {tag.TagName}
                     </span>
                     {tag.Unit && (
-                      <span style={{ fontSize: '0.62rem', color: 'var(--text-muted)', fontFamily: 'var(--mono)' }}>
-                        {tag.Unit}
+                      <span style={{ fontSize: '11px', color: '#9CA3AF', display: 'block', marginTop: '2px' }}>
+                        Unit: {tag.Unit}
                       </span>
                     )}
                   </div>
@@ -781,33 +1020,28 @@ export default function Trends() {
               );
             })
           )}
-        </div>
+        </ScrollableTagList>
       </div>
 
       {/* ═══════════════════════════════════════
           RIGHT PANEL – Chart Area
       ═══════════════════════════════════════ */}
-      <div className="trends-right-panel">
+      <div className="trends-right-panel" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
 
-        {/* ── Time range controls ── */}
+        {/* Time Preset Bar */}
         <div style={{
-          flexShrink: 0,
-          borderBottom: '1px solid var(--border)',
-          padding: '10px 20px',
+          padding: '12px 20px',
           display: 'flex',
+          justifyContent: 'space-between',
           alignItems: 'center',
-          flexWrap: 'wrap',
-          gap: '10px',
+          borderBottom: '1px solid var(--border)',
           backgroundColor: 'var(--surface-raised)',
+          flexShrink: 0,
+          flexWrap: 'wrap',
+          gap: '12px'
         }}>
-
-          {/* Label */}
-          <span style={{ fontSize: '0.68rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 600, flexShrink: 0 }}>
-            Time Range
-          </span>
-
-          {/* Preset buttons */}
-          <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '0.7rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginRight: '6px' }}>Time Range:</span>
             {PRESET_BUTTONS.map(({ key, label }) => {
               const active = timePreset === key;
               return (
@@ -815,164 +1049,59 @@ export default function Trends() {
                   key={key}
                   onClick={() => setTimePreset(key)}
                   style={{
-                    padding: '5px 12px',
+                    padding: '6px 12px',
                     fontSize: '0.72rem',
                     fontWeight: 600,
-                    fontFamily: 'var(--mono)',
-                    borderRadius: '5px',
+                    borderRadius: '6px',
                     border: active ? '1px solid var(--secondary)' : '1px solid var(--border)',
                     backgroundColor: active ? 'var(--accent-dim)' : 'transparent',
                     color: active ? 'var(--secondary)' : 'var(--text-muted)',
                     cursor: 'pointer',
-                    transition: 'all 0.15s',
-                    letterSpacing: '0.04em',
+                    transition: 'all 0.1s'
                   }}
-                  onMouseEnter={e => { if (!active) { e.currentTarget.style.borderColor = 'var(--secondary)'; e.currentTarget.style.color = 'var(--text)'; } }}
-                  onMouseLeave={e => { if (!active) { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; } }}
                 >
                   {label}
                 </button>
               );
             })}
           </div>
-
-          {/* Custom pickers */}
+          
           {timePreset === 'custom' && (
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <label style={{ fontSize: '0.65rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', whiteSpace: 'nowrap' }}>From</label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>From</span>
                 <input
                   type="datetime-local"
-                  className="form-control"
                   value={customStart}
                   onChange={e => setCustomStart(e.target.value)}
-                  style={{ padding: '4px 8px', fontSize: '0.73rem', height: '30px', width: '180px' }}
+                  style={{ padding: '4px 8px', fontSize: '0.72rem', border: '1px solid var(--border)', borderRadius: '4px', height: '28px' }}
                 />
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <label style={{ fontSize: '0.65rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', whiteSpace: 'nowrap' }}>To</label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>To</span>
                 <input
                   type="datetime-local"
-                  className="form-control"
                   value={customEnd}
                   onChange={e => setCustomEnd(e.target.value)}
-                  style={{ padding: '4px 8px', fontSize: '0.73rem', height: '30px', width: '180px' }}
+                  style={{ padding: '4px 8px', fontSize: '0.72rem', border: '1px solid var(--border)', borderRadius: '4px', height: '28px' }}
                 />
               </div>
             </div>
           )}
-
-          {/* Zoom/Pan/Export Toolbar */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0, borderLeft: '1px solid var(--border)', paddingLeft: '10px' }}>
-            <button
-              onClick={() => handlePan(-1)}
-              title="Pan Left (Shift 20% Earlier)"
-              style={{
-                width: '30px', height: '30px', borderRadius: '5px', border: '1px solid var(--border)',
-                background: 'var(--surface)', color: 'var(--text-muted)',
-                fontSize: '0.72rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                transition: 'all 0.15s'
-              }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--secondary)'; e.currentTarget.style.color = 'var(--secondary)'; e.currentTarget.style.background = 'var(--accent-dim)'; }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'var(--surface)'; }}
-            >
-              ◀
-            </button>
-            <button
-              onClick={() => handleZoom(0.7)}
-              title="Zoom In (Decrease Time Span)"
-              style={{
-                width: '30px', height: '30px', borderRadius: '5px', border: '1px solid var(--border)',
-                background: 'var(--surface)', color: 'var(--text-muted)',
-                fontSize: '0.85rem', fontWeight: 'bold', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                transition: 'all 0.15s'
-              }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--secondary)'; e.currentTarget.style.color = 'var(--secondary)'; e.currentTarget.style.background = 'var(--accent-dim)'; }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'var(--surface)'; }}
-            >
-              ＋
-            </button>
-            <button
-              onClick={() => handleZoom(1.3)}
-              title="Zoom Out (Increase Time Span)"
-              style={{
-                width: '30px', height: '30px', borderRadius: '5px', border: '1px solid var(--border)',
-                background: 'var(--surface)', color: 'var(--text-muted)',
-                fontSize: '0.85rem', fontWeight: 'bold', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                transition: 'all 0.15s'
-              }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--secondary)'; e.currentTarget.style.color = 'var(--secondary)'; e.currentTarget.style.background = 'var(--accent-dim)'; }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'var(--surface)'; }}
-            >
-              －
-            </button>
-            <button
-              onClick={() => handlePan(1)}
-              title="Pan Right (Shift 20% Later)"
-              style={{
-                width: '30px', height: '30px', borderRadius: '5px', border: '1px solid var(--border)',
-                background: 'var(--surface)', color: 'var(--text-muted)',
-                fontSize: '0.72rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                transition: 'all 0.15s'
-              }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--secondary)'; e.currentTarget.style.color = 'var(--secondary)'; e.currentTarget.style.background = 'var(--accent-dim)'; }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'var(--surface)'; }}
-            >
-              ▶
-            </button>
-            <button
-              onClick={handleZoomReset}
-              title="Reset Zoom & Pan to default"
-              style={{
-                width: '30px', height: '30px', borderRadius: '5px', border: '1px solid var(--border)',
-                background: 'var(--surface)', color: 'var(--text-muted)',
-                fontSize: '0.85rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                transition: 'all 0.15s'
-              }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--secondary)'; e.currentTarget.style.color = 'var(--secondary)'; e.currentTarget.style.background = 'var(--accent-dim)'; }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'var(--surface)'; }}
-            >
-              ↺
-            </button>
-            <button
-              onClick={handleExportCSV}
-              title="Export Current View Data to CSV"
-              style={{
-                height: '30px', padding: '0 10px', borderRadius: '5px', border: '1px solid rgba(37,99,235,0.25)',
-                background: 'rgba(37,99,235,0.08)', color: 'var(--secondary)',
-                fontSize: '0.72rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '5px',
-                transition: 'all 0.15s', marginLeft: '6px'
-              }}
-              onMouseEnter={e => { e.currentTarget.style.background = 'rgba(37,99,235,0.15)'; e.currentTarget.style.borderColor = 'var(--secondary)'; }}
-              onMouseLeave={e => { e.currentTarget.style.background = 'rgba(37,99,235,0.08)'; e.currentTarget.style.borderColor = 'rgba(37,99,235,0.25)'; }}
-            >
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-              </svg>
-              Export CSV
-            </button>
-          </div>
-
-          {/* Diagnostics pill strip */}
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: '12px', alignItems: 'center', flexShrink: 0 }}>
-            <DiagPill label="Records" value={`${diagnostics.recordsFound.toLocaleString()} rows`} highlight={diagnostics.recordsFound > 0} />
-            <DiagPill label="Query" value={`${diagnostics.queryTimeMs} ms`} />
-          </div>
         </div>
 
-        {/* ── Selected tag pills ── */}
+        {/* ── Selected tag pills (Legend) ── */}
         {selectedTags.length > 0 && (
           <div style={{
             flexShrink: 0,
-            padding: '8px 20px',
+            padding: '12px 20px',
             display: 'flex',
-            gap: '6px',
+            gap: '8px',
             flexWrap: 'wrap',
             alignItems: 'center',
-            borderBottom: '1px solid var(--border)',
-            backgroundColor: 'var(--surface-raised)',
+            borderBottom: '1px solid var(--border-subtle)'
           }}>
-            <span style={{ fontSize: '0.64rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 600, marginRight: '2px' }}>
+            <span style={{ fontSize: '0.64rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 600, marginRight: '4px' }}>
               Plotting:
             </span>
             {selectedTags.map((tagIdx, i) => {
@@ -985,12 +1114,12 @@ export default function Trends() {
                     display: 'inline-flex',
                     alignItems: 'center',
                     gap: '5px',
-                    padding: '3px 8px 3px 6px',
+                    padding: '4px 10px',
                     borderRadius: '20px',
                     fontSize: '0.71rem',
                     fontWeight: 600,
-                    border: `1px solid ${color}55`,
-                    backgroundColor: `${color}12`,
+                    border: `1px solid ${color}45`,
+                    backgroundColor: `${color}0d`,
                     color: color,
                   }}
                 >
@@ -1007,7 +1136,7 @@ export default function Trends() {
                       lineHeight: 1,
                       color: color,
                       fontSize: '0.8rem',
-                      marginLeft: '2px',
+                      marginLeft: '4px',
                       display: 'flex',
                       alignItems: 'center',
                       opacity: 0.7
@@ -1023,7 +1152,7 @@ export default function Trends() {
         )}
 
         {/* ── Chart & Statistics Container ── */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '16px', padding: '16px 20px 20px', minHeight: 0, overflow: 'hidden' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', padding: '16px 20px 20px', flex: 1, minHeight: 0 }}>
 
           {/* Chart Wrapper */}
           <div
@@ -1031,8 +1160,8 @@ export default function Trends() {
               position: 'relative', 
               width: '100%', 
               cursor: 'crosshair', 
-              flex: 1.2, 
-              minHeight: '200px',
+              flex: 2, 
+              minHeight: '340px',
               display: 'flex',
               flexDirection: 'column'
             }}
@@ -1040,11 +1169,43 @@ export default function Trends() {
             <div
               style={{ position: 'relative', width: '100%', cursor: 'crosshair', flex: 1, minHeight: 0 }}
               onMouseMove={handleMouseMove}
-              onMouseLeave={() => setHoveredData(null)}
+              onMouseLeave={handleMouseLeave}
               ref={chartRef}
             >
+              {/* Inline loading overlay that does not block or clear the axes */}
+              {(loading || isRefreshing) && renderedHistorianData.length > 0 && (
+                <div style={{
+                  position: 'absolute',
+                  top: '50%',
+                  left: '50%',
+                  transform: 'translate(-50%, -50%)',
+                  backgroundColor: 'var(--surface)',
+                  border: '1px solid var(--border)',
+                  padding: '8px 16px',
+                  borderRadius: '20px',
+                  boxShadow: 'var(--shadow-md)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  zIndex: 10,
+                  pointerEvents: 'none'
+                }}>
+                  <div style={{
+                    width: '14px',
+                    height: '14px',
+                    borderRadius: '50%',
+                    border: '2px solid rgba(0, 0, 0, 0.1)',
+                    borderTopColor: 'var(--secondary)',
+                    animation: 'spin 0.6s linear infinite'
+                  }} />
+                  <span style={{ fontSize: '0.7rem', fontWeight: 600, color: 'var(--text)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                    Updating Trend...
+                  </span>
+                </div>
+              )}
               {/* ── Loading state ── */}
-              {loading ? (
+              {/* ── Loading state ── */}
+              {(loading || isRefreshing) && renderedHistorianData.length === 0 ? (
                 <ChartPlaceholder>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                     <div style={{
@@ -1058,32 +1219,31 @@ export default function Trends() {
                     </span>
                   </div>
                 </ChartPlaceholder>
-
+ 
               /* ── No tag selected ── */
-              ) : selectedTags.length === 0 ? (
+              ) : renderedSelectedTags.length === 0 ? (
                 <ChartPlaceholder>
                   <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" strokeWidth="1.2" style={{ marginBottom: '12px' }}>
                     <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
                   </svg>
-                  <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.6 }}>
-                    {visibleTagsTotal === 0
-                      ? 'No tags configured for trends.\nConfigure tags in Tag Configuration.'
-                      : 'Select a tag from the directory\nto view its trend.'}
+                  <h4 style={{ margin: '0 0 8px 0', fontSize: '1rem', fontWeight: 600, color: 'var(--text)' }}>No equipment selected.</h4>
+                  <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.6, maxWidth: '280px' }}>
+                    Select one or more equipment items from the directory to display historical trends.
                   </p>
                 </ChartPlaceholder>
-
+ 
               /* ── No data found ── */
-              ) : historianData.length === 0 ? (
+              ) : renderedHistorianData.length === 0 ? (
                 <ChartPlaceholder>
                   <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" strokeWidth="1.2" style={{ marginBottom: '12px' }}>
                     <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" />
                     <polyline points="13 2 13 9 20 9" />
                   </svg>
                   <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.6 }}>
-                    No historian records found for selected tag and date range.
+                    No historical data available for the selected time range.
                   </p>
                 </ChartPlaceholder>
-
+ 
               /* ── SVG Chart ── */
               ) : (
                 <>
@@ -1091,54 +1251,89 @@ export default function Trends() {
                     viewBox={`0 0 ${svgWidth} ${svgHeight}`}
                     style={{ width: '100%', height: '100%', overflow: 'visible', display: 'block' }}
                   >
-                    {/* Chart background */}
+                    {/* Chart background - pure white for industrial historian feel */}
                     <rect x={paddingLeft} y={paddingTop} width={drawWidth} height={drawHeight}
-                      fill="var(--surface-raised)" rx="2" />
+                      fill="#ffffff" rx="2" />
+
+                    {/* Subtle inline loading indicator at top-right of chart */}
+                    {(loading || isRefreshing) && (
+                      <text
+                        x={paddingLeft + drawWidth}
+                        y={paddingTop - 12}
+                        fill="var(--secondary)"
+                        fontSize="8.5"
+                        fontWeight="bold"
+                        fontFamily="var(--mono)"
+                        letterSpacing="0.05em"
+                        textAnchor="end"
+                      >
+                        ↻ REFRESHING...
+                      </text>
+                    )}
 
                     {/* Y-axis focused tag scale label */}
                     {focusedTagIdx !== null && (
                       <text
                         x={paddingLeft}
                         y={paddingTop - 7}
-                        fill={TAG_COLORS[selectedTags.indexOf(focusedTagIdx) % TAG_COLORS.length] || 'var(--text-muted)'}
+                        fill={TAG_COLORS[selectedTags.indexOf(focusedTagIdx) % TAG_COLORS.length] || '#4b5563'}
                         fontSize="9"
                         fontWeight="bold"
+                        fontFamily="Inter, sans-serif"
                         textAnchor="start"
                       >
                         Scale: {tagMap[focusedTagIdx]?.TagName || `Tag ${focusedTagIdx}`} ({tagMap[focusedTagIdx]?.Unit || 'No Unit'})
                       </text>
                     )}
 
-                    {/* Y grid lines & labels */}
+                    {/* Y grid lines & labels - clearly visible at 40% opacity for value reading */}
                     {gridTicks.yTicks.map((tick, i) => (
                       <g key={`y-${i}`}>
+                        {/* Horizontal grid line */}
                         <line
                           x1={paddingLeft} y1={tick.y}
                           x2={paddingLeft + drawWidth} y2={tick.y}
-                          stroke={i === 0 ? 'var(--border)' : 'var(--border-subtle)'}
+                          stroke={i === 0 ? 'var(--border)' : 'rgba(226, 232, 240, 0.4)'}
                           strokeWidth="1"
                         />
+                        {/* Y-axis tick mark */}
+                        <line
+                          x1={paddingLeft - 5} y1={tick.y}
+                          x2={paddingLeft} y2={tick.y}
+                          stroke="#9ca3af" strokeWidth="1"
+                        />
                         <text
-                          x={paddingLeft - 7} y={tick.y + 3.5}
-                          fill="var(--text-muted)" fontSize="8.5"
-                          fontFamily="var(--mono)" textAnchor="end"
+                          x={paddingLeft - 9} y={tick.y + 4}
+                          fill="#0F172A" fontSize="11"
+                          fontFamily="Inter, sans-serif"
+                          fontWeight="500"
+                          textAnchor="end"
                         >
                           {tick.val.toFixed(1)}
                         </text>
                       </g>
                     ))}
 
-                    {/* X grid lines & labels */}
+                    {/* X grid lines & labels - lighter than horizontal (22% opacity) */}
                     {gridTicks.xTicks.map((tick, i) => (
                       <g key={`x-${i}`}>
+                        {/* Vertical grid line */}
                         <line
                           x1={tick.x} y1={paddingTop}
                           x2={tick.x} y2={paddingTop + drawHeight}
-                          stroke="var(--border-subtle)" strokeWidth="1"
+                          stroke="rgba(226, 232, 240, 0.3)" strokeWidth="1"
+                        />
+                        {/* X-axis tick mark */}
+                        <line
+                          x1={tick.x} y1={paddingTop + drawHeight}
+                          x2={tick.x} y2={paddingTop + drawHeight + 5}
+                          stroke="#9ca3af" strokeWidth="1"
                         />
                         <text
-                          x={tick.x} y={paddingTop + drawHeight + 16}
-                          fill="var(--text-muted)" fontSize="8"
+                          x={tick.x} y={paddingTop + drawHeight + 17}
+                          fill="#374151" fontSize="11"
+                          fontFamily="Inter, sans-serif"
+                          fontWeight="500"
                           textAnchor="middle"
                         >
                           {tick.label}
@@ -1146,62 +1341,113 @@ export default function Trends() {
                       </g>
                     ))}
 
-                    {/* Tag series paths */}
-                    {selectedTags.map((tagIdx, i) => {
+                    {/* Tag series paths with smooth loading opacity transition */}
+                    <g style={{ opacity: loading || isRefreshing ? 0.55 : 1, transition: 'opacity 0.22s ease-in-out' }}>
+                    {renderedSelectedTags.map((tagIdx, i) => {
                       const pts   = tagSeriesPoints[tagIdx] || [];
-                      if (pts.length < 2) return null;
+                      if (pts.length === 0) return null;
                       const color = TAG_COLORS[i % TAG_COLORS.length];
-                      const pathD = pts.map((p, j) => `${j === 0 ? 'M' : 'L'}${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ');
-                      const gradId = `tg-grad-${tagIdx}`;
+                      
+                      // Split pts into segments based on maxGapMs to prevent drawing straight lines across missing data
+                      const segments = [];
+                      let currentSegment = [];
+                      
+                      if (pts.length > 0) {
+                        currentSegment.push(pts[0]);
+                        for (let j = 1; j < pts.length; j++) {
+                          const prevMs = parseTimestampToMs(pts[j - 1].timestamp);
+                          const currMs = parseTimestampToMs(pts[j].timestamp);
+                          if (currMs - prevMs > maxGapMs) {
+                            segments.push(currentSegment);
+                            currentSegment = [pts[j]];
+                          } else {
+                            currentSegment.push(pts[j]);
+                          }
+                        }
+                        segments.push(currentSegment);
+                      }
+
+                      const lineSegments = [];
+                      const singlePoints = [];
+
+                      segments.forEach(seg => {
+                        if (seg.length === 0) return;
+                        if (seg.length === 1) {
+                          singlePoints.push(seg[0]);
+                        } else {
+                          const segD = getBezierPath(seg);
+                          lineSegments.push(segD);
+                        }
+                      });
+
+                      const pathD = lineSegments.join(' ');
 
                       return (
                         <g key={tagIdx}>
-                          <defs>
-                            <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-                              <stop offset="0%"   stopColor={color} stopOpacity={i === 0 ? '0.18' : '0.06'} />
-                              <stop offset="100%" stopColor={color} stopOpacity="0" />
-                            </linearGradient>
-                          </defs>
-                          {/* Area fill */}
-                          <path
-                            d={`${pathD} L${pts[pts.length-1].x.toFixed(2)},${(paddingTop+drawHeight).toFixed(2)} L${pts[0].x.toFixed(2)},${(paddingTop+drawHeight).toFixed(2)} Z`}
-                            fill={`url(#${gradId})`}
-                          />
-                          {/* Line */}
-                          <path
-                            d={pathD}
-                            fill="none"
-                            stroke={color}
-                            strokeWidth={i === 0 ? '2.2' : '1.8'}
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            style={{ filter: `drop-shadow(0 0 3px ${color}55)` }}
-                          />
+                          {/* Clean, thin trend line (no gradients or area fills) */}
+                          {pathD && (
+                            <path
+                              d={pathD}
+                              fill="none"
+                              stroke={color}
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              shapeRendering="geometricPrecision"
+                            />
+                          )}
+                          {/* Single isolated points */}
+                          {singlePoints.map((pt, sIdx) => (
+                            <circle
+                              key={sIdx}
+                              cx={pt.x.toFixed(2)}
+                              cy={pt.y.toFixed(2)}
+                              r="3.5"
+                              fill={color}
+                              stroke="#ffffff"
+                              strokeWidth="1.2"
+                            />
+                          ))}
                         </g>
                       );
                     })}
 
+                    {/* Snap markers while hovering over a data point */}
+                    {hoveredData && !hoveredData.empty && hoveredData.values.map((v, idx) => (
+                      <circle
+                        key={`hover-marker-${idx}`}
+                        cx={hoveredData.x}
+                        cy={v.y}
+                        r="4"
+                        fill={v.color}
+                        stroke="#ffffff"
+                        strokeWidth="1.5"
+                        style={{ filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.25))' }}
+                      />
+                    ))}
+
                     {/* Crosshair vertical line */}
-                    {hoveredData && (
+                    {hoveredData && !hoveredData.empty && (
                       <line
                         x1={hoveredData.x} y1={paddingTop}
                         x2={hoveredData.x} y2={paddingTop + drawHeight}
-                        stroke="rgba(0,229,255,0.5)"
+                        stroke="rgba(0,180,216,0.4)"
                         strokeWidth="1"
                         strokeDasharray="3 3"
                       />
                     )}
 
-                    {/* Axis border */}
+                    {/* Axis border - thin light gray */}
                     <rect
                       x={paddingLeft} y={paddingTop}
                       width={drawWidth} height={drawHeight}
                       fill="none"
-                      stroke="var(--border)"
+                      stroke="rgba(0, 0, 0, 0.1)"
                       strokeWidth="1"
                       rx="2"
                     />
-                  </svg>
+                  </g>
+                </svg>
 
                   {/* Tooltip */}
                   {hoveredData && hoveredData.values.length > 0 && (
@@ -1354,6 +1600,47 @@ export default function Trends() {
               </div>
             </div>
           )}
+
+          {/* ── Diagnostic Debug Panel ── */}
+          {debugInfo && (
+            <div style={{
+              marginTop: '15px',
+              padding: '12px 16px',
+              backgroundColor: 'var(--surface-raised)',
+              borderRadius: '8px',
+              border: '1px solid var(--border)',
+              color: 'var(--text)',
+              fontSize: '0.72rem',
+              fontFamily: 'var(--mono)',
+              lineHeight: '1.6',
+              boxShadow: 'var(--shadow-sm)',
+              flexShrink: 0
+            }}>
+              <div style={{ fontWeight: 700, color: 'var(--secondary)', marginBottom: '8px', fontSize: '0.76rem', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                Trend Query Diagnostics
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '8px 16px' }}>
+                {debugInfo.error ? (
+                  <div style={{ color: 'var(--error)', gridColumn: '1 / -1' }}><strong>Error:</strong> {debugInfo.error}</div>
+                ) : (
+                  <>
+                    <div><strong>Table:</strong> {debugInfo.tableName}</div>
+                    <div><strong>Selected Tags:</strong> {debugInfo.selectedTags}</div>
+                    <div><strong>Target Indexes:</strong> {debugInfo.targetIndexes}</div>
+                    <div><strong>Latest DB Timestamp:</strong> {debugInfo.latestTs}</div>
+                    <div><strong>Query Start Bound:</strong> {debugInfo.startStr}</div>
+                    <div><strong>Query End Bound:</strong> {debugInfo.endStr}</div>
+                    <div><strong>X-Axis Start:</strong> {debugInfo.activeChartStart}</div>
+                    <div><strong>X-Axis End:</strong> {debugInfo.activeChartEnd}</div>
+                    <div><strong>Raw Rows Returned:</strong> {debugInfo.recordCount}</div>
+                    <div><strong>Validated Rows:</strong> {debugInfo.validatedCount}</div>
+                    <div><strong>Timestamp Col:</strong> {debugInfo.tsCol}</div>
+                    <div><strong>Tag Col:</strong> {debugInfo.tagCol}</div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -1381,12 +1668,39 @@ function ChartPlaceholder({ children }) {
     </div>
   );
 }
-
-function DiagPill({ label, value, highlight }) {
+function DiagPill({ label, value, highlight, icon }) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-      <span style={{ fontSize: '0.55rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontFamily: 'var(--mono)' }}>{label}</span>
-      <span style={{ fontSize: '0.7rem', fontFamily: 'var(--mono)', fontWeight: 700, color: highlight ? 'var(--secondary)' : 'var(--text-muted)' }}>{value}</span>
+    <div style={{ 
+      display: 'flex', 
+      flexDirection: 'column',
+      justifyContent: 'center',
+      padding: '8px 12px', 
+      borderRadius: '10px', 
+      border: '1px solid #E5E7EB',
+      background: 'var(--surface)',
+      minWidth: '110px',
+      height: '52px',
+      boxShadow: 'var(--shadow-xs)'
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+        {icon && (
+          <span style={{ color: highlight ? 'var(--success)' : '#9CA3AF', display: 'flex', alignItems: 'center' }}>
+            {icon}
+          </span>
+        )}
+        <span style={{ fontSize: '11px', fontWeight: 500, textTransform: 'uppercase', color: '#6B7280', letterSpacing: '0.04em' }}>
+          {label}
+        </span>
+      </div>
+      <span style={{ 
+        fontSize: '15px', 
+        fontFamily: 'var(--mono)', 
+        fontWeight: 600, 
+        color: highlight ? 'var(--success)' : '#1F2937', 
+        marginTop: '4px' 
+      }}>
+        {value}
+      </span>
     </div>
   );
 }

@@ -1,7 +1,9 @@
 // src/components/Plants.jsx
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { getPlants, savePlant, getProductionHistory } from '../utils/db';
 import { useSimulator } from '../utils/SimulatorContext';
+import { useRefresh } from '../utils/useRefresh';
+import RefreshButton from './RefreshButton';
 
 export default function Plants() {
   const { refreshTrigger } = useSimulator();
@@ -18,20 +20,19 @@ export default function Plants() {
     targetOee: ""
   });
 
-  const loadPlantData = async () => {
+  const fetchPlantData = useCallback(async () => {
     const plist = await getPlants();
     setPlantsList(plist);
 
     const history = await getProductionHistory("all");
     setHistoryData(history);
-  };
+  }, []);
+
+  const { isRefreshing, refreshToast, handleRefresh } = useRefresh(fetchPlantData, 'Plants');
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      loadPlantData();
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [refreshTrigger]);
+    fetchPlantData().catch(() => {});
+  }, [fetchPlantData, refreshTrigger]);
 
   // Aggregate stats for each plant dynamically
   const plantStatsList = useMemo(() => {
@@ -106,22 +107,28 @@ export default function Plants() {
 
     await savePlant(target);
     setShowModal(false);
-    await loadPlantData();
+    await fetchPlantData();
     alert("Plant configuration saved successfully.");
   };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
       
-      {/* Header Action card */}
-      <div className="card" style={{ padding: '20px' }}>
-        <div className="flex justify-between items-center" style={{ flexWrap: 'wrap', gap: '12px' }}>
-          <div>
-            <h3 style={{ fontSize: '1.1rem', margin: 0 }}>🏭 Multi-Plant Operations Directory</h3>
-            <p className="text-xs text-muted" style={{ margin: '2px 0 0' }}>
-              Monitor operating status, target OEE levels, and production capacities across distributed nodes.
-            </p>
-          </div>
+      {/* ── Page Header ─────────────────────── */}
+      <div className="page-header" style={{ marginBottom: '8px' }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: '1.55rem', fontWeight: 700, color: 'var(--text)', letterSpacing: '-0.3px' }}>Multi-Plant Operations Directory</h2>
+          <p style={{ margin: '4px 0 0', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+            Monitor operating status, target OEE levels, and production capacities across distributed nodes.
+          </p>
+        </div>
+        <div className="page-header-actions" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <RefreshButton
+            isRefreshing={isRefreshing}
+            onClick={handleRefresh}
+            toast={refreshToast}
+            id="refresh-btn-plants"
+          />
           <button onClick={() => handleOpenEdit(null)} className="btn btn-primary">
             ➕ Add Node / Plant
           </button>

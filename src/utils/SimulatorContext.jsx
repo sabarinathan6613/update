@@ -1,7 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 // src/utils/SimulatorContext.jsx
 import { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
-import { getHistorianData, addHistorianRecords, addSyncLog, getTagConfigs, getPlants, getSettings } from './db';
+import { addHistorianRecords, addSyncLog, getTagConfigs, getPlants, getSettings, invalidateCache } from './db';
 import { getSupabaseClient, getSupabaseConfig } from './supabaseClient';
 
 // ─── Promise Timeout Helper ────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ export function SimulatorProvider({ children }) {
         setFailedSyncAttempts(prev => prev + 1);
         logMsg(`Sync Failed. Cloud gateway link offline. Retaining +${buffer.length} rows in local SQL cache.`, true);
         try {
-          addSyncLog(`Sync Failed: Cloud Connection Offline. Local Historian Buffer: +${buffer.length} pending.`);
+          addSyncLog(`Sync Failed: Cloud Connection Offline. Local Historian Buffer: +${buffer.length} pending.`, "ERROR");
         } catch { /* ignored */ }
         setSyncTrigger(prev => prev + 1);
         isSyncingRef.current = false;
@@ -131,10 +131,17 @@ export function SimulatorProvider({ children }) {
         logMsg(`SUCCESS: Flushed local SCADA buffer. Sync completed for +${recordBatchCount} tags.`);
         
         // Reset local buffer and failed flags
+        invalidateCache();
         setLocalBuffer([]);
         setSyncStatus("Success");
         setFailedSyncAttempts(0);
+        try {
+          localStorage.setItem('skadomation_last_sync_time', new Date().toISOString());
+        } catch (e) {
+          console.warn("Failed to store sync time locally:", e);
+        }
         setSyncTrigger(prev => prev + 1);
+        setRefreshTrigger(prev => prev + 1); // Trigger UI reload
 
         setTimeout(() => {
           setSyncStatus("Idle");
@@ -157,12 +164,21 @@ export function SimulatorProvider({ children }) {
   useEffect(() => {
     const fetchSyncStats = async () => {
       try {
-        const history = await withTimeout(getHistorianData(), 5000, 'SimulatorContext.getHistorianData');
-        setTotalSyncedRecords(history?.length || 0);
-        const size = (history?.length || 0) * 0.125; // ~125 bytes per historian row
+        const supabase = getSupabaseClient();
+        if (!supabase) return;
+        const settings = await getSettings();
+        const tableName = settings?.selectedTable || 'Database';
+        // Use a lightweight HEAD count instead of fetching all records
+        const { count, error } = await supabase
+          .from(tableName)
+          .select('*', { count: 'exact', head: true });
+        if (error) throw error;
+        const total = count || 0;
+        setTotalSyncedRecords(total);
+        const size = total * 0.125; // ~125 bytes per historian row
         setCloudStorageUsageKb(parseFloat(size.toFixed(2)));
       } catch (e) {
-        console.error("Failed to load historian data for stats:", e);
+        console.error("Failed to load historian stats:", e);
       }
     };
     fetchSyncStats();
@@ -248,7 +264,9 @@ export function SimulatorProvider({ children }) {
           console.log('Supabase real-time change payload:', payload);
           // Set to Syncing briefly on data ingestion to show active work
           if (active) setDbConnectionStatus('Syncing');
+          invalidateCache();
           setSyncTrigger(prev => prev + 1);
+          setRefreshTrigger(prev => prev + 1); // Trigger active views to refresh
           setTimeout(() => {
             if (active) setDbConnectionStatus('Connected');
           }, 800);
@@ -308,66 +326,8 @@ export function SimulatorProvider({ children }) {
 
   // 1. SCADA historian Buffering - Generates live data for configured tags
   useEffect(() => {
-    const interval = setInterval(async () => {
-      try {
-        const configs = await withTimeout(getTagConfigs(), 5000, 'SimulatorContext.getTagConfigs');
-        if (!configs || configs.length === 0) return;
-
-        const now = new Date().toISOString();
-        const millitm = new Date().getMilliseconds();
-
-        const newRecords = configs.map(tag => {
-          // Generate a realistic mock value based on the tag unit or index
-          let val;
-          if (tag.Unit === '°C') {
-            // Temperature simulation: 50 to 90 degrees with some noise
-            val = 60 + Math.sin(Date.now() / 50000) * 15 + Math.random() * 2;
-          } else if (tag.Unit === 'RPM') {
-            // Speed simulation: 1000 to 1500 RPM
-            val = 1200 + Math.cos(Date.now() / 30000) * 200 + Math.random() * 10;
-          } else if (tag.Unit === 'bar') {
-            // Pressure simulation: 4 to 6 bar
-            val = 5.0 + Math.sin(Date.now() / 40000) * 0.8 + Math.random() * 0.1;
-          } else {
-            // Standard random walk
-            val = 40 + Math.sin(Date.now() / 60000) * 30 + Math.random() * 5;
-          }
-
-          // Format value to tag's configured decimal places
-          const dp = tag.DecimalPlaces !== undefined ? tag.DecimalPlaces : 2;
-          val = parseFloat(val.toFixed(dp));
-
-          // Simulate occasional status drops or warning markers (e.g. 2% chance)
-          let status = 192; // Good
-          let marker = '';
-          if (Math.random() < 0.02) {
-            status = Math.random() < 0.5 ? 128 : 0; // Uncertain or Bad
-            marker = status === 0 ? 'CRITICAL FAULT' : 'WARNING VALUE';
-          }
-
-          return {
-            DateAndTime: now,
-            Millitm: millitm,
-            TagIndex: tag.TagIndex,
-            Val: val,
-            Status: status,
-            Marker: marker
-          };
-        });
-
-        // Add to local buffer to sync with connected database table
-        setLocalBuffer(prev => {
-          const combined = [...prev, ...newRecords];
-          // Cap local buffer at 500 records to prevent overflow
-          return combined.slice(-500);
-        });
-
-      } catch (e) {
-        console.error("Error running SCADA live simulator:", e);
-      }
-    }, 5000); // Generate every 5 seconds
-
-    return () => clearInterval(interval);
+    // SCADA simulation has been removed to enforce read-only Cloud Database access
+    // and prevent generated telemetry values from altering actual historian records.
   }, []);
 
   // 2. Automated Sync Service (runs every 12 seconds)
@@ -401,6 +361,40 @@ export function SimulatorProvider({ children }) {
 
   const [refreshTrigger, setRefreshTrigger] = useState(0);
 
+  // Centralized Time Range State Management
+  const [timePreset, setTimePreset] = useState('24h');
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
+  const [chartStart, setChartStart] = useState(() => new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+  const [chartEnd, setChartEnd] = useState(() => new Date().toISOString());
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (timePreset === 'custom') {
+        const now = new Date();
+        const start = customStart ? new Date(customStart).toISOString() : new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+        const end = customEnd ? new Date(customEnd).toISOString() : now.toISOString();
+        setChartStart(start);
+        setChartEnd(end);
+      } else if (timePreset !== 'zoomed') {
+        const now = new Date();
+        let start;
+        let end   = now;
+        switch (timePreset) {
+          case '1h':  start = new Date(now.getTime() - 1  * 60 * 60 * 1000); break;
+          case '6h':  start = new Date(now.getTime() - 6  * 60 * 60 * 1000); break;
+          case '24h': start = new Date(now.getTime() - 24 * 60 * 60 * 1000); break;
+          case '7d':  start = new Date(now.getTime() - 7  * 24 * 60 * 60 * 1000); break;
+          case '30d': start = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000); break;
+          default: start = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        }
+        setChartStart(start.toISOString());
+        setChartEnd(end.toISOString());
+      }
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [timePreset, customStart, customEnd, refreshTrigger]);
+
   return (
     <SimulatorContext.Provider value={{
       localBuffer,
@@ -413,6 +407,18 @@ export function SimulatorProvider({ children }) {
       refreshTrigger,
       setRefreshTrigger,
       forceSync,
+      
+      // Centralized Time Range State
+      timePreset,
+      setTimePreset,
+      customStart,
+      setCustomStart,
+      customEnd,
+      setCustomEnd,
+      chartStart,
+      chartEnd,
+      setChartStart,
+      setChartEnd,
       
       // Sync states
       isNetworkOnline,

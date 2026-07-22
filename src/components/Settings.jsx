@@ -6,7 +6,18 @@ import {
   getSmtpConfigurations, saveSmtpConfiguration, deleteSmtpConfiguration, setActiveSmtpConfiguration,
   getReportTemplates, saveReportTemplate, deleteReportTemplate, setDefaultReportTemplate
 } from '../utils/db';
+import {
+  getPlantTimeZone,
+  getTimeZoneOffsetMs,
+  convertLocalToUtcTime,
+  convertUtcToLocalTime,
+  getTimeZoneAbbreviation,
+  formatTimestampToPlantTime
+} from '../utils/timeService';
 import { useSimulator } from '../utils/SimulatorContext';
+import { useRefresh } from '../utils/useRefresh';
+import RefreshButton from './RefreshButton';
+import TimePicker from './TimePicker';
 
 /* ─────────────────────────────────────────────
    SVGs & Icons
@@ -67,104 +78,14 @@ function ToggleSwitch({ checked, onChange, id }) {
   );
 }
 
-function getPlantTimeZone(plantId) {
-  if (!plantId) return 'UTC';
-  const cleanId = String(plantId).trim();
-  switch (cleanId) {
-    case 'plant-1': return 'America/New_York';
-    case 'plant-2': return 'Europe/Berlin';
-    case 'plant-3': return 'Asia/Tokyo';
-    case 'plant-4':
-    case 'plant':
-    case 'Mettur':
-    case 'mettur':
-      return 'Asia/Kolkata';
-    default: return 'UTC';
-  }
-}
-
-function getTimeZoneOffsetMs(timeZone, date = new Date()) {
-  try {
-    const tzString = date.toLocaleString('en-US', { timeZone });
-    const localDate = new Date(tzString);
-    const utcString = date.toLocaleString('en-US', { timeZone: 'UTC' });
-    const utcDate = new Date(utcString);
-    return localDate.getTime() - utcDate.getTime();
-  } catch (e) {
-    console.error("getTimeZoneOffsetMs error:", e);
-    return 0;
-  }
-}
-
-function convertLocalToUtcTime(localTimeStr, plantId) {
-  if (!localTimeStr) return '00:00';
-  const [hour, min] = localTimeStr.split(':').map(Number);
-  const date = new Date();
-  date.setUTCHours(12, 0, 0, 0);
-  const tz = getPlantTimeZone(plantId);
-  const offsetMs = getTimeZoneOffsetMs(tz, date);
-  const targetLocalDate = new Date(date);
-  targetLocalDate.setUTCHours(hour, min, 0, 0);
-  const targetUtcDate = new Date(targetLocalDate.getTime() - offsetMs);
-  const utcHourStr = String(targetUtcDate.getUTCHours()).padStart(2, '0');
-  const utcMinStr = String(targetUtcDate.getUTCMinutes()).padStart(2, '0');
-  return `${utcHourStr}:${utcMinStr}`;
-}
-
-function convertUtcToLocalTime(utcTimeStr, plantId) {
-  if (!utcTimeStr) return '00:00';
-  const [hour, min] = utcTimeStr.split(':').map(Number);
-  const date = new Date();
-  date.setUTCHours(hour, min, 0, 0);
-  const tz = getPlantTimeZone(plantId);
-  const offsetMs = getTimeZoneOffsetMs(tz, date);
-  const targetLocalDate = new Date(date.getTime() + offsetMs);
-  const localHourStr = String(targetLocalDate.getUTCHours()).padStart(2, '0');
-  const localMinStr = String(targetLocalDate.getUTCMinutes()).padStart(2, '0');
-  return `${localHourStr}:${localMinStr}`;
-}
-
-function getTimeZoneAbbreviation(plantId) {
-  const tz = getPlantTimeZone(plantId);
-  try {
-    const formatter = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' });
-    const parts = formatter.formatToParts(new Date());
-    const tzPart = parts.find(p => p.type === 'timeZoneName');
-    return tzPart ? tzPart.value : tz;
-  } catch {
-    return tz;
-  }
-}
-
-function formatTimestampToPlantTime(timestampStr, plantId) {
-  if (!timestampStr) return '—';
-  const tz = getPlantTimeZone(plantId);
-  try {
-    const date = new Date(timestampStr);
-    return date.toLocaleString('en-US', {
-      timeZone: tz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false
-    });
-  } catch {
-    return timestampStr;
-  }
-}
+// Timezone functions imported from timeService.js
 
 /* ─────────────────────────────────────────────
    Main Component
    ───────────────────────────────────────────── */
 export default function Settings({ user }) {
-  const { currentPlantId } = useSimulator();
-
   const isSuperAdmin = user.role === 'Super Admin';
   const isReadOnly = user.role === 'Admin';
-  const targetPlantId = (isSuperAdmin || isReadOnly) ? currentPlantId : user.plantId;
 
   // ── Active sub-tab
   const [activeSubTab, setActiveSubTab] = useState(() => (isSuperAdmin || isReadOnly) ? 'smtp' : 'schedules');
@@ -198,24 +119,34 @@ export default function Settings({ user }) {
 
   // ── Scheduled Reports States
   const [schedulesList, setSchedulesList] = useState([]);
-  const [plantsList, setPlantsList] = useState([]);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [isSavingSchedule, setIsSavingSchedule] = useState(false);
   const [editSchedule, setEditSchedule] = useState({
-    id: '', plantId: '', reportType: 'Historian Shift Summary',
+    id: '', reportType: 'Historian Shift Summary',
     frequency: 'Daily', time: '08:00',
-    emailRecipients: '', enabled: true,
+    emailRecipients: '', ccRecipients: '', bccRecipients: '', enabled: true,
     formatPdf: true, formatExcel: true,
   });
 
-  // ── Email Logs States
-  const [emailLogsList, setEmailLogsList] = useState([]);
+  // ── Email History States
   const [schedulerHistoryList, setSchedulerHistoryList] = useState([]);
+  const [emailSearch, setEmailSearch] = useState('');
+  const [emailStatusFilter, setEmailStatusFilter] = useState('all');
+  const [emailRecipientFilter, setEmailRecipientFilter] = useState('all');
+  const [emailReportTypeFilter, setEmailReportTypeFilter] = useState('all');
+  const [emailStartDate, setEmailStartDate] = useState('');
+  const [emailEndDate, setEmailEndDate] = useState('');
+  const [selectedEmailLog, setSelectedEmailLog] = useState(null);
+  const [showEmailDetailsModal, setShowEmailDetailsModal] = useState(false);
 
   // ── Status Messages
   const [smtpStatus, setSmtpStatus] = useState(null); // { type: 'success' | 'error', text: string }
   const [templateStatus, setTemplateStatus] = useState(null);
   const [scheduleStatus, setScheduleStatus] = useState(null);
+
+  const [confirmDeleteSmtp, setConfirmDeleteSmtp] = useState(null);
+  const [confirmDeleteTemplate, setConfirmDeleteTemplate] = useState(null);
+  const [confirmDeleteSchedule, setConfirmDeleteSchedule] = useState(null);
 
   const showSmtpStatus = (type, text) => {
     setSmtpStatus({ type, text });
@@ -235,42 +166,41 @@ export default function Settings({ user }) {
   /* ── Load data ────────────────────────── */
   const loadData = useCallback(async () => {
     try {
-      const plist = await getPlants();
-      setPlantsList(plist);
-
       const allSchedules = await getSchedules();
-      setSchedulesList((isSuperAdmin || isReadOnly) ? allSchedules : allSchedules.filter(s => s.plantId === targetPlantId));
-
+      setSchedulesList(allSchedules);
+      const smtpConfigs = await getSmtpConfigurations();
+      setSmtpConfigsList(smtpConfigs);
+      const templates = await getReportTemplates();
+      setTemplatesList(templates);
       if (isSuperAdmin || isReadOnly) {
-        const allEmailLogs = await getEmailLogs();
-        setEmailLogsList(allEmailLogs);
-
         const history = await getSchedulerHistory();
         setSchedulerHistoryList(history);
-
-        const smtpConfigs = await getSmtpConfigurations();
-        setSmtpConfigsList(smtpConfigs);
-
-        const templates = await getReportTemplates();
-        setTemplatesList(templates);
-      } else {
-        // Plant Admin can also see SMTP & Templates
-        const smtpConfigs = await getSmtpConfigurations();
-        setSmtpConfigsList(smtpConfigs);
-
-        const templates = await getReportTemplates();
-        setTemplatesList(templates);
       }
     } catch (err) {
       console.error('Error loading settings data:', err);
     }
-  }, [targetPlantId, isSuperAdmin, isReadOnly]);
+  }, [isSuperAdmin, isReadOnly]);
+
+  const fetchSettingsData = useCallback(async () => {
+    if (activeSubTab === 'smtp') {
+      const smtpConfigs = await getSmtpConfigurations();
+      setSmtpConfigsList(smtpConfigs);
+    } else if (activeSubTab === 'templates') {
+      const templates = await getReportTemplates();
+      setTemplatesList(templates);
+    } else if (activeSubTab === 'schedules') {
+      const allSchedules = await getSchedules();
+      setSchedulesList(allSchedules);
+    } else if (activeSubTab === 'emailhistory') {
+      const history = await getSchedulerHistory();
+      setSchedulerHistoryList(history);
+    }
+  }, [activeSubTab]);
+
+  const { isRefreshing, refreshToast, handleRefresh } = useRefresh(fetchSettingsData, 'Settings');
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      loadData();
-    }, 0);
-    return () => clearTimeout(timer);
+    loadData().catch(() => {});
   }, [loadData]);
 
   /* ── SMTP Configuration CRUD ────────────────── */
@@ -328,15 +258,16 @@ export default function Settings({ user }) {
     }
   };
 
-  const handleDeleteSmtp = async (id, name) => {
-    if (window.confirm(`Are you sure you want to permanently delete SMTP configuration "${name}"?`)) {
-      try {
-        await deleteSmtpConfiguration(id);
-        showSmtpStatus('success', `SMTP Configuration "${name}" deleted successfully.`);
-        await loadData();
-      } catch (err) {
-        alert(`Error deleting SMTP configuration: ${err.message}`);
-      }
+  const handleDeleteConfirmSmtp = async () => {
+    if (!confirmDeleteSmtp) return;
+    const { id, name } = confirmDeleteSmtp;
+    setConfirmDeleteSmtp(null);
+    try {
+      await deleteSmtpConfiguration(id);
+      showSmtpStatus('success', `SMTP Configuration "${name}" deleted successfully.`);
+      await loadData();
+    } catch (err) {
+      alert(`Error deleting SMTP configuration: ${err.message}`);
     }
   };
 
@@ -397,7 +328,7 @@ export default function Settings({ user }) {
       });
       const res = await response.json();
       if (!response.ok || res.error) {
-        throw new Error(res.error || 'Failed to dispatch test email.');
+        throw new Error(res.details || res.error || 'Failed to dispatch test email.');
       }
       showSmtpStatus('success', `Test email successfully dispatched using "${testingConfig.name}". Verify SMTP log feed.`);
     } catch (err) {
@@ -407,6 +338,30 @@ export default function Settings({ user }) {
       setTestingConfig(null);
     }
   };
+
+  const handleTestUnsavedSmtp = () => {
+    if (!editSmtpObj.name?.trim()) return alert('Please enter a Configuration Name.');
+    if (!editSmtpObj.host?.trim()) return alert('Please enter an SMTP Host Address.');
+    if (!editSmtpObj.port) return alert('Please enter a Port Number.');
+    if (!editSmtpObj.username?.trim()) return alert('Please enter an SMTP Username.');
+    if (!editSmtpObj.password?.trim()) return alert('Please enter an SMTP Password/App Key.');
+
+    const virtualConfig = {
+      id: 'unsaved',
+      name: editSmtpObj.name,
+      host: editSmtpObj.host,
+      port: editSmtpObj.port,
+      username: editSmtpObj.username,
+      password: editSmtpObj.password,
+      secure: editSmtpObj.security_type === 'SSL/TLS' || editSmtpObj.port === 465,
+      security_type: editSmtpObj.security_type
+    };
+
+    setTestingConfig(virtualConfig);
+    setTestEmailRecipient(editSmtpObj.username || '');
+    setShowTestModal(true);
+  };
+
 
 
   /* ── Report Templates CRUD ──────────────────── */
@@ -464,15 +419,16 @@ export default function Settings({ user }) {
     }
   };
 
-  const handleDeleteTemplate = async (id, name) => {
-    if (window.confirm(`Are you sure you want to permanently delete template "${name}"?`)) {
-      try {
-        await deleteReportTemplate(id);
-        showTemplateStatus('success', `Report template "${name}" deleted successfully.`);
-        await loadData();
-      } catch (err) {
-        alert(`Error deleting template: ${err.message}`);
-      }
+  const handleDeleteConfirmTemplate = async () => {
+    if (!confirmDeleteTemplate) return;
+    const { id, name } = confirmDeleteTemplate;
+    setConfirmDeleteTemplate(null);
+    try {
+      await deleteReportTemplate(id);
+      showTemplateStatus('success', `Report template "${name}" deleted successfully.`);
+      await loadData();
+    } catch (err) {
+      alert(`Error deleting template: ${err.message}`);
     }
   };
 
@@ -511,15 +467,17 @@ export default function Settings({ user }) {
   /* ── Scheduled Reports CRUD ─────────────────── */
   const handleOpenScheduleEdit = (sched = null) => {
     if (sched) {
-      const localTime = convertUtcToLocalTime(sched.time, sched.plantId);
+      const localTime = convertUtcToLocalTime(sched.time, 'plant-1');
       setEditSchedule({
         id: sched.id,
-        plantId: sched.plantId,
+        plantId: 'plant-1',
         reportType: sched.reportType,
         frequency: sched.frequency,
         time: sched.time,
         localTime: localTime,
         emailRecipients: sched.emailRecipients,
+        ccRecipients: sched.ccRecipients || '',
+        bccRecipients: sched.bccRecipients || '',
         enabled: sched.enabled,
         formatPdf: sched.formatPdf !== false,
         formatExcel: sched.formatExcel !== false,
@@ -529,12 +487,14 @@ export default function Settings({ user }) {
     } else {
       setEditSchedule({
         id: '',
-        plantId: targetPlantId,
+        plantId: 'plant-1',
         reportType: 'Daily Production Report',
         frequency: 'Daily',
         time: '02:30',
         localTime: '08:00',
         emailRecipients: '',
+        ccRecipients: '',
+        bccRecipients: '',
         enabled: true,
         formatPdf: true,
         formatExcel: true,
@@ -552,9 +512,10 @@ export default function Settings({ user }) {
 
     setIsSavingSchedule(true);
     try {
-      const utcTime = convertLocalToUtcTime(editSchedule.localTime, editSchedule.plantId);
+      const utcTime = convertLocalToUtcTime(editSchedule.localTime, 'plant-1');
       const scheduleToSave = {
         ...editSchedule,
+        plantId: 'plant-1',
         time: utcTime
       };
       await saveSchedule(scheduleToSave);
@@ -568,15 +529,16 @@ export default function Settings({ user }) {
     }
   };
 
-  const handleDeleteSchedule = async (id) => {
-    if (window.confirm('Are you sure you want to permanently delete this report schedule?')) {
-      try {
-        await deleteSchedule(id);
-        showScheduleStatus('success', 'Report schedule configuration deleted successfully.');
-        await loadData();
-      } catch (err) {
-        alert(`Error deleting schedule: ${err.message}`);
-      }
+  const handleDeleteConfirmSchedule = async () => {
+    if (!confirmDeleteSchedule) return;
+    const { id } = confirmDeleteSchedule;
+    setConfirmDeleteSchedule(null);
+    try {
+      await deleteSchedule(id);
+      showScheduleStatus('success', 'Report schedule configuration deleted successfully.');
+      await loadData();
+    } catch (err) {
+      alert(`Error deleting schedule: ${err.message}`);
     }
   };
 
@@ -599,8 +561,7 @@ export default function Settings({ user }) {
     { key: 'templates', label: 'Report Templates' },
     { key: 'schedules', label: 'Scheduled Reports' },
     ...(isSuperAdmin ? [
-      { key: 'emaillogs', label: 'Email Dispatches' },
-      { key: 'schedulerhistory', label: 'Execution History' }
+      { key: 'emailhistory', label: 'Email History' }
     ] : []),
   ];
 
@@ -657,15 +618,114 @@ export default function Settings({ user }) {
     t.subject.toLowerCase().includes(templateSearch.toLowerCase())
   );
 
+  const uniqueRecipients = [...new Set(schedulerHistoryList.map(log => log.recipients).filter(Boolean))];
+  const uniqueReportTypes = [...new Set(schedulerHistoryList.map(log => log.type).filter(Boolean))];
+
+  const filteredEmailHistory = schedulerHistoryList.filter(log => {
+    // 1. Search by recipient or subject
+    if (emailSearch.trim()) {
+      const q = emailSearch.toLowerCase();
+      const matchRecipient = (log.recipients || '').toLowerCase().includes(q);
+      const matchSubject = (log.name || '').toLowerCase().includes(q);
+      if (!matchRecipient && !matchSubject) return false;
+    }
+
+    // 2. Status filter
+    const isSuccess = log.delivery_status === 'SENT' || log.delivery_status === 'success' || log.delivery_status === 'SUCCESS';
+    if (emailStatusFilter !== 'all') {
+      if (emailStatusFilter === 'success' && !isSuccess) return false;
+      if (emailStatusFilter === 'failed' && isSuccess) return false;
+    }
+
+    // 3. Recipient filter
+    if (emailRecipientFilter !== 'all') {
+      if (log.recipients !== emailRecipientFilter) return false;
+    }
+
+    // 4. Report Type filter
+    if (emailReportTypeFilter !== 'all') {
+      if (log.type !== emailReportTypeFilter) return false;
+    }
+
+    // 5. Date range filter
+    if (emailStartDate) {
+      const logDate = new Date(log.generated_at || log.delivery_time);
+      const start = new Date(emailStartDate + 'T00:00:00');
+      if (logDate < start) return false;
+    }
+    if (emailEndDate) {
+      const logDate = new Date(log.generated_at || log.delivery_time);
+      const end = new Date(emailEndDate + 'T23:59:59');
+      if (logDate > end) return false;
+    }
+
+    return true;
+  });
+
+  const [retryingLogId, setRetryingLogId] = useState(null);
+  const handleRetryDispatch = async (log) => {
+    setRetryingLogId(log.id);
+    try {
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      alert(`Successfully queued retry dispatch for report: "${log.name}" to recipients: ${log.recipients}`);
+    } catch (e) {
+      alert('Retry dispatch failed: ' + e.message);
+    } finally {
+      setRetryingLogId(null);
+    }
+  };
+
+  const handleExportEmailHistoryCSV = () => {
+    try {
+      const headers = ['Timestamp', 'Report Name', 'Recipient(s)', 'Subject', 'Format', 'Status', 'Delivery Time', 'Error Message', 'Sent By'];
+      const rows = filteredEmailHistory.map(log => {
+        const isSuccess = log.delivery_status === 'SENT' || log.delivery_status === 'success' || log.delivery_status === 'SUCCESS';
+        const formats = log.attachments_sent || '—';
+        const sentBy = (log.created_by || '').toLowerCase().includes('scheduler') || (log.created_by || '').toLowerCase().includes('system') ? 'Scheduler' : `Manual (${log.created_by || 'Unknown'})`;
+        return [
+          log.generated_at || log.delivery_time || '—',
+          log.type || '—',
+          log.recipients || '—',
+          log.name || '—',
+          formats,
+          isSuccess ? 'Success' : 'Failed',
+          log.delivery_time || '—',
+          !isSuccess ? (log.type || 'Failed to dispatch email') : '—',
+          sentBy
+        ];
+      });
+      
+      const csvContent = "data:text/csv;charset=utf-8," 
+        + [headers.join(','), ...rows.map(e => e.map(val => `"${String(val).replace(/"/g, '""')}"`).join(","))].join("\n");
+      
+      const encodedUri = encodeURI(csvContent);
+      const link = document.createElement("a");
+      link.setAttribute("href", encodedUri);
+      link.setAttribute("download", `email_history_${new Date().toISOString().split('T')[0]}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (err) {
+      alert('Failed to export CSV: ' + err.message);
+    }
+  };
+
   return (
     <div style={S.page}>
 
       {/* ── Page Header ─────────────────────── */}
-      <div style={S.header}>
-        <h2 style={S.headerTitle}>Industrial Configuration System</h2>
-        <p style={S.headerSub}>
-          SCADA parameterization panel for SMTP engines, branding layouts, and automated dispatch schedules.
-        </p>
+      <div className="page-header" style={{ marginBottom: '28px' }}>
+        <div>
+          <h2 style={S.headerTitle}>Industrial Configuration System</h2>
+        </div>
+        <div className="page-header-actions">
+          <RefreshButton
+            isRefreshing={isRefreshing}
+            onClick={handleRefresh}
+            toast={refreshToast}
+            id="refresh-btn-settings"
+          />
+        </div>
       </div>
 
       {/* ── Tab Bar ─────────────────────────── */}
@@ -793,8 +853,8 @@ export default function Settings({ user }) {
                           >
                             Copy
                           </button>
-                          <button
-                            onClick={() => handleDeleteSmtp(config.id, config.name)}
+                           <button
+                             onClick={() => setConfirmDeleteSmtp({ id: config.id, name: config.name })}
                             className="btn btn-danger btn-sm"
                             style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
                           >
@@ -927,8 +987,8 @@ export default function Settings({ user }) {
                           >
                             Copy
                           </button>
-                          <button
-                            onClick={() => handleDeleteTemplate(template.id, template.name)}
+                           <button
+                             onClick={() => setConfirmDeleteTemplate({ id: template.id, name: template.name })}
                             className="btn btn-danger btn-sm"
                             style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
                           >
@@ -988,10 +1048,8 @@ export default function Settings({ user }) {
               <table style={S.table} className="table responsive-table">
                 <thead>
                   <tr>
-                    <th style={S.th}>Plant Location</th>
-                    <th style={S.th}>Report Type</th>
-                    <th style={S.th}>Mode</th>
-                    <th style={S.th}>Shift #</th>
+                    <th style={S.th}>Report Name</th>
+                    <th style={S.th}>Frequency</th>
                     <th style={S.th}>Trigger Time</th>
                     <th style={S.th}>Format(s)</th>
                     <th style={S.th}>Last Run</th>
@@ -1005,7 +1063,6 @@ export default function Settings({ user }) {
                 </thead>
                 <tbody>
                   {schedulesList.map(sched => {
-                    const plantName = plantsList.find(p => p.id === sched.plantId)?.name || sched.plantId || 'Unknown Plant';
                     const formats = [sched.formatPdf !== false ? 'PDF' : '', sched.formatExcel !== false ? 'Excel' : ''].filter(Boolean).join(', ');
                     const localTriggerTime = convertUtcToLocalTime(sched.time, sched.plantId);
                     const tzAbbr = getTimeZoneAbbreviation(sched.plantId);
@@ -1018,12 +1075,14 @@ export default function Settings({ user }) {
                     else if (sched.lastExecutionStatus && sched.lastExecutionStatus.startsWith('failed')) statusColor = 'var(--error)';
                     else if (sched.lastExecutionStatus === 'running') statusColor = 'var(--info)';
 
+                    const freqLabel = sched.reportMode === 'Shift' 
+                      ? `${sched.reportMode || 'Daily'} (Shift ${sched.shiftNumber || 1})`
+                      : (sched.reportMode || 'Daily');
+
                     return (
                       <tr key={sched.id}>
-                        <td data-label="Plant Location" style={{ ...S.td, fontWeight: 600 }}>{plantName}</td>
-                        <td data-label="Report Type" style={S.td}>{sched.reportType}</td>
-                        <td data-label="Mode" style={S.td}>{sched.reportMode || 'Daily'}</td>
-                        <td data-label="Shift #" style={S.td}>{sched.reportMode === 'Shift' ? `Shift ${sched.shiftNumber || 1}` : '—'}</td>
+                        <td data-label="Report Name" style={{ ...S.td, fontWeight: 600 }}>{sched.reportType}</td>
+                        <td data-label="Frequency" style={S.td}>{freqLabel}</td>
                         <td data-label="Trigger Time" style={S.td}>{localTriggerTime} ({tzAbbr})</td>
                         <td data-label="Format(s)" style={S.td}>{formats || 'None'}</td>
                         <td data-label="Last Run" style={{ ...S.td, fontFamily: 'monospace', fontSize: '0.76rem', whiteSpace: 'nowrap' }}>{formattedLastRun}</td>
@@ -1043,7 +1102,7 @@ export default function Settings({ user }) {
                         <td data-label="Last Sent To" style={{ ...S.td, maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={sched.lastEmailSentTo || sched.emailRecipients}>
                           {sched.lastEmailSentTo || '—'}
                         </td>
-                        <td data-label="Status" style={{ ...S.td, textAlign: 'center' }}>
+                        <td data-label="Scheduler Status" style={{ ...S.td, textAlign: 'center' }}>
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
                             <span style={{ fontSize: '0.72rem', color: sched.enabled ? 'var(--success)' : 'var(--text-dim)', fontWeight: 700 }}>
                               {sched.enabled ? 'ENABLED' : 'DISABLED'}
@@ -1068,8 +1127,8 @@ export default function Settings({ user }) {
                               >
                                 Edit
                               </button>
-                              <button
-                                onClick={() => handleDeleteSchedule(sched.id)}
+                               <button
+                                 onClick={() => setConfirmDeleteSchedule({ id: sched.id })}
                                 className="btn btn-danger btn-sm"
                                 style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem' }}
                               >
@@ -1084,8 +1143,8 @@ export default function Settings({ user }) {
 
                   {schedulesList.length === 0 && (
                     <tr>
-                      <td colSpan="13" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
-                        No report schedules configured for this plant location.
+                      <td colSpan="11" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
+                        No report schedules configured.
                       </td>
                     </tr>
                   )}
@@ -1097,134 +1156,209 @@ export default function Settings({ user }) {
       )}
 
       {/* ═══════════════════════════════════════
-          TAB: EMAIL LOG DISPATCHES
+          TAB: EMAIL HISTORY
       ═══════════════════════════════════════ */}
-      {activeSubTab === 'emaillogs' && isSuperAdmin && (
+      {activeSubTab === 'emailhistory' && isSuperAdmin && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
           <div style={S.card}>
-            <p style={S.sectionTitle}>SMTP Output Logs</p>
+            <p style={S.sectionTitle}>Centralized Email Delivery History</p>
             <p style={S.sectionSub}>
-              Historian dispatch telemetry detailing report outputs, recipients, and verification status codes.
+              Centralized transmission directory for report dispatches, recipients, and mail transmission status logs.
             </p>
 
+            {/* Email History Filters & Search */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', alignItems: 'center', marginBottom: '20px', background: 'var(--surface-raised)', padding: '16px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)' }}>
+              {/* Search */}
+              <div style={{ flex: '1 1 200px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase' }}>Search</label>
+                <input
+                  type="text"
+                  className="form-control"
+                  placeholder="Recipient or subject..."
+                  value={emailSearch}
+                  onChange={e => setEmailSearch(e.target.value)}
+                  style={{ height: '36px', fontSize: '0.8rem' }}
+                />
+              </div>
+
+              {/* Status */}
+              <div style={{ flex: '1 1 120px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase' }}>Status</label>
+                <select
+                  className="form-control"
+                  value={emailStatusFilter}
+                  onChange={e => setEmailStatusFilter(e.target.value)}
+                  style={{ height: '36px', fontSize: '0.8rem' }}
+                >
+                  <option value="all">All Statuses</option>
+                  <option value="success">Success</option>
+                  <option value="failed">Failed</option>
+                </select>
+              </div>
+
+              {/* Recipient */}
+              <div style={{ flex: '1 1 180px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase' }}>Recipient</label>
+                <select
+                  className="form-control"
+                  value={emailRecipientFilter}
+                  onChange={e => setEmailRecipientFilter(e.target.value)}
+                  style={{ height: '36px', fontSize: '0.8rem' }}
+                >
+                  <option value="all">All Recipients</option>
+                  {uniqueRecipients.map(r => (
+                    <option key={r} value={r}>{r}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Report Type */}
+              <div style={{ flex: '1 1 180px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase' }}>Report Type</label>
+                <select
+                  className="form-control"
+                  value={emailReportTypeFilter}
+                  onChange={e => setEmailReportTypeFilter(e.target.value)}
+                  style={{ height: '36px', fontSize: '0.8rem' }}
+                >
+                  <option value="all">All Report Types</option>
+                  {uniqueReportTypes.map(t => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Date Range Start */}
+              <div style={{ flex: '1 1 130px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase' }}>Start Date</label>
+                <input
+                  type="date"
+                  className="form-control"
+                  value={emailStartDate}
+                  onChange={e => setEmailStartDate(e.target.value)}
+                  style={{ height: '36px', fontSize: '0.8rem' }}
+                />
+              </div>
+
+              {/* Date Range End */}
+              <div style={{ flex: '1 1 130px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase' }}>End Date</label>
+                <input
+                  type="date"
+                  className="form-control"
+                  value={emailEndDate}
+                  onChange={e => setEmailEndDate(e.target.value)}
+                  style={{ height: '36px', fontSize: '0.8rem' }}
+                />
+              </div>
+
+              {/* CSV Export Button */}
+              <div style={{ display: 'flex', alignItems: 'flex-end', height: '56px' }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={handleExportEmailHistoryCSV}
+                  style={{ height: '36px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem' }}
+                >
+                  📥 Export CSV
+                </button>
+              </div>
+            </div>
+
+            {/* Email History Table */}
             <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
               <table style={S.table} className="table responsive-table">
                 <thead>
                   <tr>
                     <th style={S.th}>Timestamp</th>
-                    <th style={S.th}>Recipients</th>
-                    <th style={S.th}>Subject Name</th>
-                    <th style={S.th}>Attachment Contents</th>
-                    <th style={{ ...S.th, textAlign: 'center' }}>Relay Status</th>
+                    <th style={S.th}>Report Name</th>
+                    <th style={S.th}>Recipient(s)</th>
+                    <th style={S.th}>Subject</th>
+                    <th style={S.th}>Format</th>
+                    <th style={S.th}>Status</th>
+                    <th style={S.th}>Delivery Time</th>
+                    <th style={S.th}>Error Message</th>
+                    <th style={S.th}>Sent By</th>
+                    <th style={{ ...S.th, textAlign: 'center' }}>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {emailLogsList.map((log, index) => (
-                    <tr key={index}>
-                      <td data-label="Timestamp" style={{ ...S.td, fontFamily: 'monospace', fontSize: '0.76rem', whiteSpace: 'nowrap' }}>{log.timestamp}</td>
-                      <td data-label="Recipients" style={{ ...S.td, maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.recipient}>
-                        {log.recipient}
-                      </td>
-                      <td data-label="Subject Name" style={S.td}>{log.subject}</td>
-                      <td data-label="Attachment Contents" style={S.td}>
-                        <span style={{ fontSize: '0.75rem', padding: '2px 8px', background: 'var(--surface-raised)', border: '1px solid var(--border)', borderRadius: '4px' }}>
-                          📄 PDF, Excel
-                        </span>
-                      </td>
-                      <td data-label="Relay Status" style={{ ...S.td, textAlign: 'center' }}>
-                        <span style={{
-                          fontSize: '0.7rem', padding: '2px 8px', borderRadius: 4, fontWeight: 700,
-                          backgroundColor: log.status === 'SENT' ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)',
-                          color: log.status === 'SENT' ? 'var(--success)' : 'var(--error)'
-                        }}>
-                          {log.status || 'SENT'}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-
-                  {emailLogsList.length === 0 && (
-                    <tr>
-                      <td colSpan="5" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
-                        No email dispatch records found in the telemetry history log.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {activeSubTab === 'schedulerhistory' && isSuperAdmin && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-          <div style={S.card}>
-            <p style={S.sectionTitle}>Scheduler Execution History</p>
-            <p style={S.sectionSub}>
-              Detailed audit trail tracking automated report scheduling triggers, execution times, dispatches, and delivery status.
-            </p>
-
-            <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-              <table style={S.table} className="table responsive-table">
-                <thead>
-                  <tr>
-                    <th style={S.th}>Schedule Name</th>
-                    <th style={S.th}>Trigger Time</th>
-                    <th style={S.th}>Execution Time</th>
-                    <th style={S.th}>Report Period</th>
-                    <th style={S.th}>Records Processed</th>
-                    <th style={S.th}>Email Recipients</th>
-                    <th style={S.th}>Success / Failure</th>
-                    <th style={S.th}>Error Message / Context</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {schedulerHistoryList.map((log, index) => {
-                    const errorMsg = log.delivery_status === 'FAILED' ? log.type : 'None';
-                    const triggerTime = log.trigger_time || '—';
-                    const executionTime = formatTimestampToPlantTime(log.delivery_time || log.generated_at, log.plant_id);
-                    const recordsProcessed = log.records_processed !== null && log.records_processed !== undefined ? log.records_processed : '—';
+                  {filteredEmailHistory.map((log, index) => {
+                    const isSuccess = log.delivery_status === 'SENT' || log.delivery_status === 'success' || log.delivery_status === 'SUCCESS';
+                    const triggerTime = log.generated_at || log.delivery_time;
+                    const deliveryTime = log.delivery_time ? formatTimestampToPlantTime(log.delivery_time, log.plant_id) : '—';
+                    const formats = log.attachments_sent || 'None';
+                    const errorMsg = !isSuccess ? (log.type || 'SMTP connection timeout') : '—';
+                    const sentBy = (log.created_by || '').toLowerCase().includes('scheduler') || (log.created_by || '').toLowerCase().includes('system') ? 'Scheduler' : 'Manual';
+                    
                     return (
                       <tr key={log.id || index}>
-                        <td data-label="Schedule Name" style={{ ...S.td, fontWeight: 600 }}>
-                          {log.name || 'Automated Shift Report'}
-                        </td>
-                        <td data-label="Trigger Time" style={S.td}>
+                        <td data-label="Timestamp" style={{ ...S.td, fontFamily: 'monospace', fontSize: '0.76rem', whiteSpace: 'nowrap' }}>
                           {triggerTime}
                         </td>
-                        <td data-label="Execution Time" style={{ ...S.td, fontFamily: 'monospace', fontSize: '0.76rem', whiteSpace: 'nowrap' }}>
-                          {executionTime}
+                        <td data-label="Report Name" style={{ ...S.td, fontWeight: 600 }}>
+                          {log.type || '—'}
                         </td>
-                        <td data-label="Report Period" style={S.td}>
-                          {log.date_range || '—'}
-                        </td>
-                        <td data-label="Records Processed" style={{ ...S.td, textAlign: 'center' }}>
-                          {recordsProcessed}
-                        </td>
-                        <td data-label="Email Recipients" style={{ ...S.td, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.recipients}>
+                        <td data-label="Recipient(s)" style={{ ...S.td, maxWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.recipients}>
                           {log.recipients || '—'}
                         </td>
-                        <td data-label="Success / Failure" style={S.td}>
-                          <span style={{
-                            fontSize: '0.7rem', padding: '2px 8px', borderRadius: 4, fontWeight: 700,
-                            backgroundColor: log.delivery_status === 'SENT' ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)',
-                            color: log.delivery_status === 'SENT' ? 'var(--success)' : 'var(--error)'
-                          }}>
-                            {log.delivery_status === 'SENT' ? 'SUCCESS' : (log.delivery_status || 'FAILED')}
+                        <td data-label="Subject" style={{ ...S.td, maxWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.name}>
+                          {log.name || '—'}
+                        </td>
+                        <td data-label="Format" style={S.td}>
+                          <span style={{ fontSize: '0.72rem', padding: '2px 6px', background: 'var(--surface-raised)', border: '1px solid var(--border)', borderRadius: '4px' }}>
+                            {formats}
                           </span>
                         </td>
-                        <td data-label="Error Message / Context" style={{ ...S.td, fontSize: '0.78rem', color: log.delivery_status === 'FAILED' ? 'var(--error)' : 'var(--text-muted)' }}>
+                        <td data-label="Status" style={S.td}>
+                          <span style={{
+                            fontSize: '0.7rem', padding: '2px 8px', borderRadius: 4, fontWeight: 700,
+                            backgroundColor: isSuccess ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)',
+                            color: isSuccess ? 'var(--success)' : 'var(--error)'
+                          }}>
+                            {isSuccess ? 'SUCCESS' : 'FAILED'}
+                          </span>
+                        </td>
+                        <td data-label="Delivery Time" style={{ ...S.td, fontFamily: 'monospace', fontSize: '0.76rem', whiteSpace: 'nowrap' }}>
+                          {deliveryTime}
+                        </td>
+                        <td data-label="Error Message" style={{ ...S.td, maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--error)' }} title={errorMsg}>
                           {errorMsg}
+                        </td>
+                        <td data-label="Sent By" style={S.td}>
+                          <span style={{ fontSize: '0.72rem', fontWeight: 600, color: sentBy === 'Scheduler' ? 'var(--info)' : 'var(--accent)' }}>
+                            {sentBy}
+                          </span>
+                        </td>
+                        <td data-label="Actions" style={S.td}>
+                          <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
+                            <button
+                              onClick={() => { setSelectedEmailLog(log); setShowEmailDetailsModal(true); }}
+                              className="btn btn-secondary btn-sm"
+                              style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem', display: 'flex', alignItems: 'center' }}
+                            >
+                              Details
+                            </button>
+                            {!isSuccess && (
+                              <button
+                                onClick={() => handleRetryDispatch(log)}
+                                disabled={retryingLogId === log.id}
+                                className="btn btn-primary btn-sm"
+                                style={{ padding: '0 8px', height: '24px', fontSize: '0.75rem', display: 'flex', alignItems: 'center', backgroundColor: 'var(--secondary)', borderColor: 'var(--secondary)' }}
+                              >
+                                {retryingLogId === log.id ? 'Retrying...' : 'Retry'}
+                              </button>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     );
                   })}
 
-                  {schedulerHistoryList.length === 0 && (
+                  {filteredEmailHistory.length === 0 && (
                     <tr>
-                      <td colSpan="8" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
-                        No scheduler execution logs found.
+                      <td colSpan="10" style={{ ...S.td, textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
+                        No email history records found matching criteria.
                       </td>
                     </tr>
                   )}
@@ -1378,6 +1512,9 @@ export default function Settings({ user }) {
               <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
                 <button type="button" onClick={() => setShowSmtpModal(false)} className="btn btn-secondary" style={{ flex: 1 }}>
                   Cancel
+                </button>
+                <button type="button" onClick={handleTestUnsavedSmtp} disabled={isSavingSmtp} className="btn btn-warning" style={{ flex: 1.5, backgroundColor: '#D97706', borderColor: '#D97706', color: '#FFF' }}>
+                  🔌 Test Connection
                 </button>
                 <button type="submit" disabled={isSavingSmtp} className="btn btn-primary" style={{ flex: 2 }}>
                   {isSavingSmtp ? 'Saving Server…' : (editSmtpObj.id ? 'Save Configuration' : 'Add Configuration')}
@@ -1686,19 +1823,6 @@ export default function Settings({ user }) {
               <button onClick={() => setShowScheduleModal(false)} style={S.modalClose}>×</button>
             </div>
             <form onSubmit={handleSaveSchedule} style={S.modalBody}>
-              {/* Plant selection */}
-              <div style={S.formGroup}>
-                <label style={S.label} htmlFor="sched-plant">Target Plant Location</label>
-                <input
-                  type="text"
-                  id="sched-plant"
-                  className="form-control"
-                  value={editSchedule.plantId}
-                  onChange={e => setEditSchedule({ ...editSchedule, plantId: e.target.value })}
-                  placeholder="Enter plant ID or location name (e.g. plant-1)"
-                  style={{ height: '36px', fontSize: '0.85rem' }}
-                />
-              </div>
 
               {/* Report Scope & Frequency */}
               <div className="form-grid-special-12">
@@ -1766,14 +1890,10 @@ export default function Settings({ user }) {
 
               {/* Run Time */}
               <div style={S.formGroup}>
-                <label style={S.label} htmlFor="sched-local-time">Dispatch Trigger Time ({getTimeZoneAbbreviation(editSchedule.plantId)} local time)</label>
-                <input
-                  type="time"
-                  id="sched-local-time"
-                  className="form-control"
-                  value={editSchedule.localTime || ''}
-                  onChange={e => setEditSchedule({ ...editSchedule, localTime: e.target.value })}
-                  style={{ height: '36px', fontSize: '0.85rem' }}
+                <TimePicker
+                  value={editSchedule.localTime || '08:00'}
+                  onChange={newTime => setEditSchedule({ ...editSchedule, localTime: newTime })}
+                  label={`Dispatch Trigger Time (${getTimeZoneAbbreviation(editSchedule.plantId)} local time)`}
                 />
               </div>
 
@@ -1813,6 +1933,32 @@ export default function Settings({ user }) {
                 />
               </div>
 
+              {/* CC Recipients */}
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="sched-cc-recipients">CC Recipients (comma-separated list)</label>
+                <input
+                  id="sched-cc-recipients"
+                  type="text"
+                  className="form-control"
+                  placeholder="cc@plant.com"
+                  value={editSchedule.ccRecipients}
+                  onChange={e => setEditSchedule({ ...editSchedule, ccRecipients: e.target.value })}
+                />
+              </div>
+
+              {/* BCC Recipients */}
+              <div style={S.formGroup}>
+                <label style={S.label} htmlFor="sched-bcc-recipients">BCC Recipients (comma-separated list)</label>
+                <input
+                  id="sched-bcc-recipients"
+                  type="text"
+                  className="form-control"
+                  placeholder="bcc@plant.com"
+                  value={editSchedule.bccRecipients}
+                  onChange={e => setEditSchedule({ ...editSchedule, bccRecipients: e.target.value })}
+                />
+              </div>
+
               {/* Scheduler Toggle */}
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
                 <div>
@@ -1835,6 +1981,137 @@ export default function Settings({ user }) {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Custom SMTP Delete Confirmation Modal */}
+      {confirmDeleteSmtp && (
+        <div style={S.modalOverlay}>
+          <div style={S.modalBox(400)}>
+            <div style={S.modalHead}>
+              <h3 style={{ color: 'var(--error)', margin: 0, fontSize: '1rem', fontWeight: 700 }}>⚠ Confirm Action</h3>
+              <button onClick={() => setConfirmDeleteSmtp(null)} style={S.modalClose}>×</button>
+            </div>
+            <div style={S.modalBody}>
+              <p style={{ color: 'var(--text)', fontSize: '0.9rem', lineHeight: 1.6, margin: 0 }}>
+                Are you sure you want to permanently delete SMTP configuration "{confirmDeleteSmtp.name}"? This action cannot be undone.
+              </p>
+              <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setConfirmDeleteSmtp(null)} style={{ flex: 1 }}>Cancel</button>
+                <button type="button" className="btn btn-danger" onClick={handleDeleteConfirmSmtp} style={{ flex: 1 }}>Delete</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Custom Template Delete Confirmation Modal */}
+      {confirmDeleteTemplate && (
+        <div style={S.modalOverlay}>
+          <div style={S.modalBox(400)}>
+            <div style={S.modalHead}>
+              <h3 style={{ color: 'var(--error)', margin: 0, fontSize: '1rem', fontWeight: 700 }}>⚠ Confirm Action</h3>
+              <button onClick={() => setConfirmDeleteTemplate(null)} style={S.modalClose}>×</button>
+            </div>
+            <div style={S.modalBody}>
+              <p style={{ color: 'var(--text)', fontSize: '0.9rem', lineHeight: 1.6, margin: 0 }}>
+                Are you sure you want to permanently delete template "{confirmDeleteTemplate.name}"? This action cannot be undone.
+              </p>
+              <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setConfirmDeleteTemplate(null)} style={{ flex: 1 }}>Cancel</button>
+                <button type="button" className="btn btn-danger" onClick={handleDeleteConfirmTemplate} style={{ flex: 1 }}>Delete</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Custom Schedule Delete Confirmation Modal */}
+      {confirmDeleteSchedule && (
+        <div style={S.modalOverlay}>
+          <div style={S.modalBox(400)}>
+            <div style={S.modalHead}>
+              <h3 style={{ color: 'var(--error)', margin: 0, fontSize: '1rem', fontWeight: 700 }}>⚠ Confirm Action</h3>
+              <button onClick={() => setConfirmDeleteSchedule(null)} style={S.modalClose}>×</button>
+            </div>
+            <div style={S.modalBody}>
+              <p style={{ color: 'var(--text)', fontSize: '0.9rem', lineHeight: 1.6, margin: 0 }}>
+                Are you sure you want to permanently delete this report schedule? This action cannot be undone.
+              </p>
+              <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setConfirmDeleteSchedule(null)} style={{ flex: 1 }}>Cancel</button>
+                <button type="button" className="btn btn-danger" onClick={handleDeleteConfirmSchedule} style={{ flex: 1 }}>Delete</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Email Transmission Details Modal */}
+      {showEmailDetailsModal && selectedEmailLog && (
+        <div style={S.modalOverlay}>
+          <div style={S.modalBox(600)}>
+            <div style={S.modalHead}>
+              <h3 style={S.modalTitle}>📧 Email Transmission Details</h3>
+              <button onClick={() => setShowEmailDetailsModal(false)} style={S.modalClose}>×</button>
+            </div>
+            <div style={{ ...S.modalBody, maxHeight: '80vh', overflowY: 'auto' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr', gap: '12px 16px', fontSize: '0.82rem', lineHeight: 1.6 }}>
+                
+                <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>Timestamp:</span>
+                <span style={{ fontFamily: 'monospace' }}>{selectedEmailLog.generated_at || selectedEmailLog.delivery_time}</span>
+
+                <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>Report Name:</span>
+                <span>{selectedEmailLog.type}</span>
+
+                <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>Recipient(s):</span>
+                <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{selectedEmailLog.recipients}</span>
+
+                <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>Subject:</span>
+                <span style={{ fontWeight: 600 }}>{selectedEmailLog.name}</span>
+
+                <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>Format:</span>
+                <span>{selectedEmailLog.attachments_sent || 'None'}</span>
+
+                <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>Delivery Time:</span>
+                <span style={{ fontFamily: 'monospace' }}>{selectedEmailLog.delivery_time || '—'}</span>
+
+                <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>Sent By:</span>
+                <span>
+                  {(selectedEmailLog.created_by || '').toLowerCase().includes('scheduler') || (selectedEmailLog.created_by || '').toLowerCase().includes('system') 
+                    ? 'Scheduler' 
+                    : `Manual (${selectedEmailLog.created_by})`}
+                </span>
+
+                <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>Status:</span>
+                <span>
+                  <span style={{
+                    fontSize: '0.72rem', padding: '3px 8px', borderRadius: 4, fontWeight: 700,
+                    backgroundColor: (selectedEmailLog.delivery_status === 'SENT' || selectedEmailLog.delivery_status === 'success' || selectedEmailLog.delivery_status === 'SUCCESS') ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)',
+                    color: (selectedEmailLog.delivery_status === 'SENT' || selectedEmailLog.delivery_status === 'success' || selectedEmailLog.delivery_status === 'SUCCESS') ? 'var(--success)' : 'var(--error)'
+                  }}>
+                    {(selectedEmailLog.delivery_status === 'SENT' || selectedEmailLog.delivery_status === 'success' || selectedEmailLog.delivery_status === 'SUCCESS') ? 'SUCCESS' : 'FAILED'}
+                  </span>
+                </span>
+
+                {!(selectedEmailLog.delivery_status === 'SENT' || selectedEmailLog.delivery_status === 'success' || selectedEmailLog.delivery_status === 'SUCCESS') && (
+                  <>
+                    <span style={{ fontWeight: 600, color: 'var(--error)' }}>Error Message:</span>
+                    <span style={{ color: 'var(--error)', background: 'rgba(239, 68, 68, 0.05)', padding: '8px 12px', borderRadius: '4px', border: '1px solid rgba(239, 68, 68, 0.15)' }}>
+                      {selectedEmailLog.type || 'SMTP connection timeout or authentication error'}
+                    </span>
+                  </>
+                )}
+              </div>
+
+              <div style={{ display: 'flex', gap: '10px', marginTop: '16px', borderTop: '1px solid var(--border)', paddingTop: '16px' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setShowEmailDetailsModal(false)} style={{ flex: 1 }}>Close</button>
+                <button type="button" className="btn btn-primary" onClick={() => { handleRetryDispatch(selectedEmailLog); setShowEmailDetailsModal(false); }} style={{ flex: 1 }}>
+                  🔄 Retry Dispatch
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

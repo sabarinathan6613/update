@@ -12,6 +12,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.108.1",
     "dotenv": "^17.4.2",
+    "html2pdf.js": "^0.14.0",
     "mssql": "^12.5.5",
     "nodemailer": "^6.9.13",
     "pdfkit": "^0.19.1",

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { getSupabaseClient, getSupabaseConfig } from '../utils/supabaseClient';
 import { addAuditLog } from '../utils/db';
 
@@ -119,6 +119,17 @@ export default function Login({ onLogin }) {
   const [forgotEmail, setForgotEmail] = useState('');
   const [forgotSent, setForgotSent] = useState(false);
 
+  useEffect(() => {
+    fetch('https://api.ipify.org?format=json')
+      .then(res => res.json())
+      .then(data => {
+        window.clientIp = data.ip;
+      })
+      .catch(() => {
+        window.clientIp = '127.0.0.1';
+      });
+  }, []);
+
   /* ─── auth logic (Supabase Auth only) ─── */
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -141,9 +152,26 @@ export default function Login({ onLogin }) {
         password: password
       });
 
+      const clientIp = window.clientIp || '127.0.0.1';
+
       if (authErr) {
         const msg = authErr.message || '';
-        await addAuditLog(email.trim(), 'anonymous', null, 'Failed Login Attempt', `Error: ${msg}`);
+        let reason = 'Wrong Password';
+        if (msg.toLowerCase().includes('email not confirmed')) {
+          reason = 'Email Not Confirmed';
+        } else if (msg.toLowerCase().includes('too many requests')) {
+          reason = 'Account Locked';
+        } else if (msg.toLowerCase().includes('invalid login credentials') || msg.toLowerCase().includes('invalid credentials')) {
+          reason = 'Wrong Password';
+        }
+
+        await addAuditLog(email.trim(), 'anonymous', null, 'Failed Login', {
+          targetUser: email.trim(),
+          ipAddress: clientIp,
+          status: 'Failed',
+          message: reason
+        });
+
         if (msg.toLowerCase().includes('email not confirmed')) {
           setError('Your email address has not been confirmed. Please check your inbox for a confirmation link, or ask your administrator to confirm your account in Supabase Authentication settings.');
         } else if (msg.toLowerCase().includes('invalid login credentials') || msg.toLowerCase().includes('invalid credentials')) {
@@ -165,14 +193,24 @@ export default function Login({ onLogin }) {
 
         if (profileErr || !profile) {
           setError('User profile details not found in database.');
-          await addAuditLog(email.trim(), 'anonymous', null, 'Failed Login Attempt', 'User profile details not found in database.');
+          await addAuditLog(email.trim(), 'anonymous', null, 'Failed Login', {
+            targetUser: email.trim(),
+            ipAddress: clientIp,
+            status: 'Failed',
+            message: 'User Not Found'
+          });
           await supabase.auth.signOut();
           return;
         }
 
         if (!profile.active) {
           setError('This account has been deactivated. Contact Super Admin.');
-          await addAuditLog(profile.email, profile.role, profile.plant_id, 'Failed Login Attempt', 'Account is deactivated.');
+          await addAuditLog(profile.email, profile.role === 'User' ? 'Operator' : profile.role, profile.plant_id, 'Failed Login', {
+            targetUser: profile.email,
+            ipAddress: clientIp,
+            status: 'Failed',
+            message: 'Account Disabled'
+          });
           await supabase.auth.signOut();
           return;
         }
@@ -187,14 +225,29 @@ export default function Login({ onLogin }) {
           authProvider: 'supabase'
         };
 
-        await addAuditLog(matchedUser.email, matchedUser.role, matchedUser.plantId, 'Login', 'User logged in successfully.');
+        // Save login time to calculate session duration later
+        localStorage.setItem('skadomation_login_time', new Date().toISOString());
+
+        await addAuditLog(matchedUser.email, matchedUser.role, matchedUser.plantId, 'Login', {
+          targetUser: matchedUser.email,
+          ipAddress: clientIp,
+          status: 'Success',
+          message: `User logged in successfully.`
+        });
+
         onLogin(matchedUser, rememberMe);
         return;
       }
     } catch (err) {
       console.error("Supabase Auth Error:", err);
       setError("Network error authenticating with cloud database.");
-      await addAuditLog(email.trim(), 'anonymous', null, 'Failed Login Attempt', `Network error: ${err.message}`);
+      const clientIp = window.clientIp || '127.0.0.1';
+      await addAuditLog(email.trim(), 'anonymous', null, 'Failed Login', {
+        targetUser: email.trim(),
+        ipAddress: clientIp,
+        status: 'Failed',
+        message: `Network error: ${err.message}`
+      });
       return;
     }
   };
@@ -740,31 +793,6 @@ export default function Login({ onLogin }) {
               }}>
                 Secured connection · Enterprise SCADA Platform
               </p>
-              <button
-                type="button"
-                onClick={() => {
-                  if (confirm("Reset application storage? This will clear all local mock databases and cached users to restore initial configurations.")) {
-                    localStorage.clear();
-                    sessionStorage.clear();
-                    window.location.reload();
-                  }
-                }}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: '#4A6480',
-                  fontSize: '0.68rem',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  textDecoration: 'underline',
-                  padding: 0,
-                  fontFamily: 'inherit'
-                }}
-                onMouseOver={(e) => e.target.style.color = '#7C9DBF'}
-                onMouseOut={(e) => e.target.style.color = '#4A6480'}
-              >
-                Reset App Storage (Clear Mock Caches)
-              </button>
             </div>
           </div>
         </div>

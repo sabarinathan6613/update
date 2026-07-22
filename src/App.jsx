@@ -10,6 +10,7 @@ import Reports from './components/Reports';
 import UserManagement from './components/UserManagement';
 import Settings from './components/Settings';
 import CloudSync from './components/CloudSync';
+import SystemLogs from './components/SystemLogs';
 import Explorer from './components/Explorer';
 import TagConfig from './components/TagConfig';
 import ForgotPassword from './components/ForgotPassword';
@@ -190,6 +191,7 @@ function AppContent() {
   const [sessionExpired, setSessionExpired] = useState(false);
   const [startupError,   setStartupError]   = useState(null);
   const [startupLogs,    setStartupLogs]    = useState([]);
+  const [authTimeout,    setAuthTimeout]    = useState(false);
   // Simulator context is loaded to ensure background simulator runs, but syncTrigger is not needed here
   useSimulator();
 
@@ -204,34 +206,70 @@ function AppContent() {
     setStartupLogs(prev => [...prev, `${new Date().toLocaleTimeString()} - ${msg}`]);
   }, []);
 
+  // Track whether this tab initiated a logout to prevent re-broadcasting
+  const isLoggingOutRef = useRef(false);
+
   const handleLogout = useCallback(async () => {
+    if (isLoggingOutRef.current) return; // Prevent double-logout
+    isLoggingOutRef.current = true;
     const u = userRef.current;
+
     invalidateCache();
+
     if (u) {
-      await addAuditLog(u.email, u.role, u.plantId, 'Logout', 'User logged out.');
+      const loginTime = localStorage.getItem('skadomation_login_time');
+      let sessionDuration = '—';
+      if (loginTime) {
+        const diffMs = Date.now() - new Date(loginTime).getTime();
+        const diffSecs = Math.max(0, Math.floor(diffMs / 1000));
+        const h = Math.floor(diffSecs / 3600);
+        const m = Math.floor((diffSecs % 3600) / 60);
+        const s = diffSecs % 60;
+        sessionDuration = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+        localStorage.removeItem('skadomation_login_time');
+      }
+
+      await addAuditLog(u.email, u.role, u.plantId, 'Logout', {
+        targetUser: u.email,
+        ipAddress: typeof window !== 'undefined' ? window.clientIp || '127.0.0.1' : '127.0.0.1',
+        status: 'Success',
+        message: sessionDuration
+      });
     }
+
+    // Sign out from Supabase
     const supabase = getSupabaseClient();
     if (supabase) {
       try { await supabase.auth.signOut(); } catch { /* ignored */ }
     }
+
+    // Clear user state locally
     setUser(null);
+    isLoggingOutRef.current = false;
   }, []);
 
   const triggerSessionExpiration = useCallback((reason, details = '') => {
     const u = userRef.current;
     if (!u) return;
-    console.warn(`[Auth] Session expired. Reason: "${reason}". Details: "${details}"`);
+
     addAuditLog(u.email, u.role, u.plantId, 'Session Expiration', `Reason: ${reason}. ${details}`);
+
     setSessionExpired(true);
     setUser(null);
   }, []);
 
   // ─── Audited Bootstrap Sequence ──────────────────────────────────────────────
-  const bootstrapApp = useCallback(async () => {
+  // ─── Audited Bootstrap Sequence ──────────────────────────────────────────────
+  const bootstrapApp = useCallback(async (isRetry = false) => {
     setLoading(true);
     setStartupError(null);
-    setStartupLogs([]);
+    setAuthTimeout(false);
+    if (!isRetry) {
+      setStartupLogs([]);
+    }
+    
     addLog('[Bootstrap] Starting Skadomation initialization...');
+    console.log('[Bootstrap] getSession started...');
 
     const config = getSupabaseConfig();
     addLog(`[Bootstrap] Environment Config check: URL is ${config ? config.url : 'empty'}, Anon Key is ${config?.anonKey ? 'present' : 'empty'}`);
@@ -244,37 +282,102 @@ function AppContent() {
       return;
     }
 
+    // Step 0: Check localStorage session presence before network hit
+    let cachedSessionExists = false;
+    try {
+      const ref = config?.url ? config.url.replace('https://', '').split('.')[0] : null;
+      const storageKey = ref ? `sb-${ref}-auth-token` : null;
+      const stored = storageKey ? localStorage.getItem(storageKey) : null;
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed?.access_token && parsed?.expires_at) {
+          const isExpired = parsed.expires_at * 1000 < Date.now();
+          if (!isExpired) {
+            cachedSessionExists = true;
+            addLog(`[Bootstrap] Cached session found in localStorage for ${parsed.user?.email || 'user'}`);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[Bootstrap] Error reading localStorage session:', e);
+    }
+
     try {
       // Step 1: Session validation
       addLog('[Bootstrap] Step 1/4: Validating user session...');
-      const { data: { session }, error: sessionErr } = await withTimeout(
-        supabase.auth.getSession(),
-        15000,
-        'supabase.auth.getSession'
-      );
+      let session = null;
+      let sessionErr = null;
+
+      try {
+        console.log('[Bootstrap] Executing supabase.auth.getSession()...');
+        const res = await withTimeout(
+          supabase.auth.getSession(),
+          15000,
+          'supabase.auth.getSession'
+        );
+        session = res.data?.session;
+        sessionErr = res.error;
+      } catch (timeoutErr) {
+        console.log('[Bootstrap] getSession timeout occurred:', timeoutErr.message);
+        addLog('[Bootstrap] Warning: Session lookup timed out. Network might be slow.');
+        
+        // If we have a cached localStorage session, proceed with it, otherwise trigger non-critical timeout state
+        if (cachedSessionExists) {
+          addLog('[Bootstrap] Proceeding using cached localStorage session.');
+        } else {
+          setAuthTimeout(true);
+          setLoading(false);
+          return;
+        }
+      }
+
       if (sessionErr) throw sessionErr;
+      console.log('[Bootstrap] getSession completed. Session found:', !!session);
 
       // Step 2: Profile lookup
       if (session?.user?.id) {
         addLog(`[Bootstrap] Step 2/4: Session found for ${session.user.email}. Loading profile...`);
-        const { data: profile, error: profileErr } = await withTimeout(
-          supabase
-            .from('profiles')
-            .select('*')
-            .eq('id', session.user.id)
-            .maybeSingle(),
-          15000,
-          'profiles.lookup'
-        );
-        if (profileErr) throw profileErr;
+        let profile = null;
+        try {
+          const { data, error } = await withTimeout(
+            supabase
+              .from('profiles')
+              .select('*')
+              .eq('id', session.user.id)
+              .maybeSingle(),
+            15000,
+            'profiles.lookup'
+          );
+          if (error) throw error;
+          profile = data;
+        } catch (profileErr) {
+          addLog(`[Bootstrap] Warning: Profile lookup failed: ${profileErr.message}`);
+          if (cachedSessionExists) {
+            // Fake profile for offline bypass
+            profile = {
+              id: session.user.id,
+              email: session.user.email,
+              role: 'Operator',
+              active: true,
+              plant_id: 'default'
+            };
+          } else {
+            throw profileErr;
+          }
+        }
 
-        if (profile?.active) {
-          addLog(`[Bootstrap] Profile loaded successfully. Role: ${profile.role}`);
-          setUser(profileToUser(profile));
+        if (profile) {
+          if (profile.active) {
+            addLog(`[Bootstrap] Profile loaded successfully. Role: ${profile.role}`);
+            setUser(profileToUser(profile));
+          } else {
+            addLog('[Bootstrap] Warning: User profile is deactivated. Signing out...');
+            await withTimeout(supabase.auth.signOut(), 3000, 'supabase.auth.signOut');
+            setUser(null);
+          }
         } else {
-          addLog('[Bootstrap] Warning: User profile is deactivated or missing. Signing out...');
-          await withTimeout(supabase.auth.signOut(), 3000, 'supabase.auth.signOut');
-          setUser(null);
+          addLog('[Bootstrap] Profile details not found in database. Showing error/retry state.');
+          throw new Error('User profile details not found in database.');
         }
       } else {
         addLog('[Bootstrap] Step 2/4: No active session detected.');
@@ -282,13 +385,21 @@ function AppContent() {
 
       // Step 3: Settings loading
       addLog('[Bootstrap] Step 3/4: Loading system configuration settings...');
-      const settings = await withTimeout(getSettings({ forceRefresh: true }), 15000, 'db.getSettings');
-      addLog(`[Bootstrap] Settings loaded successfully. Target table: ${settings?.selectedTable || 'None'}`);
+      try {
+        const settings = await withTimeout(getSettings({ forceRefresh: true }), 15000, 'db.getSettings');
+        addLog(`[Bootstrap] Settings loaded successfully. Target table: ${settings?.selectedTable || 'None'}`);
+      } catch (settingsErr) {
+        addLog(`[Bootstrap] Warning: Settings loading failed or timed out: ${settingsErr.message}. Using default settings.`);
+      }
 
       // Step 4: Tag config loading
       addLog('[Bootstrap] Step 4/4: Loading tag configurations...');
-      const tags = await withTimeout(getTagConfigs({ forceRefresh: true }), 15000, 'db.getTagConfigs');
-      addLog(`[Bootstrap] Loaded ${tags?.length || 0} tag configurations.`);
+      try {
+        const tags = await withTimeout(getTagConfigs({ forceRefresh: true }), 15000, 'db.getTagConfigs');
+        addLog(`[Bootstrap] Loaded ${tags?.length || 0} tag configurations.`);
+      } catch (tagsErr) {
+        addLog(`[Bootstrap] Warning: Tag configurations loading failed or timed out: ${tagsErr.message}. Using default tags.`);
+      }
 
       addLog('[Bootstrap] Initialization completed successfully.');
       initialCheckDoneRef.current = true;
@@ -355,7 +466,7 @@ function AppContent() {
     };
   }, []);
 
-  // Auth state listener
+  // Auth state listener — only react to genuine sign-in/sign-out, not initialization noise
   useEffect(() => {
     if (getAuthRoute()) return;
     const supabase = getSupabaseClient();
@@ -363,7 +474,13 @@ function AppContent() {
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
       console.log('[Auth] onAuthStateChange event:', event, session?.user?.email ?? 'no user');
-      if (event === 'SIGNED_IN' && session?.user?.id) {
+
+      if (event === 'INITIAL_SESSION' && !initialCheckDoneRef.current) {
+        console.log('[Auth] Ignoring INITIAL_SESSION event during active app bootstrap sequence.');
+        return;
+      }
+
+      if ((event === 'SIGNED_IN' || event === 'INITIAL_SESSION' || event === 'TOKEN_REFRESHED') && session?.user?.id) {
         try {
           const { data: profile, error: profileErr } = await withTimeout(
             supabase
@@ -371,21 +488,26 @@ function AppContent() {
               .select('*')
               .eq('id', session.user.id)
               .maybeSingle(),
-            15000,
+            45000,
             'onAuthStateChange.profiles.lookup'
           );
           if (profileErr) throw profileErr;
 
-          if (profile?.active) {
-            setUser(profileToUser(profile));
-          } else {
-            await withTimeout(supabase.auth.signOut(), 3000, 'onAuthStateChange.signOut');
+          if (profile) {
+            if (profile.active) {
+              setUser(profileToUser(profile));
+            } else {
+              console.warn('[Auth] Profile is inactive. Signing out...');
+              await withTimeout(supabase.auth.signOut(), 3000, 'onAuthStateChange.signOut');
+              setUser(null);
+            }
           }
         } catch (err) {
           console.error("Auth state change error:", err);
         }
         setLoading(false);
       } else if (event === 'SIGNED_OUT') {
+        console.log('[Auth] SIGNED_OUT event received. Clearing user state.');
         setUser(null);
         setLoading(false);
       } else if (event === 'PASSWORD_RECOVERY') {
@@ -398,7 +520,7 @@ function AppContent() {
     };
   }, []);
 
-  // Periodic session validity check
+  // Periodic session validity check — tolerant of network issues
   useEffect(() => {
     if (getAuthRoute()) return;
     const supabase = getSupabaseClient();
@@ -410,10 +532,17 @@ function AppContent() {
       try {
         const { data: { session }, error: sessionErr } = await withTimeout(
           supabase.auth.getSession(),
-          15000,
+          45000,
           'sessionChecker.getSession'
         );
-        if (sessionErr) throw sessionErr;
+
+        // If there's a network/timeout error, do NOT log out — just warn and continue
+        if (sessionErr) {
+          console.warn("[Auth] Session check encountered an error (keeping session):", sessionErr.message);
+          return;
+        }
+
+        // Only expire if we definitively got a null session without any error
         if (!session) {
           triggerSessionExpiration('Session expired — no session returned by server', 'Periodic check');
           return;
@@ -425,18 +554,22 @@ function AppContent() {
             .select('id, active')
             .eq('id', session.user.id)
             .maybeSingle(),
-          15000,
+          45000,
           'sessionChecker.profileLookup'
         );
 
-        if (profileErr) throw profileErr;
+        if (profileErr) {
+          // Network error fetching profile — don't log out
+          console.warn("[Auth] Profile check warning (keeping session):", profileErr.message);
+          return;
+        }
 
         if (!profile || !profile.active) {
           triggerSessionExpiration('Account deactivated or removed', `active=${profile?.active}`);
         }
       } catch (e) {
-        // Ignore network/timeout errors during poll
-        console.warn("[Auth] Session checker warning:", e.message || e);
+        // Ignore network/timeout errors during poll — keep the session alive
+        console.warn("[Auth] Session checker warning (keeping session):", e.message || e);
       }
     }, 30000);
 
@@ -450,7 +583,18 @@ function AppContent() {
     const runSchedulerCheck = async () => {
       try {
         console.log('[Client Poller] Triggering scheduled reports engine...');
-        const response = await fetch('/api/run-scheduler', { method: 'POST' });
+        const supabase = getSupabaseClient();
+        let token = '';
+        if (supabase) {
+          const sessionRes = await supabase.auth.getSession();
+          token = sessionRes.data.session?.access_token || '';
+        }
+        const response = await fetch('/api/run-scheduler', { 
+          method: 'POST',
+          headers: {
+            ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+          }
+        });
         const result = await response.json();
         console.log('[Client Poller] Scheduler engine response:', result);
       } catch (err) {
@@ -470,6 +614,9 @@ function AppContent() {
 
   const handleLogin = (authenticatedUser) => {
     invalidateCache();
+    try {
+      localStorage.removeItem('portal:auth_logout');
+    } catch {}
     setUser(authenticatedUser);
     setActiveTab('dashboard');
   };
@@ -477,6 +624,97 @@ function AppContent() {
   // ── Standalone auth routes ─────────────────────────────────────────────────
   const authRoute = getAuthRoute();
   if (authRoute === 'forgot-password') return <ForgotPassword />;
+
+  // ── Fallback Auth Timeout screen (non-critical timeout handling) ──────────
+  if (authTimeout) {
+    return (
+      <div style={{
+        minHeight: '100vh',
+        backgroundColor: '#060B18',
+        color: '#F1F5F9',
+        fontFamily: "'Inter', sans-serif",
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '24px',
+        boxSizing: 'border-box'
+      }}>
+        <div style={{
+          maxWidth: '540px',
+          width: '100%',
+          backgroundColor: '#0D1526',
+          border: '1px solid #1e293b',
+          borderRadius: '12px',
+          padding: '32px',
+          boxShadow: '0 8px 30px rgba(0,0,0,0.6)',
+          boxSizing: 'border-box'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '20px' }}>
+            <div style={{
+              width: '40px',
+              height: '40px',
+              borderRadius: '8px',
+              backgroundColor: 'rgba(59, 130, 246, 0.1)',
+              border: '1px solid rgba(59, 130, 246, 0.25)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#3b82f6'
+            }}>
+              <span style={{ fontSize: '1.25rem' }}>⏳</span>
+            </div>
+            <h2 style={{ fontSize: '1.25rem', fontWeight: 600, color: '#93c5fd', margin: 0 }}>
+              Unable to verify session
+            </h2>
+          </div>
+
+          <p style={{ color: '#7C9DBF', fontSize: '0.9rem', marginBottom: '20px', lineHeight: '1.6' }}>
+            The authentication server is taking longer than expected to respond. This might be due to a sleeping database or a slow network connection.
+          </p>
+
+          <div style={{ display: 'flex', gap: '12px' }}>
+            <button
+              onClick={() => {
+                setAuthTimeout(false);
+                setUser(null);
+                setLoading(false);
+              }}
+              style={{
+                flex: 1,
+                height: '42px',
+                backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                border: '1px solid rgba(255, 255, 255, 0.1)',
+                borderRadius: '8px',
+                color: '#fff',
+                cursor: 'pointer',
+                fontWeight: 600,
+                fontSize: '0.88rem'
+              }}
+            >
+              Proceed to Sign In
+            </button>
+            <button
+              onClick={() => bootstrapApp(true)}
+              style={{
+                flex: 1,
+                height: '42px',
+                background: 'linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%)',
+                border: 'none',
+                borderRadius: '8px',
+                color: '#fff',
+                cursor: 'pointer',
+                fontWeight: 600,
+                fontSize: '0.88rem',
+                boxShadow: '0 4px 12px rgba(37, 99, 235, 0.2)'
+              }}
+            >
+              Retry Connection
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // ── Fallback error screen ──────────────────────────────────────────────────
   if (startupError) {
@@ -596,38 +834,57 @@ function AppContent() {
   if (!getSupabaseConfig()) return <NoDatabaseScreen />;
 
   // ── Render pages ──────────────────────────────────────────────────────────
-  const renderPage = () => {
+  const renderPages = () => {
     const role = user?.role || 'Operator';
     const isSuperAdmin = role === 'Super Admin';
-    const isAdmin = role === 'Admin';
-    const adminOrAbove = ['Super Admin', 'Plant Admin', 'Admin'].includes(role);
+    const adminOrAbove = ['Super Admin', 'Admin'].includes(role);
 
-    if (['explorer', 'cloudSync'].includes(activeTab) && !isSuperAdmin && !isAdmin) {
-      return <Dashboard user={user} onNavigate={setActiveTab} />;
-    }
-    if (activeTab === 'settings' && !adminOrAbove) {
-      return <Dashboard user={user} onNavigate={setActiveTab} />;
-    }
-    if (['tagConfig', 'users'].includes(activeTab) && !adminOrAbove) {
-      return <Dashboard user={user} onNavigate={setActiveTab} />;
-    }
-    switch (activeTab) {
-      case 'dashboard': return <Dashboard user={user} onNavigate={setActiveTab} />;
-      case 'trends':    return <Trends />;
-      case 'reports':   return <Reports user={user} />;
-      case 'explorer':  return <Explorer />;
-      case 'cloudSync': return <CloudSync user={user} />;
-      case 'tagConfig': return <TagConfig user={user} />;
-      case 'users':     return <UserManagement user={user} />;
-      case 'settings':  return <Settings user={user} />;
-      default:          return <Dashboard user={user} />;
-    }
+    const tabsList = [
+      { id: 'dashboard', render: () => <Dashboard user={user} onNavigate={setActiveTab} isActive={activeTab === 'dashboard'} /> },
+      { id: 'trends', render: () => <Trends isActive={activeTab === 'trends'} /> },
+      { id: 'reports', render: () => <Reports user={user} isActive={activeTab === 'reports'} /> },
+      { id: 'explorer', render: () => isSuperAdmin ? <Explorer isActive={activeTab === 'explorer'} /> : null },
+      { id: 'cloudSync', render: () => isSuperAdmin ? <CloudSync user={user} isActive={activeTab === 'cloudSync'} /> : null },
+      { id: 'tagConfig', render: () => adminOrAbove ? <TagConfig user={user} isActive={activeTab === 'tagConfig'} /> : null },
+      { id: 'users', render: () => adminOrAbove ? <UserManagement user={user} isActive={activeTab === 'users'} /> : null },
+      { id: 'settings', render: () => adminOrAbove ? <Settings user={user} isActive={activeTab === 'settings'} /> : null },
+      { id: 'systemLogs', render: () => isSuperAdmin ? <SystemLogs user={user} isActive={activeTab === 'systemLogs'} /> : null }
+    ];
+
+    return (
+      <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+        {tabsList.map(tab => {
+          const content = tab.render();
+          if (!content) return null;
+          const isVisible = activeTab === tab.id;
+          return (
+            <div
+              key={tab.id}
+              style={{
+                display: isVisible ? 'block' : 'none',
+                width: '100%',
+                height: '100%'
+              }}
+            >
+              {content}
+            </div>
+          );
+        })}
+      </div>
+    );
   };
 
   return (
     <>
       {!user ? (
-        <Login onLogin={handleLogin} />
+        (() => {
+          if (typeof window !== 'undefined' && window.skadomation_diagnostic_log) {
+            window.skadomation_diagnostic_log('protected_route.redirect_to_login', {
+              logoutReason: 'No user session found in current tab state'
+            });
+          }
+          return <Login onLogin={handleLogin} />;
+        })()
       ) : (
         <Layout
           user={user}
@@ -635,7 +892,7 @@ function AppContent() {
           activeTab={activeTab}
           setActiveTab={setActiveTab}
         >
-          {renderPage()}
+          {renderPages()}
         </Layout>
       )}
 

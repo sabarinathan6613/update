@@ -1,20 +1,561 @@
-// src/components/Reports.jsx
-import { useState, useEffect, useMemo, useRef } from 'react';
-import { getTagConfigs, getReportTemplates, addEmailLog, getReportsList, saveReportRecord, deleteReportRecord, compileReportData, getRecipients } from '../utils/db';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import html2pdf from 'html2pdf.js';
+import { formatTimestampToPlantTime, toLocalInput, getPlantTimeZone, getTimeZoneOffsetMs } from '../utils/timeService';
+import { getTagConfigs, getReportTemplates, addEmailLog, getReportsList, saveReportRecord, deleteReportRecord, compileReportData, getRecipients, getSettings, saveSettings } from '../utils/db';
+import { calculateExecutiveKPIs } from '../utils/historianService';
+import { useRefresh } from '../utils/useRefresh';
+import RefreshButton from './RefreshButton';
+import { getSupabaseClient } from '../utils/supabaseClient';
 import { useSimulator } from '../utils/SimulatorContext';
 
-function formatTemplateString(str, report) {
+function formatTemplateString(str, report, plantId) {
   if (!str) return '';
   return str
     .replace(/\{\{reportName\}\}/g, report.name || '')
     .replace(/\{\{reportType\}\}/g, report.type || '')
     .replace(/\{\{shift\}\}/g, report.shift || 'Email Delivery Log')
     .replace(/\{\{dateRange\}\}/g, report.dateInfo || '')
-    .replace(/\{\{generatedAt\}\}/g, new Date(report.generatedAt || Date.now()).toLocaleString());
+    .replace(/\{\{generatedAt\}\}/g, formatTimestampToPlantTime(report.generatedAt || Date.now(), plantId));
 }
 
-export default function Reports({ user }) {
-  const { refreshTrigger } = useSimulator();
+function DailyProductionSummaryView({ report }) {
+  if (!report || !report.data) return null;
+  const { data, meta } = report;
+  const dp = data.dailyProduction || {};
+  const metadata = dp.metadata || {
+    siteName: meta.siteName || 'Crushing Circuit',
+    projectName: 'OHP4 Crushing Circuit',
+    preparedBy: meta.createdBy || 'System Administrator',
+    reportDate: meta.startDate ? meta.startDate.substring(0, 10) : new Date().toISOString().substring(0, 10),
+    timeGenerated: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+    shiftReported: 'Day / Night / Daily'
+  };
+
+  const pt = dp.productionTonnes || {
+    dayShiftRow: { day: { lump: 0, fines: 0, total: 0 } },
+    nightShiftRow: { night: { lump: 0, fines: 0, total: 0 } },
+    dailyTotalRow: { total: { lump: 0, fines: 0, total: 0 } },
+    refeedDay: 0,
+    refeedNight: 0
+  };
+
+  const downtime = dp.downtimeSummary || [];
+  const totalDowntime = dp.totalDowntimeRow || { dayEvents: 0, dayMins: 0, dayPct: 0, nightEvents: 0, nightMins: 0, nightPct: 0, combEvents: 0, combMins: 0, combPct: 0 };
+  const lumpSamples = dp.lumpSamples || [];
+  const fineSamples = dp.fineSamples || [];
+
+  const fmtNum = (v, decimals = 0) => {
+    if (v === null || v === undefined || isNaN(Number(v))) return '—';
+    return Number(v).toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  };  return (
+    <div style={{ padding: '0', fontFamily: 'system-ui, -apple-system, sans-serif', color: '#0F172A', backgroundColor: '#FFFFFF', width: '100%', maxWidth: '100%', boxSizing: 'border-box' }}>
+      
+      {/* ── 1. MAIN REPORT TITLE BANNER ── */}
+      <div style={{ backgroundColor: '#1E3A8A', color: '#FFFFFF', padding: '10px 16px', textAlign: 'center', fontWeight: 800, fontSize: '1.15rem', letterSpacing: '0.08em', textTransform: 'uppercase', borderRadius: '4px 4px 0 0' }}>
+        DAILY PRODUCTION SUMMARY REPORT
+      </div>
+
+      {/* ── 2. REPORT INFORMATION HEADER ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', border: '1px solid #CBD5E1', borderTop: 'none', backgroundColor: '#F8FAFC', padding: '8px 14px', gap: '12px', fontSize: '0.75rem', marginBottom: '10px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+          <div><strong style={{ color: '#475569' }}>Site Name:</strong> <span style={{ color: '#0F172A', fontWeight: 600 }}>{metadata.siteName}</span></div>
+          <div><strong style={{ color: '#475569' }}>Project / Contract:</strong> <span style={{ color: '#0F172A', fontWeight: 600 }}>{metadata.projectName}</span></div>
+          <div><strong style={{ color: '#475569' }}>Prepared By:</strong> <span style={{ color: '#0F172A', fontWeight: 600 }}>{metadata.preparedBy}</span></div>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+          <div><strong style={{ color: '#475569' }}>Report Date:</strong> <span style={{ color: '#0F172A', fontWeight: 600 }}>{metadata.reportDate}</span></div>
+          <div><strong style={{ color: '#475569' }}>Time Generated:</strong> <span style={{ color: '#0F172A', fontWeight: 600 }}>{metadata.timeGenerated}</span></div>
+          <div><strong style={{ color: '#475569' }}>Shift Reported:</strong> <span style={{ color: '#0F172A', fontWeight: 600 }}>{metadata.shiftReported}</span></div>
+        </div>
+      </div>
+
+      {/* ── 3. PRODUCTION TONNES SECTION ── */}
+      <div style={{ marginBottom: '12px', pageBreakInside: 'avoid', breakInside: 'avoid' }}>
+        <div style={{ backgroundColor: '#1E40AF', color: '#FFFFFF', padding: '6px 12px', fontWeight: 700, fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+          PRODUCTION TONNES &mdash; {metadata.siteName}
+        </div>
+        <div style={{ overflowX: 'auto', border: '1px solid #CBD5E1', borderTop: 'none' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem', textAlign: 'center' }}>
+            <thead>
+              <tr style={{ color: '#FFFFFF' }}>
+                <th style={{ padding: '5px 6px', backgroundColor: '#1E3A8A', border: '1px solid #CBD5E1', textAlign: 'left', width: '22%' }}>PRODUCTION ROW</th>
+                <th colSpan={3} style={{ padding: '5px 6px', backgroundColor: '#1E3A8A', border: '1px solid #CBD5E1' }}>DAY SHIFT</th>
+                <th colSpan={3} style={{ padding: '5px 6px', backgroundColor: '#1E3A8A', border: '1px solid #CBD5E1' }}>NIGHT SHIFT</th>
+                <th colSpan={3} style={{ padding: '5px 6px', backgroundColor: '#6D28D9', border: '1px solid #CBD5E1' }}>DAILY TOTAL</th>
+              </tr>
+              <tr style={{ backgroundColor: '#F1F5F9', color: '#334155', fontWeight: 700, fontSize: '0.68rem' }}>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1', textAlign: 'left' }}>Description</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Lump (t)</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Fines (t)</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Total Feed (t)</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Lump (t)</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Fines (t)</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Total Feed (t)</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Lump (t)</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Fines (t)</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Grand Total (t)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', textAlign: 'left', fontWeight: 600 }}>Day Shift</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>{fmtNum(pt.dayShiftRow?.day?.lump)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>{fmtNum(pt.dayShiftRow?.day?.fines)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', fontWeight: 700 }}>{fmtNum(pt.dayShiftRow?.day?.total)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>—</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>—</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>—</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>{fmtNum(pt.dayShiftRow?.day?.lump)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>{fmtNum(pt.dayShiftRow?.day?.fines)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', fontWeight: 700 }}>{fmtNum(pt.dayShiftRow?.day?.total)}</td>
+              </tr>
+              <tr>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', textAlign: 'left', fontWeight: 600 }}>Night Shift</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>—</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>—</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>—</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>{fmtNum(pt.nightShiftRow?.night?.lump)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>{fmtNum(pt.nightShiftRow?.night?.fines)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', fontWeight: 700 }}>{fmtNum(pt.nightShiftRow?.night?.total)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>{fmtNum(pt.nightShiftRow?.night?.lump)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1' }}>{fmtNum(pt.nightShiftRow?.night?.fines)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', fontWeight: 700 }}>{fmtNum(pt.nightShiftRow?.night?.total)}</td>
+              </tr>
+              {/* Highlighted Daily Total Row (Subtle light green) */}
+              <tr style={{ backgroundColor: '#DCFCE7', fontWeight: 800 }}>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', textAlign: 'left', color: '#14532D' }}>DAILY TOTAL</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', color: '#14532D' }}>{fmtNum(pt.dayShiftRow?.day?.lump)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', color: '#14532D' }}>{fmtNum(pt.dayShiftRow?.day?.fines)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', color: '#14532D' }}>{fmtNum(pt.dayShiftRow?.day?.total)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', color: '#14532D' }}>{fmtNum(pt.nightShiftRow?.night?.lump)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', color: '#14532D' }}>{fmtNum(pt.nightShiftRow?.night?.fines)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', color: '#14532D' }}>{fmtNum(pt.nightShiftRow?.night?.total)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', color: '#14532D' }}>{fmtNum(pt.dailyTotalRow?.day?.lump)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', color: '#14532D' }}>{fmtNum(pt.dailyTotalRow?.day?.fines)}</td>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', color: '#14532D' }}>{fmtNum(pt.dailyTotalRow?.day?.total)}</td>
+              </tr>
+              {/* Highlighted Re-Feed Conveyor Row (Yellow) */}
+              <tr style={{ backgroundColor: '#FEF08A' }}>
+                <td style={{ padding: '5px 6px', border: '1px solid #CBD5E1', textAlign: 'left', fontWeight: 700, color: '#713F12' }}>Re-Feed Conveyor (t)</td>
+                <td colSpan={3} style={{ padding: '5px 6px', border: '1px solid #CBD5E1', fontWeight: 700, color: '#713F12' }}>{fmtNum(pt.refeedDay)} T</td>
+                <td colSpan={3} style={{ padding: '5px 6px', border: '1px solid #CBD5E1', fontWeight: 700, color: '#713F12' }}>{fmtNum(pt.refeedNight)} T</td>
+                <td colSpan={3} style={{ padding: '5px 6px', border: '1px solid #CBD5E1', fontWeight: 800, color: '#713F12' }}>{fmtNum(pt.refeedDay + pt.refeedNight)} T</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── 4. SHIFT DOWNTIME SUMMARY SECTION ── */}
+      <div style={{ marginBottom: '12px', pageBreakInside: 'avoid', breakInside: 'avoid' }}>
+        <div style={{ backgroundColor: '#1E3A8A', color: '#FFFFFF', padding: '6px 12px', fontWeight: 700, fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+          SHIFT DOWNTIME SUMMARY
+        </div>
+        <div style={{ overflowX: 'auto', border: '1px solid #CBD5E1', borderTop: 'none' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem', textAlign: 'center' }}>
+            <thead>
+              <tr style={{ backgroundColor: '#1E3A8A', color: '#FFFFFF' }}>
+                <th style={{ padding: '6px', border: '1px solid #CBD5E1', textAlign: 'left', width: '31%' }}>DOWNTIME EVENT REASON</th>
+                <th colSpan={3} style={{ padding: '6px', border: '1px solid #CBD5E1' }}>DAY SHIFT</th>
+                <th colSpan={3} style={{ padding: '6px', border: '1px solid #CBD5E1' }}>NIGHT SHIFT</th>
+                <th colSpan={3} style={{ padding: '6px', border: '1px solid #CBD5E1' }}>COMBINED</th>
+              </tr>
+              <tr style={{ backgroundColor: '#F1F5F9', color: '#334155', fontWeight: 700, fontSize: '0.66rem' }}>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1', textAlign: 'left' }}>Event Description</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Events</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Mins Down</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>% Shift</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Events</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Mins Down</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>% Shift</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Events</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>Mins Down</th>
+                <th style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>% Shift</th>
+              </tr>
+            </thead>
+            <tbody>
+              {downtime.map((row, idx) => (
+                <tr key={idx} style={{ backgroundColor: idx % 2 === 0 ? '#FFFFFF' : '#F8FAFC', pageBreakInside: 'avoid', breakInside: 'avoid' }}>
+                  <td style={{ padding: '4px 6px', border: '1px solid #CBD5E1', textAlign: 'left', fontWeight: 500 }}>{row.event}</td>
+                  <td style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>{row.dayEvents}</td>
+                  <td style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>{row.dayMins}</td>
+                  <td style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>{row.dayPct}%</td>
+                  <td style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>{row.nightEvents}</td>
+                  <td style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>{row.nightMins}</td>
+                  <td style={{ padding: '4px 6px', border: '1px solid #CBD5E1' }}>{row.nightPct}%</td>
+                  <td style={{ padding: '4px 6px', border: '1px solid #CBD5E1', fontWeight: 600 }}>{row.combEvents}</td>
+                  <td style={{ padding: '4px 6px', border: '1px solid #CBD5E1', fontWeight: 600 }}>{row.combMins}</td>
+                  <td style={{ padding: '4px 6px', border: '1px solid #CBD5E1', fontWeight: 600 }}>{row.combPct}%</td>
+                </tr>
+              ))}
+              {/* Highlighted Total Downtime Row (Yellow) */}
+              <tr style={{ backgroundColor: '#FEF08A', fontWeight: 800, color: '#713F12', pageBreakInside: 'avoid', breakInside: 'avoid' }}>
+                <td style={{ padding: '6px', border: '1px solid #CBD5E1', textAlign: 'left' }}>{totalDowntime.event}</td>
+                <td style={{ padding: '6px', border: '1px solid #CBD5E1' }}>{totalDowntime.dayEvents}</td>
+                <td style={{ padding: '6px', border: '1px solid #CBD5E1' }}>{totalDowntime.dayMins}</td>
+                <td style={{ padding: '6px', border: '1px solid #CBD5E1' }}>{totalDowntime.dayPct}%</td>
+                <td style={{ padding: '6px', border: '1px solid #CBD5E1' }}>{totalDowntime.nightEvents}</td>
+                <td style={{ padding: '6px', border: '1px solid #CBD5E1' }}>{totalDowntime.nightMins}</td>
+                <td style={{ padding: '6px', border: '1px solid #CBD5E1' }}>{totalDowntime.nightPct}%</td>
+                <td style={{ padding: '6px', border: '1px solid #CBD5E1' }}>{totalDowntime.combEvents}</td>
+                <td style={{ padding: '6px', border: '1px solid #CBD5E1' }}>{totalDowntime.combMins}</td>
+                <td style={{ padding: '6px', border: '1px solid #CBD5E1' }}>{totalDowntime.combPct}%</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── 5. SAMPLE STATION DATA SECTION (Explicit Page Break Before) ── */}
+      {/* ── 5. SAMPLE STATION DATA SECTION (Explicit Page Break Before) ── */}
+      <div style={{ pageBreakBefore: 'always', breakBefore: 'page' }}>
+        <div style={{ backgroundColor: '#15803D', color: '#FFFFFF', padding: '8px 14px', fontWeight: 700, fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+          SAMPLE STATION DATA
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginTop: '10px' }}>
+          
+          {/* Lump Sample Station Table */}
+          <div style={{ border: '1px solid #CBD5E1', borderRadius: '4px', overflow: 'hidden' }}>
+            <div style={{ backgroundColor: '#DCFCE7', color: '#166534', padding: '6px 12px', fontWeight: 700, fontSize: '0.78rem', textTransform: 'uppercase' }}>
+              🟢 LUMP SAMPLE STATION
+            </div>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem', textAlign: 'left' }}>
+                <thead>
+                  <tr style={{ backgroundColor: '#F1F5F9', color: '#334155', borderBottom: '1px solid #CBD5E1' }}>
+                    <th style={{ padding: '6px 8px', width: '24%' }}>TIMESTAMP</th>
+                    <th style={{ padding: '6px 8px', width: '24%' }}>EQUIPMENT NAME</th>
+                    <th style={{ padding: '6px 8px', width: '14%' }}>SHIFT ID</th>
+                    <th style={{ padding: '6px 8px', width: '19%', textAlign: 'center' }}>SHIFT CUM. TONNES</th>
+                    <th style={{ padding: '6px 8px', width: '19%', textAlign: 'center' }}>STOCKPILE TONNES</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {lumpSamples.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} style={{ padding: '12px', textAlign: 'center', color: '#94A3B8', fontStyle: 'italic' }}>
+                        No Lump Sample Station data available.
+                      </td>
+                    </tr>
+                  ) : (
+                    lumpSamples.map((s, idx) => (
+                      <tr key={idx} style={{ borderBottom: '1px solid #F1F5F9', backgroundColor: idx % 2 === 0 ? '#FFFFFF' : '#F8FAFC' }}>
+                        <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: '0.68rem', color: '#475569' }}>
+                          {s.timestamp ? formatTimestampToPlantTime(s.timestamp, meta.plantId) : (s.dateTime || '—')}
+                        </td>
+                        <td style={{ padding: '6px 8px', fontWeight: 600, color: '#1F2937' }}>
+                          {s.tagName || s.tag_name || 'Lump Sample Station'}
+                        </td>
+                        <td style={{ padding: '6px 8px', fontWeight: 700, color: '#111827' }}>
+                          {s.shift_id != null ? s.shift_id : (s.shiftId || '—')}
+                        </td>
+                        <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 700, color: '#111827' }}>
+                          {s.shift_cumulative_tonnes != null ? Number(s.shift_cumulative_tonnes).toFixed(2) : (s.cumTons != null ? Number(s.cumTons).toFixed(2) : '—')}
+                        </td>
+                        <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 700, color: '#111827' }}>
+                          {s.stockpile_tonnes != null ? Number(s.stockpile_tonnes).toFixed(2) : (s.stockpileTons != null ? Number(s.stockpileTons).toFixed(2) : '—')}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Fines Sample Station Table */}
+          <div style={{ border: '1px solid #CBD5E1', borderRadius: '4px', overflow: 'hidden' }}>
+            <div style={{ backgroundColor: '#FEF3C7', color: '#92400E', padding: '6px 12px', fontWeight: 700, fontSize: '0.78rem', textTransform: 'uppercase' }}>
+              🟠 FINES SAMPLE STATION
+            </div>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem', textAlign: 'left' }}>
+                <thead>
+                  <tr style={{ backgroundColor: '#F1F5F9', color: '#334155', borderBottom: '1px solid #CBD5E1' }}>
+                    <th style={{ padding: '6px 8px', width: '24%' }}>TIMESTAMP</th>
+                    <th style={{ padding: '6px 8px', width: '24%' }}>EQUIPMENT NAME</th>
+                    <th style={{ padding: '6px 8px', width: '14%' }}>SHIFT ID</th>
+                    <th style={{ padding: '6px 8px', width: '19%', textAlign: 'center' }}>SHIFT CUM. TONNES</th>
+                    <th style={{ padding: '6px 8px', width: '19%', textAlign: 'center' }}>STOCKPILE TONNES</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {fineSamples.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} style={{ padding: '12px', textAlign: 'center', color: '#94A3B8', fontStyle: 'italic' }}>
+                        No Fines Sample Station data available.
+                      </td>
+                    </tr>
+                  ) : (
+                    fineSamples.map((s, idx) => (
+                      <tr key={idx} style={{ borderBottom: '1px solid #F1F5F9', backgroundColor: idx % 2 === 0 ? '#FFFFFF' : '#F8FAFC' }}>
+                        <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: '0.68rem', color: '#475569' }}>
+                          {s.timestamp ? formatTimestampToPlantTime(s.timestamp, meta.plantId) : (s.dateTime || '—')}
+                        </td>
+                        <td style={{ padding: '6px 8px', fontWeight: 600, color: '#1F2937' }}>
+                          {s.tagName || s.tag_name || 'Fines Sample Station'}
+                        </td>
+                        <td style={{ padding: '6px 8px', fontWeight: 700, color: '#111827' }}>
+                          {s.shift_id != null ? s.shift_id : (s.shiftId || '—')}
+                        </td>
+                        <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 700, color: '#111827' }}>
+                          {s.shift_cumulative_tonnes != null ? Number(s.shift_cumulative_tonnes).toFixed(2) : (s.cumTons != null ? Number(s.cumTons).toFixed(2) : '—')}
+                        </td>
+                        <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 700, color: '#111827' }}>
+                          {s.stockpile_tonnes != null ? Number(s.stockpile_tonnes).toFixed(2) : (s.stockpileTons != null ? Number(s.stockpileTons).toFixed(2) : '—')}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
+function DailyProductionAccountView({ data }) {
+  if (!data) return null;
+  const { safetyAndRisk: sr, productionOHP4: pt, dayShiftDowntime: dsD, nightShiftDowntime: dsN, dayTotalMins: tMinsD, nightTotalMins: tMinsN } = data;
+
+  const S = {
+    titleBlock: {
+      border: '2.5px solid #059669', // green border
+      borderRadius: '4px',
+      padding: '12px',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: '24px',
+      marginBottom: '20px',
+      background: '#FFFFFF'
+    },
+    logo: {
+      backgroundColor: '#E11D48', // red oval
+      width: '54px',
+      height: '32px',
+      borderRadius: '16px / 16px', // oval shape
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      color: '#FFFFFF',
+      fontWeight: 'bold',
+      fontSize: '0.8rem',
+      fontStyle: 'italic',
+      boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
+    },
+    title: {
+      color: '#1E293B',
+      fontWeight: 'bold',
+      fontSize: '1.25rem',
+      margin: 0
+    },
+    table: {
+      width: '100%',
+      borderCollapse: 'collapse',
+      fontSize: '0.72rem',
+      marginBottom: '15px',
+      border: '1px solid #CBD5E1'
+    },
+    th: {
+      backgroundColor: '#1B365D',
+      color: '#FFFFFF',
+      padding: '5px 8px',
+      fontWeight: 'bold',
+      border: '1px solid #CBD5E1',
+      fontSize: '0.7rem'
+    },
+    td: {
+      padding: '4px 8px',
+      border: '1px solid #CBD5E1',
+      color: '#1E293B',
+      background: '#FFFFFF'
+    },
+    tdLabel: {
+      padding: '4px 8px',
+      border: '1px solid #CBD5E1',
+      color: '#1E293B',
+      background: '#F8FAFC',
+      fontWeight: 'bold',
+      textAlign: 'left'
+    },
+    tdBold: {
+      padding: '4px 8px',
+      border: '1px solid #CBD5E1',
+      fontWeight: 'bold',
+      color: '#1E293B',
+      background: '#F8FAFC'
+    },
+    tdYellow: {
+      padding: '4px 8px',
+      border: '1px solid #CBD5E1',
+      background: '#FFFF00', // yellow
+      color: '#1E293B',
+      fontWeight: 'bold'
+    },
+    headerBanner: {
+      backgroundColor: '#1B365D', // Navy banner
+      color: '#FFFFFF',
+      padding: '5px 12px',
+      fontSize: '0.75rem',
+      fontWeight: 'bold',
+      textAlign: 'center',
+      border: '1px solid #CBD5E1',
+      borderBottom: 'none'
+    }
+  };
+
+  return (
+    <div className="daily-production-account-report" style={{ padding: '4px' }}>
+      {/* ── MACA STYLE HEADER TITLE BLOCK ── */}
+      <div style={S.titleBlock}>
+        <div style={S.logo}>maca</div>
+        <h2 style={S.title}>Daily Production Account</h2>
+      </div>
+
+      {/* ── SAFETY / METADATA TABLE ── */}
+      <table style={S.table}>
+        <tbody>
+          <tr>
+            <td style={{ ...S.tdLabel, width: '22%' }}>Safety Share/Safety topic</td>
+            <td style={{ ...S.td, textAlign: 'left', fontWeight: '500' }} colSpan="3">{sr.safetyShare}</td>
+          </tr>
+          <tr>
+            <td style={S.tdLabel}>Hazards</td>
+            <td style={{ ...S.td, textAlign: 'left' }} colSpan="3">{sr.hazards}</td>
+          </tr>
+          <tr>
+            <td style={S.tdLabel}>Take 5</td>
+            <td style={{ ...S.td, textAlign: 'left' }} colSpan="3">{sr.take5}</td>
+          </tr>
+          <tr>
+            <td style={S.tdLabel}>Incidents</td>
+            <td style={{ ...S.td, textAlign: 'left' }} colSpan="3">{sr.incidents}</td>
+          </tr>
+          <tr>
+            <td style={S.tdLabel}>Trucks per shift</td>
+            <td style={{ ...S.td, textAlign: 'left' }} colSpan="3">
+              Trucks per shift target {sr.trucksPerShiftTarget} &nbsp;&nbsp;&nbsp;&nbsp; 
+              Day Shift - {sr.trucksDayShift} &nbsp;&nbsp;&nbsp;&nbsp; 
+              Night Shift - {sr.trucksNightShift}
+            </td>
+          </tr>
+          <tr>
+            <td style={S.tdLabel}>Re-Feed Conveyor</td>
+            <td style={{ ...S.td, textAlign: 'left' }} colSpan="3">
+              Tonnes &nbsp;&nbsp;&nbsp;&nbsp; 
+              Day Shift - {sr.refeedDay} &nbsp;&nbsp;&nbsp;&nbsp; 
+              Night Shift - {sr.refeedNight}
+            </td>
+          </tr>
+          <tr>
+            <td style={S.tdLabel}>Catastrophic Risks today</td>
+            <td style={{ ...S.td, textAlign: 'left', fontWeight: 'bold' }} colSpan="3">{sr.catastrophicRisks}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      {/* ── PRODUCTION OHP4 ── */}
+      <div style={S.headerBanner}>
+        Production OHP4
+      </div>
+      <table style={{ ...S.table, marginTop: 0 }}>
+        <thead>
+          <tr>
+            <th style={{ ...S.th, width: '30%', textAlign: 'left' }}></th>
+            <th style={S.th}>CV10 Lump (Tonnes)</th>
+            <th style={S.th}>CV17 Fines (Tonnes)</th>
+            <th style={S.th}>Totals</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style={{ ...S.td, fontWeight: 'bold', textAlign: 'left' }}>Day shift (6am to 6pm)</td>
+            <td style={S.td}>{pt.dayShift.lump.toLocaleString()}</td>
+            <td style={S.td}>{pt.dayShift.fines.toLocaleString()}</td>
+            <td style={S.tdBold}>{pt.dayShift.total.toLocaleString()}</td>
+          </tr>
+          <tr>
+            <td style={{ ...S.td, fontWeight: 'bold', textAlign: 'left' }}>Night shift (6pm to 6am)</td>
+            <td style={S.td}>{pt.nightShift.lump.toLocaleString()}</td>
+            <td style={S.td}>{pt.nightShift.fines.toLocaleString()}</td>
+            <td style={S.tdBold}>{pt.nightShift.total.toLocaleString()}</td>
+          </tr>
+          <tr>
+            <td style={{ ...S.td, fontWeight: 'bold', textAlign: 'left' }}>Total</td>
+            <td style={S.tdBold}>{pt.totals.lump.toLocaleString()}</td>
+            <td style={S.tdBold}>{pt.totals.fines.toLocaleString()}</td>
+            <td style={S.tdYellow}>{pt.totals.total.toLocaleString()}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      {/* ── DAY SHIFT DOWNTIME OHP4 ── */}
+      <div style={S.headerBanner}>
+        Day Shift Downtime OHP4
+      </div>
+      <table style={{ ...S.table, marginTop: 0 }}>
+        <thead>
+          <tr>
+            <th style={{ ...S.th, width: '40%', textAlign: 'left' }}>Event</th>
+            <th style={S.th}>Number of Events</th>
+            <th style={S.th}>Minutes Down</th>
+          </tr>
+        </thead>
+        <tbody>
+          {dsD.map((row, idx) => (
+            <tr key={idx}>
+              <td style={{ ...S.td, textAlign: 'left' }}>{row.event}</td>
+              <td style={S.td}>{row.events ?? ''}</td>
+              <td style={S.td}>{row.mins ?? ''}</td>
+            </tr>
+          ))}
+          <tr style={{ fontWeight: 'bold', background: '#F1F5F9' }}>
+            <td style={{ ...S.tdLabel, textAlign: 'left' }}>TOTAL:</td>
+            <td style={S.tdBold}></td>
+            <td style={S.tdBold}>{tMinsD}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      {/* ── NIGHT SHIFT DOWNTIME OHP4 ── */}
+      <div style={S.headerBanner}>
+        Night Shift Downtime OHP4
+      </div>
+      <table style={{ ...S.table, marginTop: 0 }}>
+        <thead>
+          <tr>
+            <th style={{ ...S.th, width: '40%', textAlign: 'left' }}>Event</th>
+            <th style={S.th}>Number of Events</th>
+            <th style={S.th}>Minutes Down</th>
+          </tr>
+        </thead>
+        <tbody>
+          {dsN.map((row, idx) => (
+            <tr key={idx}>
+              <td style={{ ...S.td, textAlign: 'left' }}>{row.event}</td>
+              <td style={S.td}>{row.events ?? ''}</td>
+              <td style={S.td}>{row.mins ?? ''}</td>
+            </tr>
+          ))}
+          <tr style={{ fontWeight: 'bold', background: '#F1F5F9' }}>
+            <td style={{ ...S.tdLabel, textAlign: 'left' }}>TOTAL:</td>
+            <td style={S.tdBold}></td>
+            <td style={S.tdBold}>{tMinsN}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+export default function Reports({ user, isActive }) {
+  const { refreshTrigger, currentPlantId, chartStart, chartEnd } = useSimulator();
   const isReadOnly = user?.role === 'Admin';
 
   // Tab State: 'workspace', 'history'
@@ -26,12 +567,17 @@ export default function Reports({ user }) {
   const [selectedTemplateId, setSelectedTemplateId] = useState('');
   const [emailSubject, setEmailSubject] = useState('');
   const [emailMessage, setEmailMessage] = useState('');
-
   // Report Builder Form State
   const [reportTitle, setReportTitle] = useState('');
-  const [reportType, setReportType] = useState('Historian Shift Summary');
+  const [reportType, setReportType] = useState('Daily Production Report');
   const [customStart, setCustomStart] = useState('');
   const [customEnd, setCustomEnd] = useState('');
+
+  // Align Report custom range state with centralized time range
+  useEffect(() => {
+    if (chartStart) setCustomStart(toLocalInput(new Date(chartStart)));
+    if (chartEnd) setCustomEnd(toLocalInput(new Date(chartEnd)));
+  }, [chartStart, chartEnd]);
   const [selectedReportTags, setSelectedReportTags] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isReportCompiling, setIsReportCompiling] = useState(false);
@@ -54,7 +600,29 @@ export default function Reports({ user }) {
   const [customEmail, setCustomEmail] = useState('');
   const [customType, setCustomType] = useState('to');
   const [isSendingEmail, setIsSendingEmail] = useState(false);
+  const [isDownloadingPDF, setIsDownloadingPDF] = useState(false);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
+  const [generationProgress, setGenerationProgress] = useState(0);
+  const [generationMessage, setGenerationMessage] = useState('');
+  const [generationFormat, setGenerationFormat] = useState('pdf');
   const [emailSuccessToast, setEmailSuccessToast] = useState(false);
+  const [emailTo, setEmailTo] = useState('');
+  const [emailCc, setEmailCc] = useState('');
+  const [emailBcc, setEmailBcc] = useState('');
+
+  const [toEmails, setToEmails] = useState([]);
+  const [ccEmails, setCcEmails] = useState([]);
+  const [bccEmails, setBccEmails] = useState([]);
+
+  const [toInput, setToInput] = useState('');
+  const [ccInput, setCcInput] = useState('');
+  const [bccInput, setBccInput] = useState('');
+
+  const [toError, setToError] = useState('');
+  const [ccError, setCcError] = useState('');
+  const [bccError, setBccError] = useState('');
+  const [attachPdf, setAttachPdf] = useState(true);
+  const [attachExcel, setAttachExcel] = useState(true);
 
   const didInitRef = useRef(false);
 
@@ -64,6 +632,14 @@ export default function Reports({ user }) {
            templatesList.find(t => t.report_type === selectedReport.meta.type) ||
            null;
   }, [templatesList, selectedReport]);
+
+  // Filter tag configs for report workspace: union of PDF-enabled OR Excel-enabled tags
+  const eligibleReportTags = useMemo(() => {
+    return tagConfigs.filter(t => 
+      (t.pdf_enabled || t.IncludeInPDF || t.excel_enabled || t.IncludeInExcel) && 
+      (t.ActiveStatus !== false && t.active_status !== false)
+    );
+  }, [tagConfigs]);
 
   // Load configuration and initialize inputs
   useEffect(() => {
@@ -79,13 +655,46 @@ export default function Reports({ user }) {
       const savedReports = await getReportsList();
       setReportsList(savedReports);
 
-      // Load recipients from Supabase
+      // Sanitize/delete demo email addresses from Supabase tables
+      try {
+        const supabase = getSupabaseClient();
+        if (supabase) {
+          const demoEmails = [
+            'plantadmin@plant.com',
+            'ops-lead@plant.com',
+            'maintenance-tech@plant.com',
+            'engineer@plant.com',
+            'archive@plant.com'
+          ];
+          await supabase.from('report_recipients').delete().in('email', demoEmails);
+
+          const { data: schedules } = await supabase.from('scheduled_reports').select('id, email_recipients');
+          if (schedules) {
+            for (const s of schedules) {
+              if (s.email_recipients) {
+                const cleaned = s.email_recipients.split(',')
+                  .map(x => x.trim())
+                  .filter(x => !demoEmails.includes(x.toLowerCase()))
+                  .join(', ');
+                if (cleaned !== s.email_recipients) {
+                  await supabase.from('scheduled_reports').update({ email_recipients: cleaned }).eq('id', s.id);
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to sanitize demo emails on startup:", err);
+      }
+
       const recs = await getRecipients();
       setRecipientsList(recs);
 
       if (!didInitRef.current) {
-        // Default select tags configured as ReportsVisible
-        const reportVisibleTags = sortedConfigs.filter(t => t.ReportsVisible).map(t => t.TagIndex);
+        // Select all report-configured tags (PDF or Excel enabled) by default
+        const reportVisibleTags = sortedConfigs
+          .filter(t => (t.pdf_enabled || t.IncludeInPDF || t.excel_enabled || t.IncludeInExcel) && (t.ActiveStatus !== false && t.active_status !== false))
+          .map(t => t.TagIndex);
         setSelectedReportTags(reportVisibleTags);
 
         // Default range: last 24 hours
@@ -95,21 +704,18 @@ export default function Reports({ user }) {
         didInitRef.current = true;
       }
     };
-    loadReportConfigs();
-  }, [refreshTrigger]);
+    if (isActive) {
+      loadReportConfigs();
+    }
+  }, [isActive]);
 
   // Tag dictionary mapping
   const tagMap = useMemo(() => {
     const map = {};
-    tagConfigs.forEach(c => {
-      map[c.TagIndex] = c;
+    tagConfigs.forEach(t => {
+      map[t.TagIndex] = t;
     });
     return map;
-  }, [tagConfigs]);
-
-  // Filter tag configs for checkboxes
-  const eligibleReportTags = useMemo(() => {
-    return tagConfigs.filter(t => t.ReportsVisible);
   }, [tagConfigs]);
 
   const allSelected =
@@ -154,10 +760,19 @@ export default function Reports({ user }) {
   // Compile and load into workspace preview
   const handleGenerate = (e) => {
     e.preventDefault();
-    if (selectedReportTags.length === 0) {
-      alert('Please select at least one tag to include in the report.');
+    
+    // Auto-populate tags if selectedReportTags is empty but eligible tags exist
+    let activeTags = selectedReportTags;
+    if (activeTags.length === 0 && eligibleReportTags.length > 0) {
+      activeTags = eligibleReportTags.map(t => t.TagIndex);
+      setSelectedReportTags(activeTags);
+    }
+
+    if (eligibleReportTags.length === 0) {
+      alert('Daily Production Report cannot be generated: No historian tags have been enabled for PDF or Excel in Tag Configuration. Please enable PDF or Excel toggles in Tag Configuration first.');
       return;
     }
+
     if (!customStart || !customEnd) {
       alert('Please set a valid date range.');
       return;
@@ -170,8 +785,8 @@ export default function Reports({ user }) {
     setIsGenerating(true);
 
     setTimeout(async () => {
-      const start = new Date(customStart).toISOString();
-      const end = new Date(customEnd).toISOString();
+      const start = customStart ? new Date(customStart).toISOString() : new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const end = customEnd ? new Date(customEnd).toISOString() : new Date().toISOString();
       const dateInfo = `${customStart.replace('T', ' ')} to ${customEnd.replace('T', ' ')}`;
       const name = reportTitle.trim() || `${reportType} — ${dateInfo}`;
 
@@ -182,7 +797,7 @@ export default function Reports({ user }) {
         dateInfo,
         startDate: start,
         endDate: end,
-        tags: [...selectedReportTags],
+        tags: [...activeTags],
         generatedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
         createdBy: user?.email || ''
       };
@@ -197,7 +812,7 @@ export default function Reports({ user }) {
       setIsGenerating(false);
 
       await handleViewReport(newReport);
-    }, 800);
+    }, 400);
   };
 
   // Load a report into workspace preview panel
@@ -215,19 +830,19 @@ export default function Reports({ user }) {
     }
   };
 
-  // Refresh the currently selected report if refreshTrigger changes (in the background)
-  useEffect(() => {
-    if (!selectedReportRef.current) return;
-    const refreshActiveReport = async () => {
-      try {
-        const freshData = await compileReportData(selectedReportRef.current.meta);
-        setSelectedReport(prev => prev ? { ...prev, data: freshData } : null);
-      } catch (err) {
-        console.error("Failed to refresh active report data:", err);
-      }
-    };
-    refreshActiveReport();
-  }, [refreshTrigger]);
+  // Background auto-refresh of compiled reports has been removed to reduce Supabase egress usage
+  // in line with the requirement that reports should only be compiled/fetched explicitly.
+
+  const handleManualRefreshReport = useCallback(async () => {
+    if (!selectedReportRef.current) {
+      alert("No report is currently loaded in the workspace. Compile a report first, then click Refresh.");
+      return;
+    }
+    const freshData = await compileReportData(selectedReportRef.current.meta);
+    setSelectedReport(prev => prev ? { ...prev, data: freshData } : null);
+  }, []);
+
+  const { isRefreshing, refreshToast, handleRefresh } = useRefresh(handleManualRefreshReport, 'Reports');
 
   // Delete saved report
   const handleDeleteReport = async (reportId) => {
@@ -295,6 +910,282 @@ export default function Reports({ user }) {
 
   const handlePrint = () => window.print();
 
+
+
+  const handleDownloadPDF = async () => {
+    if (!selectedReport) {
+      alert('No report loaded to download.');
+      return;
+    }
+    
+    setIsGeneratingReport(true);
+    setGenerationProgress(10);
+    setGenerationMessage('Initializing client PDF export...');
+    setGenerationFormat('pdf');
+
+    try {
+      setGenerationProgress(30);
+      setGenerationMessage('Capturing report DOM...');
+      
+      const element = document.getElementById('printable-area');
+      if (!element) {
+        throw new Error('Report container element #printable-area not found in DOM');
+      }
+
+      setGenerationProgress(60);
+      setGenerationMessage('Rendering PDF pages...');
+
+      const repDate = (selectedReport.meta.startDate || new Date().toISOString()).substring(0, 10);
+      const opt = {
+        margin:       [6, 6, 6, 6],
+        filename:     `Daily_Production_Report_${repDate}.pdf`,
+        image:        { type: 'jpeg', quality: 0.98 },
+        html2canvas:  { scale: 2, useCORS: true, logging: false },
+        jsPDF:        { unit: 'mm', format: 'a4', orientation: 'landscape', compress: true },
+        pagebreak:    { mode: ['css', 'legacy'] }
+      };
+
+      setGenerationProgress(85);
+      setGenerationMessage('Generating document file...');
+
+      await html2pdf().set(opt).from(element).save();
+
+      setGenerationProgress(100);
+      setGenerationMessage('Download completed!');
+      console.log('[PDF Export] Client-side PDF export succeeded');
+    } catch (err) {
+      console.error('[PDF Export Error]:', err);
+      alert(`PDF Export Failed: ${err.message || err}`);
+    } finally {
+      setTimeout(() => {
+        setIsGeneratingReport(false);
+        setGenerationProgress(0);
+      }, 400);
+    }
+  };
+
+  const handleGenerateReport = async (report, format) => {
+    if (!report || isGeneratingReport) return;
+    setIsGeneratingReport(true);
+    setGenerationProgress(0);
+    setGenerationMessage('Initializing report generation...');
+    setGenerationFormat(format);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 35000);
+
+    try {
+      const activeTemplate = templatesList.find(t => t.report_type === report.type && t.is_default) ||
+                            templatesList.find(t => t.report_type === report.type) ||
+                            null;
+      const supabase = getSupabaseClient();
+      let token = '';
+      if (supabase) {
+        const sessionRes = await supabase.auth.getSession();
+        token = sessionRes.data.session?.access_token || '';
+      }
+
+      console.log(`[PDF/Report Export] Starting ${format.toUpperCase()} generation for:`, report.name);
+
+      const response = await fetch('/api/generate-report', {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({
+          format,
+          reportMeta: report,
+          templateConfig: activeTemplate ? {
+            logoText: activeTemplate.logo_text,
+            headerColor: activeTemplate.header_color,
+            footerText: activeTemplate.footer_text
+          } : null
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server returned status ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      const processLine = (line) => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('data: ')) {
+          try {
+            const payload = JSON.parse(trimmed.substring(6));
+            if (payload.type === 'progress') {
+              console.log(`[PDF/Report Export Progress] ${payload.percent}% - ${payload.message}`);
+              setGenerationProgress(payload.percent);
+              setGenerationMessage(payload.message);
+            } else if (payload.type === 'complete') {
+              console.log(`[PDF/Report Export Complete] 100% - Downloading ${payload.fileName}`);
+              setGenerationProgress(100);
+              setGenerationMessage('Download ready!');
+              
+              // Decode base64 to Blob
+              const byteCharacters = atob(payload.data);
+              const byteNumbers = new Array(byteCharacters.length);
+              for (let i = 0; i < byteCharacters.length; i++) {
+                byteNumbers[i] = byteCharacters.charCodeAt(i);
+              }
+              const byteArray = new Uint8Array(byteNumbers);
+              const blob = new Blob([byteArray], { type: payload.fileType });
+              
+              const url = window.URL.createObjectURL(blob);
+              const link = document.createElement('a');
+              link.href = url;
+              link.setAttribute('download', payload.fileName);
+              document.body.appendChild(link);
+              link.click();
+              document.body.removeChild(link);
+              window.URL.revokeObjectURL(url);
+            } else if (payload.type === 'error') {
+              throw new Error(payload.message);
+            }
+          } catch (jsonErr) {
+            if (trimmed.length > 200) {
+              console.warn('NDJSON parse error for payload length:', trimmed.length);
+            }
+          }
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          if (buffer && buffer.trim()) {
+            processLine(buffer);
+            buffer = '';
+          }
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          processLine(line);
+        }
+      }
+    } catch (err) {
+      console.error('[PDF/Report Export Error]:', err);
+      const isAbort = err.name === 'AbortError';
+      const errMsg = isAbort ? 'PDF generation timed out after 35s. Please retry.' : (err.message || 'Unknown generation error');
+      setGenerationMessage(`Error generating report: ${errMsg}`);
+      alert(`Report Generation Failed: ${errMsg}`);
+    } finally {
+      clearTimeout(timeoutId);
+      setTimeout(() => {
+        setIsGeneratingReport(false);
+      }, 600);
+    }
+  };
+
+  const filteredRecipients = useMemo(() => {
+    const demoEmails = [
+      'plantadmin@plant.com',
+      'ops-lead@plant.com',
+      'maintenance-tech@plant.com',
+      'engineer@plant.com',
+      'archive@plant.com'
+    ];
+    return recipientsList.filter(rec => rec && rec.email && !demoEmails.includes(rec.email.toLowerCase().trim()));
+  }, [recipientsList]);
+
+  const handleAddEmail = (type) => {
+    let emailInput = '';
+    let setInput, setEmailList, emailList, setError;
+    
+    if (type === 'to') {
+      emailInput = toInput; setInput = setToInput; setEmailList = setToEmails; emailList = toEmails; setError = setToError;
+    } else if (type === 'cc') {
+      emailInput = ccInput; setInput = setCcInput; setEmailList = setCcEmails; emailList = ccEmails; setError = setCcError;
+    } else {
+      emailInput = bccInput; setInput = setBccInput; setEmailList = setBccEmails; emailList = bccEmails; setError = setBccError;
+    }
+
+    const clean = emailInput.trim();
+    if (!clean) return;
+
+    if (!validateEmail(clean)) {
+      setError('Invalid format');
+      return;
+    }
+
+    if (emailList.includes(clean)) {
+      setError('Duplicate email');
+      return;
+    }
+
+    const newList = [...emailList, clean];
+    setEmailList(newList);
+    setInput('');
+    setError('');
+
+    if (type === 'to') setEmailTo(newList.join(', '));
+    else if (type === 'cc') setEmailCc(newList.join(', '));
+    else setEmailBcc(newList.join(', '));
+  };
+
+  const handleRemoveEmail = (type, email) => {
+    let setEmailList, emailList;
+    if (type === 'to') {
+      setEmailList = setToEmails; emailList = toEmails;
+    } else if (type === 'cc') {
+      setEmailList = setCcEmails; emailList = ccEmails;
+    } else {
+      setEmailList = setBccEmails; emailList = bccEmails;
+    }
+
+    const newList = emailList.filter(x => x !== email);
+    setEmailList(newList);
+
+    if (type === 'to') setEmailTo(newList.join(', '));
+    else if (type === 'cc') setEmailCc(newList.join(', '));
+    else setEmailBcc(newList.join(', '));
+  };
+
+  const handleQuickAdd = (email, type) => {
+    let setEmailList, emailList, setError;
+    if (type === 'to') {
+      setEmailList = setToEmails; emailList = toEmails; setError = setToError;
+    } else if (type === 'cc') {
+      setEmailList = setCcEmails; emailList = ccEmails; setError = setCcError;
+    } else {
+      setEmailList = setBccEmails; emailList = bccEmails; setError = setBccError;
+    }
+
+    if (emailList.includes(email)) return;
+
+    const newList = [...emailList, email];
+    setEmailList(newList);
+    setError('');
+
+    if (type === 'to') setEmailTo(newList.join(', '));
+    else if (type === 'cc') setEmailCc(newList.join(', '));
+    else setEmailBcc(newList.join(', '));
+  };
+
+  const handleSaveDefaultRecipients = async () => {
+    try {
+      const currentSettings = await getSettings({ forceRefresh: true });
+      const updated = {
+        ...currentSettings,
+        emailRecipients: emailTo
+      };
+      await saveSettings(updated);
+      alert('Default recipients successfully saved in Plant Settings.');
+    } catch (err) {
+      alert(`Failed to save default recipients: ${err.message}`);
+    }
+  };
+
   // Email simulation helpers & handlers
   const getReportCategory = (type) => {
     const t = (type || '').toLowerCase();
@@ -317,34 +1208,71 @@ export default function Reports({ user }) {
 
   const handleOpenEmailPrompt = () => {
     if (!selectedReport) return;
-    const category = getReportCategory(selectedReport.meta.type);
-    const initialSelection = {};
-    recipientsList.forEach(rec => {
-      if (rec.active) {
-        const subbedTypes = (rec.report_types || '').split(',').map(x => x.trim()).filter(Boolean);
-        if (subbedTypes.includes(category)) {
-          initialSelection[rec.email] = 'to';
-        } else {
-          initialSelection[rec.email] = 'none';
-        }
-      }
-    });
-    setSelectedRecipients(initialSelection);
-    setCustomRecipients([]);
-    setCustomEmail('');
-    setCustomType('to');
 
-    // Find default template matching this report type
     const defaultTemp = templatesList.find(t => t.report_type === selectedReport.meta.type && t.is_default);
     if (defaultTemp) {
       setSelectedTemplateId(defaultTemp.id);
-      setEmailSubject(formatTemplateString(defaultTemp.subject, selectedReport.meta));
-      setEmailMessage(formatTemplateString(defaultTemp.email_body, selectedReport.meta));
+      setEmailSubject(formatTemplateString(defaultTemp.subject, selectedReport.meta, currentPlantId));
+      setEmailMessage(formatTemplateString(defaultTemp.email_body, selectedReport.meta, currentPlantId));
     } else {
       setSelectedTemplateId('');
       setEmailSubject(`Skadomation Production Report: ${selectedReport.meta.name}`);
-      setEmailMessage(`Dear Team,\n\nPlease find the compiled production report details attached below:\n\nReport Name: ${selectedReport.meta.name}\nReport Type: ${selectedReport.meta.type}\nGenerated At: ${new Date(selectedReport.meta.generatedAt).toLocaleString()}\n\nMonitored Tags: ${selectedReport.meta.tags.length}\nTotal Telemetry Records: ${selectedReport.data.totalRowsCount}\n\nReport compilation completed successfully. Formats: PDF, Excel.`);
+      setEmailMessage(`Dear Team,\n\nPlease find the compiled production report details attached below:\n\nReport Name: ${selectedReport.meta.name}\nReport Type: ${selectedReport.meta.type}\nGenerated At: ${formatTimestampToPlantTime(selectedReport.meta.generatedAt, currentPlantId)}\n\nMonitored Tags: ${selectedReport.meta.tags.length}\nTotal Telemetry Records: ${selectedReport.data.totalRowsCount}\n\nReport compilation completed successfully. Formats: PDF, Excel.`);
     }
+
+    const category = getReportCategory(selectedReport.meta.type);
+    const toList = [];
+    filteredRecipients.forEach(rec => {
+      if (rec.active) {
+        const subbedTypes = (rec.report_types || '').split(',').map(x => x.trim()).filter(Boolean);
+        if (subbedTypes.includes(category)) {
+          toList.push(rec.email);
+        }
+      }
+    });
+
+    if (toList.length === 0) {
+      getSettings().then(sett => {
+        const demoEmails = [
+          'plantadmin@plant.com',
+          'ops-lead@plant.com',
+          'maintenance-tech@plant.com',
+          'engineer@plant.com',
+          'archive@plant.com'
+        ];
+        if (sett && sett.emailRecipients) {
+          const defaults = sett.emailRecipients.split(',')
+            .map(x => x.trim())
+            .filter(x => validateEmail(x) && !demoEmails.includes(x.toLowerCase()));
+          setToEmails(defaults);
+          setEmailTo(defaults.join(', '));
+        } else {
+          setToEmails([]);
+          setEmailTo('');
+        }
+      }).catch(() => {
+        setToEmails([]);
+        setEmailTo('');
+      });
+    } else {
+      setToEmails(toList);
+      setEmailTo(toList.join(', '));
+    }
+
+    setCcEmails([]);
+    setBccEmails([]);
+    setEmailCc('');
+    setEmailBcc('');
+
+    setToInput('');
+    setCcInput('');
+    setBccInput('');
+
+    setToError('');
+    setCcError('');
+    setBccError('');
+    setAttachPdf(true);
+    setAttachExcel(true);
 
     setShowEmailPrompt(true);
   };
@@ -353,34 +1281,36 @@ export default function Reports({ user }) {
     setSelectedTemplateId(templateId);
     const temp = templatesList.find(t => t.id === templateId);
     if (temp) {
-      setEmailSubject(formatTemplateString(temp.subject, selectedReport.meta));
-      setEmailMessage(formatTemplateString(temp.email_body, selectedReport.meta));
+      setEmailSubject(formatTemplateString(temp.subject, selectedReport.meta, currentPlantId));
+      setEmailMessage(formatTemplateString(temp.email_body, selectedReport.meta, currentPlantId));
     } else {
       setEmailSubject(`Skadomation Production Report: ${selectedReport.meta.name}`);
-      setEmailMessage(`Dear Team,\n\nPlease find the compiled production report details attached below:\n\nReport Name: ${selectedReport.meta.name}\nReport Type: ${selectedReport.meta.type}\nGenerated At: ${new Date(selectedReport.meta.generatedAt).toLocaleString()}\n\nMonitored Tags: ${selectedReport.meta.tags.length}\nTotal Telemetry Records: ${selectedReport.data.totalRowsCount}\n\nReport compilation completed successfully. Formats: PDF, Excel.`);
+      setEmailMessage(`Dear Team,\n\nPlease find the compiled production report details attached below:\n\nReport Name: ${selectedReport.meta.name}\nReport Type: ${selectedReport.meta.type}\nGenerated At: ${formatTimestampToPlantTime(selectedReport.meta.generatedAt, currentPlantId)}\n\nMonitored Tags: ${selectedReport.meta.tags.length}\nTotal Telemetry Records: ${selectedReport.data.totalRowsCount}\n\nReport compilation completed successfully. Formats: PDF, Excel.`);
     }
   };
 
   const handleEmailReportSubmit = async (e) => {
     e.preventDefault();
-    const toList = [];
-    const ccList = [];
-    const bccList = [];
 
-    Object.entries(selectedRecipients).forEach(([email, role]) => {
-      if (role === 'to') toList.push(email);
-      else if (role === 'cc') ccList.push(email);
-      else if (role === 'bcc') bccList.push(email);
-    });
+    const toEmails = emailTo.split(',').map(x => x.trim()).filter(Boolean);
+    const ccEmails = emailCc.split(',').map(x => x.trim()).filter(Boolean);
+    const bccEmails = emailBcc.split(',').map(x => x.trim()).filter(Boolean);
 
-    customRecipients.forEach(cr => {
-      if (cr.type === 'to') toList.push(cr.email);
-      else if (cr.type === 'cc') ccList.push(cr.email);
-      else if (cr.type === 'bcc') bccList.push(cr.email);
-    });
+    // Validate To field is not empty
+    if (toEmails.length === 0) {
+      alert("Error: The 'To' field cannot be empty. Please configure or enter a recipient.");
+      return;
+    }
 
-    if (toList.length === 0) {
-      alert('Please select at least one recipient for the "To" field.');
+    // Validate email addresses
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const invalidTo = toEmails.filter(x => !emailRegex.test(x));
+    const invalidCc = ccEmails.filter(x => !emailRegex.test(x));
+    const invalidBcc = bccEmails.filter(x => !emailRegex.test(x));
+    const allInvalids = [...invalidTo, ...invalidCc, ...invalidBcc];
+
+    if (allInvalids.length > 0) {
+      alert(`Error: The following email addresses are invalid:\n${allInvalids.join('\n')}`);
       return;
     }
 
@@ -388,28 +1318,40 @@ export default function Reports({ user }) {
     try {
       const activeTemplate = templatesList.find(t => t.id === selectedTemplateId);
 
+      const supabase = getSupabaseClient();
+      let token = '';
+      if (supabase) {
+        const sessionRes = await supabase.auth.getSession();
+        token = sessionRes.data.session?.access_token || '';
+      }
+
       const response = await fetch('/api/send-email', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+        },
         body: JSON.stringify({
-          smtpConfig: null, // Endpoint queries active configuration in database
+          smtpConfig: null, 
           templateConfig: activeTemplate ? {
             logoText: activeTemplate.logo_text,
             headerColor: activeTemplate.header_color,
             footerText: activeTemplate.footer_text
           } : null,
-          to: toList,
-          cc: ccList,
-          bcc: bccList,
+          to: toEmails,
+          cc: ccEmails,
+          bcc: bccEmails,
           subject: emailSubject,
           message: emailMessage,
           reportData: (() => {
-            // Strip allRows (full dataset) before sending to avoid hitting Vercel's
-            // 4.5MB serverless body limit. The PDF appendix uses `rows` (last 10k)
-            // and the Excel sheet falls back to `rows` when allRows is absent.
             const dataCopy = { ...selectedReport.data };
             delete dataCopy.allRows;
-            return { meta: selectedReport.meta, data: dataCopy };
+            return { 
+              meta: selectedReport.meta, 
+              data: dataCopy,
+              formatPdf: attachPdf,
+              formatExcel: attachExcel
+            };
           })()
         })
       });
@@ -420,15 +1362,15 @@ export default function Reports({ user }) {
       }
 
       const recipientSummaryString = [
-        toList.length > 0 ? `To: ${toList.join(', ')}` : '',
-        ccList.length > 0 ? `CC: ${ccList.join(', ')}` : '',
-        bccList.length > 0 ? `BCC: ${bccList.join(', ')}` : ''
+        toEmails.length > 0 ? `To: ${toEmails.join(', ')}` : '',
+        ccEmails.length > 0 ? `CC: ${ccEmails.join(', ')}` : '',
+        bccEmails.length > 0 ? `BCC: ${bccEmails.join(', ')}` : ''
       ].filter(Boolean).join(' | ');
 
       await addEmailLog({
         recipient: recipientSummaryString,
         subject: emailSubject,
-        message: `Historian telemetry report compiled. Dispatched to ${toList.length + ccList.length + bccList.length} total recipients.`,
+        message: `Historian telemetry report compiled. Dispatched to ${toEmails.length + ccEmails.length + bccEmails.length} total recipients.`,
         status: 'SENT'
       });
 
@@ -532,13 +1474,18 @@ export default function Reports({ user }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: '0', height: '100%', minHeight: 0 }}>
 
       {/* ── Tabs Navigation Bar ── */}
-      <div style={{ display: 'flex', borderBottom: '1px solid var(--border)', gap: '8px', marginBottom: '20px' }} className="no-print">
-        <button onClick={() => setActiveTab('workspace')} style={tabStyle(activeTab === 'workspace')}>
-          📊 Report Workspace
-        </button>
-        <button onClick={() => setActiveTab('history')} style={tabStyle(activeTab === 'history')}>
-          📜 Saved Reports
-        </button>
+      <div style={{ display: 'flex', borderBottom: '1px solid var(--border)', gap: '8px', marginBottom: '20px', justifyContent: 'space-between', alignItems: 'center' }} className="no-print">
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button onClick={() => setActiveTab('workspace')} style={tabStyle(activeTab === 'workspace')}>
+            📊 Report Workspace
+          </button>
+          <button onClick={() => setActiveTab('history')} style={tabStyle(activeTab === 'history')}>
+            📜 Saved Reports
+          </button>
+        </div>
+        <div style={{ paddingBottom: '4px' }}>
+          <RefreshButton isRefreshing={isRefreshing} onClick={handleRefresh} toast={refreshToast} id="refresh-btn-reports" />
+        </div>
       </div>
 
       {/* ── Tab Contents ── */}
@@ -575,8 +1522,7 @@ export default function Reports({ user }) {
                       style={{ height: '36px' }}
                     >
                       <option value="Historian Shift Summary">Historian Shift Summary</option>
-                      <option value="Alarm & Incident Log">Alarm & Incident Log</option>
-                      <option value="Full Process Audit">Full Process Audit</option>
+                      <option value="Daily Production Report">Daily Production Report</option>
                     </select>
                   </div>
                 </div>
@@ -584,7 +1530,7 @@ export default function Reports({ user }) {
                 {/* Column 2: Date presets & pickers */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-                    {[['today', 'Today'], ['yesterday', 'Yest'], ['7d', '7D'], ['30d', '30D']].map(([k, label]) => (
+                    {[['today', 'Today'], ['yesterday', 'Yesterday'], ['7d', 'Week']].map(([k, label]) => (
                       <button
                         key={k}
                         type="button"
@@ -625,7 +1571,7 @@ export default function Reports({ user }) {
                 {/* Column 3: Tag selector list */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <label className="form-label">Tags Selection</label>
+                    <label className="form-label">Equipment Selection</label>
                     <button
                       type="button"
                       onClick={handleSelectAllToggle}
@@ -661,7 +1607,6 @@ export default function Reports({ user }) {
                               onChange={() => handleFormTagToggle(t.TagIndex)}
                               style={{ accentColor: 'var(--secondary)', width: '13px', height: '13px' }}
                             />
-                            <span style={{ fontFamily: 'var(--mono)', fontSize: '0.7rem', opacity: 0.6 }}>[{t.TagIndex}]</span>
                             {t.TagName}
                           </label>
                         );
@@ -671,12 +1616,12 @@ export default function Reports({ user }) {
                 </div>
 
                 {/* Column 4: Compile Button */}
-                <div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                   <button
                     type="submit"
                     className="btn btn-primary"
                     disabled={isGenerating}
-                    style={{ height: '38px', padding: '0 20px', minWidth: '130px' }}
+                    style={{ height: '36px', padding: '0 16px', minWidth: '135px' }}
                   >
                     {isGenerating ? 'Compiling...' : '⚡ Compile Report'}
                   </button>
@@ -737,8 +1682,8 @@ export default function Reports({ user }) {
                         </h2>
                         <p style={{ fontSize: '0.78rem', color: '#475569', margin: 0 }}>
                           <strong>Reporting Period:</strong>{' '}
-                          {new Date(selectedReport.meta.startDate).toLocaleString()} &mdash;{' '}
-                          {new Date(selectedReport.meta.endDate).toLocaleString()}
+                          {formatTimestampToPlantTime(selectedReport.meta.startDate, currentPlantId)} &mdash;{' '}
+                          {formatTimestampToPlantTime(selectedReport.meta.endDate, currentPlantId)}
                         </p>
                       </div>
                       <div style={{ textAlign: 'right', fontSize: '0.7rem', color: '#475569', fontFamily: 'monospace', lineHeight: 1.6 }}>
@@ -749,7 +1694,11 @@ export default function Reports({ user }) {
                     </div>
 
                     {/* Report Data Body */}
-                    {selectedReport.data.totalRowsCount === 0 ? (
+                    {selectedReport.meta.type === 'Daily Production Report' ? (
+                      <DailyProductionSummaryView report={selectedReport} />
+                    ) : selectedReport.meta.type === 'Daily Production Account' ? (
+                      <DailyProductionAccountView data={selectedReport.data.dailyProductionAccount} />
+                    ) : selectedReport.data.totalRowsCount === 0 ? (
                       <div style={{ padding: '48px 0', textAlign: 'center', color: '#64748B' }}>
                         <div style={{ fontSize: '2rem', marginBottom: '8px' }}>⚠️</div>
                         <h4 style={{ fontSize: '0.92rem', margin: '0 0 4px', color: '#0F172A', fontWeight: 700 }}>No telemetry records available.</h4>
@@ -757,6 +1706,180 @@ export default function Reports({ user }) {
                       </div>
                     ) : (
                       <>
+                        {/* ── EXECUTIVE KPI DASHBOARD ── */}
+                        <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '10px', borderBottom: '2px solid #1E3A5F', paddingBottom: '4px' }}>
+                          SECTION 1 &mdash; Executive KPI Dashboard
+                        </h4>
+                        {(() => {
+                          const summaries = selectedReport.data.summaries || [];
+                          const totalRowsCount = selectedReport.data.totalRowsCount || 0;
+                          const daysInRange = selectedReport.data.daysInRange || 1;
+                          const rawRows = selectedReport.data.rows || [];
+
+                          // Helper to find tag index dynamically by name
+                          const findTagIdx = (name) => {
+                            const cleanTarget = name.toLowerCase().trim();
+                            const match = summaries.find(s => {
+                              const sName = (s.tagName || s.display_name || '').toLowerCase().trim();
+                              return sName === cleanTarget;
+                            });
+                            return match ? match.tagIndex : null;
+                          };
+
+                          const feedRateIdx = findTagIdx("Total Input Feed");
+                          const lumpRateIdx = findTagIdx("Lump Out");
+                          const finesRateIdx = findTagIdx("Fines Out");
+
+                          const feedShiftIdx = findTagIdx("Total Feed Input Per Shift");
+                          
+                          // Calculate KPIs dynamically using the unified Historian KPI Service
+                          const kpisResult = calculateExecutiveKPIs(rawRows, summaries, 'UTC', null);
+                           
+                          const totalFeed = kpisResult.totalFeed;
+                          const lumpProd = kpisResult.lumpProd;
+                          const finesProd = kpisResult.finesProd;
+                          const runtimeHours = kpisResult.runtimeHours;
+                          const downtimeHours = kpisResult.downtimeHours;
+                          const availability = kpisResult.availability;
+                          const latestTs = kpisResult.latestTs;
+
+                          // Stats mapping wrapper for UI compatibility
+                          const feedRateStats = {
+                            current: kpisResult.currentFeedRate,
+                            avg: kpisResult.avgFeedRate,
+                            max: kpisResult.maxFeedRate,
+                            min: kpisResult.minFeedRate
+                          };
+                          const lumpRateStats = { avg: lumpProd / (daysInRange * 24) };
+                          const finesRateStats = { avg: finesProd / (daysInRange * 24) };
+
+                          const pt = selectedReport.data.productionTonnes || {
+                             dayShiftRow: { day: { total: 0, lump: 0, fines: 0 } },
+                             nightShiftRow: { night: { total: 0, lump: 0, fines: 0 } },
+                             dailyTotalRow: { total: { total: 0, lump: 0, fines: 0 } }
+                           };
+
+                           const latestFeedShiftDay = pt.dayShiftRow?.day?.total || 0;
+                           const latestFeedShiftNight = pt.nightShiftRow?.night?.total || 0;
+
+                           const latestLumpShiftDay = pt.dayShiftRow?.day?.lump || 0;
+                           const latestLumpShiftNight = pt.nightShiftRow?.night?.lump || 0;
+
+                           const latestFinesShiftDay = pt.dayShiftRow?.day?.fines || 0;
+                           const latestFinesShiftNight = pt.nightShiftRow?.night?.fines || 0;
+
+                          // Formatters
+                          const formatVal = (val, suffix = '', decimals = 0) => {
+                            if (val === null || val === undefined || isNaN(val)) return 'No Historian Data';
+                            return `${Number(val.toFixed(decimals)).toLocaleString()} ${suffix}`;
+                          };
+
+                          const executiveKpis = [
+                            {
+                              name: "Today's Total Feed",
+                              value: formatVal(totalFeed, 'T', 0),
+                              desc: "Total feed processed during the reporting period."
+                            },
+                            {
+                              name: "Total Feed (Day Shift)",
+                              value: formatVal(latestFeedShiftDay && latestFeedShiftDay > 0 ? latestFeedShiftDay : (feedRateStats && feedRateStats.avg ? feedRateStats.avg * 10 : 0), 'T', 0),
+                              desc: "Total feed processed during the Day Shift."
+                            },
+                            {
+                              name: "Total Feed (Night Shift)",
+                              value: formatVal(latestFeedShiftNight && latestFeedShiftNight > 0 ? latestFeedShiftNight : (feedRateStats && feedRateStats.avg ? feedRateStats.avg * 10 : 0), 'T', 0),
+                              desc: "Total feed processed during the Night Shift."
+                            },
+                            {
+                              name: "Today's Lump Production",
+                              value: formatVal(lumpProd, 'T', 0),
+                              desc: "Total lump ore produced during the reporting period."
+                            },
+                            {
+                              name: "Total Lump (Day Shift)",
+                              value: formatVal(latestLumpShiftDay && latestLumpShiftDay > 0 ? latestLumpShiftDay : (lumpRateStats && lumpRateStats.avg ? lumpRateStats.avg * 10 : 0), 'T', 0),
+                              desc: "Total lump ore produced during the Day Shift."
+                            },
+                            {
+                              name: "Total Lump (Night Shift)",
+                              value: formatVal(latestLumpShiftNight && latestLumpShiftNight > 0 ? latestLumpShiftNight : (lumpRateStats && lumpRateStats.avg ? lumpRateStats.avg * 10 : 0), 'T', 0),
+                              desc: "Total lump ore produced during the Night Shift."
+                            },
+                            {
+                              name: "Today's Fines Production",
+                              value: formatVal(finesProd, 'T', 0),
+                              desc: "Total fines produced during the reporting period."
+                            },
+                            {
+                              name: "Total Fines (Day Shift)",
+                              value: formatVal(latestFinesShiftDay && latestFinesShiftDay > 0 ? latestFinesShiftDay : (finesRateStats && finesRateStats.avg ? finesRateStats.avg * 10 : 0), 'T', 0),
+                              desc: "Total fines produced during the Day Shift."
+                            },
+                            {
+                              name: "Total Fines (Night Shift)",
+                              value: formatVal(latestFinesShiftNight && latestFinesShiftNight > 0 ? latestFinesShiftNight : (finesRateStats && finesRateStats.avg ? finesRateStats.avg * 10 : 0), 'T', 0),
+                              desc: "Total fines produced during the Night Shift."
+                            },
+                            {
+                              name: "Current Feed Rate",
+                              value: feedRateStats ? formatVal(feedRateStats.current, 'TPH', 1) : 'No Historian Data',
+                              desc: "Latest recorded feed rate from the historian."
+                            },
+                            {
+                              name: "Average Feed Rate",
+                              value: feedRateStats ? formatVal(feedRateStats.avg, 'TPH', 1) : 'No Historian Data',
+                              desc: "Average feed rate calculated from all historian samples."
+                            },
+                            {
+                              name: "Maximum Feed Rate",
+                              value: feedRateStats ? formatVal(feedRateStats.max, 'TPH', 1) : 'No Historian Data',
+                              desc: "Highest recorded feed rate during the reporting period."
+                            },
+                            {
+                              name: "Minimum Feed Rate",
+                              value: feedRateStats ? formatVal(feedRateStats.min, 'TPH', 1) : 'No Historian Data',
+                              desc: "Lowest recorded feed rate during the reporting period."
+                            },
+                            {
+                              name: "Total Runtime",
+                              value: formatVal(runtimeHours, 'Hours', 1),
+                              desc: "Total plant operating runtime during the reporting period."
+                            },
+                            {
+                              name: "Total Downtime",
+                              value: formatVal(downtimeHours, 'Hours', 1),
+                              desc: "Total plant downtime hours recorded."
+                            },
+                            {
+                              name: "Plant Availability",
+                              value: formatVal(availability, '%', 1),
+                              desc: "Percentage of time the plant was operational and available."
+                            },
+                            {
+                              name: "Total Historian Samples",
+                              value: formatVal(totalRowsCount, 'Samples', 0),
+                              desc: "Total count of telemetry samples logged."
+                            },
+                            {
+                              name: "Last Telemetry Received",
+                              value: latestTs ? formatTimestampToPlantTime(latestTs, currentPlantId) : 'No Historian Data',
+                              desc: "Latest historian timestamp processed."
+                            }
+                          ];
+
+                          return (
+                            <div className="reports-stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '12px', marginBottom: '24px' }}>
+                              {executiveKpis.map((k, i) => (
+                                <div key={i} style={{ background: '#F0F4FA', border: `1px solid #D2DFEC`, borderLeft: `4px solid #1E3A5F`, borderRadius: '6px', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '4px', textAlign: 'left' }}>
+                                  <div style={{ fontSize: '0.62rem', fontWeight: 700, textTransform: 'uppercase', color: '#4B5563', letterSpacing: '0.06em' }}>{k.name}</div>
+                                  <div style={{ fontSize: '1.2rem', fontWeight: 800, color: '#1E3A5F' }}>{k.value}</div>
+                                  <div style={{ fontSize: '0.6rem', color: '#6B7280', fontStyle: 'italic', borderTop: '1px dashed #D2DFEC', paddingTop: '4px', marginTop: '2px' }}>{k.desc}</div>
+                                </div>
+                              ))}
+                            </div>
+                          );
+                        })()}
+
                         {/* ── EXECUTIVE SUMMARY KPI CARDS ── */}
                         <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '10px', borderBottom: '2px solid #1E3A5F', paddingBottom: '4px' }}>
                           Executive Summary
@@ -764,7 +1887,7 @@ export default function Reports({ user }) {
                         <div className="reports-stats-grid">
                           {[
                             { label: 'Total Records', value: selectedReport.data.totalRowsCount.toLocaleString(), color: '#1E40AF' },
-                            { label: 'Total Tags', value: String(selectedReport.data.summaries.length), color: '#065F46' },
+                            { label: 'Total Tags', value: String(selectedReport.data.summaries.filter(s => selectedReport.meta.tags.includes(s.tagIndex)).length), color: '#065F46' },
                             { label: 'Avg / Day', value: (selectedReport.data.avgRecordsPerDay || 0).toLocaleString(), color: '#7C3AED' },
                             { label: 'Period (Days)', value: String(selectedReport.data.daysInRange || '—'), color: '#92400E' },
                           ].map((kpi) => (
@@ -775,28 +1898,36 @@ export default function Reports({ user }) {
                           ))}
                         </div>
 
-                        {/* ── TAG SUMMARY TABLE ── */}
+                        {/* ── EQUIPMENT SUMMARY TABLE ── */}
                         <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '8px', borderBottom: '2px solid #1E3A5F', paddingBottom: '4px' }}>
-                          Tag Summary Table
+                          Equipment Summary Table
                         </h4>
                         <table className="table responsive-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem', marginBottom: '24px' }}>
                           <thead>
                             <tr style={{ backgroundColor: '#1E3A5F', color: '#FFFFFF' }}>
-                              {['Idx', 'Tag Name', 'Unit', 'Min', 'Max', 'Average', 'Last Value', 'Records', 'Quality', 'Trend'].map(h => (
-                                <th key={h} style={{ padding: '7px 8px', textAlign: ['Min', 'Max', 'Average', 'Last Value', 'Records'].includes(h) ? 'right' : 'left', fontWeight: 700, fontSize: '0.68rem' }}>{h}</th>
+                              {['Idx', 'Equipment Name', 'Unit', 'Min', 'Max', 'Average', 'Last Value', 'Total (t)', 'Records', 'Quality', 'Trend'].map(h => (
+                                <th key={h} style={{ padding: '7px 8px', textAlign: ['Min', 'Max', 'Average', 'Last Value', 'Total (t)', 'Records'].includes(h) ? 'right' : 'left', fontWeight: 700, fontSize: '0.68rem' }}>{h}</th>
                               ))}
                             </tr>
                           </thead>
                           <tbody>
-                            {selectedReport.data.summaries.map((s, idx) => (
+                            {selectedReport.data.summaries.filter(s => selectedReport.meta.tags.includes(s.tagIndex)).map((s, idx) => (
                               <tr key={idx} style={{ borderBottom: '1px solid #E2E8F0', background: idx % 2 === 0 ? '#FFFFFF' : '#F0F4FA' }}>
                                 <td data-label="Idx" style={{ padding: '6px 8px', fontFamily: 'monospace', fontWeight: 700, fontSize: '0.68rem' }}>{s.tagIndex}</td>
-                                <td data-label="Tag Name" style={{ padding: '6px 8px', fontWeight: 600 }}>{s.tagName}</td>
+                                <td data-label="Equipment Name" style={{ padding: '6px 8px', fontWeight: 600 }}>{s.tagName}</td>
                                 <td data-label="Unit" style={{ padding: '6px 8px', color: '#64748B' }}>{s.unit || '—'}</td>
                                 <td data-label="Min" style={{ padding: '6px 8px', textAlign: 'right', color: '#475569' }}>{s.min != null ? s.min.toFixed(s.decimalPlaces) : '—'}</td>
                                 <td data-label="Max" style={{ padding: '6px 8px', textAlign: 'right', color: '#475569' }}>{s.max != null ? s.max.toFixed(s.decimalPlaces) : '—'}</td>
                                 <td data-label="Average" style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 600 }}>{s.avg != null ? s.avg.toFixed(s.decimalPlaces) : '—'}</td>
                                 <td data-label="Last Value" style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 700, color: '#1E3A5F' }}>{s.current != null ? s.current.toFixed(s.decimalPlaces) : '—'}</td>
+                                <td data-label="Total (t)" style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 600, color: '#0F172A' }}>
+                                  {(() => {
+                                    const unitClean = (s.unit || '').toLowerCase().trim();
+                                    const isRate = unitClean === 'tph' || unitClean === 't/h' || unitClean === 't/hr' || unitClean === 'tons/hr';
+                                    const hours = (selectedReport.data.daysInRange || 1) * 24;
+                                    return isRate && s.avg != null ? (s.avg * hours).toFixed(1) : '—';
+                                  })()}
+                                </td>
                                 <td data-label="Records" style={{ padding: '6px 8px', textAlign: 'right', color: '#475569' }}>{s.count.toLocaleString()}</td>
                                 <td data-label="Quality" style={{ padding: '6px 8px', fontWeight: 700, color: s.goodPct != null && s.goodPct > 98 ? '#16A34A' : '#D97706' }}>{s.goodPct != null ? s.goodPct.toFixed(1) + '%' : '—'}</td>
                                 <td data-label="Trend" style={{ padding: '2px 8px', textAlign: 'center' }}>{generateReportSparkline(s.sparkPoints)}</td>
@@ -810,10 +1941,10 @@ export default function Reports({ user }) {
                           Statistical Analysis
                         </h4>
                         <div style={{ marginBottom: '24px' }}>
-                          {selectedReport.data.summaries.map((s, si) => (
+                          {selectedReport.data.summaries.filter(s => selectedReport.meta.tags.includes(s.tagIndex)).map((s, si) => (
                             <div key={si} style={{ marginBottom: '12px', border: '1px solid #E2E8F0', borderRadius: '6px', overflow: 'hidden' }}>
                               <div style={{ background: '#3B82F6', color: '#FFFFFF', padding: '6px 12px', fontSize: '0.72rem', fontWeight: 700 }}>
-                                T{s.tagIndex} — {s.tagName} {s.unit ? `[${s.unit}]` : ''}
+                                T{s.tagIndex} &mdash; {s.tagName} {s.unit ? `[${s.unit}]` : ''}
                               </div>
                               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', background: si % 2 === 0 ? '#F8FAFC' : '#FFFFFF' }}>
                                 {[
@@ -823,8 +1954,8 @@ export default function Reports({ user }) {
                                   ['Std Deviation', s.stdDev != null ? s.stdDev.toFixed(s.decimalPlaces) : '—'],
                                   ['Total Samples', s.count.toLocaleString()],
                                   ['Quality Index', s.goodPct != null ? s.goodPct.toFixed(1) + '%' : '—'],
-                                  ['First Sample', s.firstSampleTime ? new Date(s.firstSampleTime).toLocaleString() : '—'],
-                                  ['Last Sample', s.lastSampleTime ? new Date(s.lastSampleTime).toLocaleString() : '—'],
+                                  ['First Sample', s.firstSampleTime ? formatTimestampToPlantTime(s.firstSampleTime, currentPlantId) : '—'],
+                                  ['Last Sample', s.lastSampleTime ? formatTimestampToPlantTime(s.lastSampleTime, currentPlantId) : '—'],
                                 ].map(([label, val], ii) => (
                                   <div key={ii} style={{ padding: '8px 12px', borderRight: ii % 4 !== 3 ? '1px solid #E2E8F0' : 'none', borderTop: ii >= 4 ? '1px solid #E2E8F0' : 'none' }}>
                                     <div style={{ fontSize: '0.6rem', fontWeight: 700, textTransform: 'uppercase', color: '#64748B', letterSpacing: '0.05em', marginBottom: '2px' }}>{label}</div>
@@ -854,9 +1985,9 @@ export default function Reports({ user }) {
                               </tr>
                             </thead>
                             <tbody>
-                              {selectedReport.data.incidents.map((inc, iIdx) => (
+                              {selectedReport.data.incidents.filter(inc => selectedReport.meta.tags.includes(inc.tagIndex)).map((inc, iIdx) => (
                                 <tr key={iIdx} style={{ borderBottom: '1px solid #E2E8F0', background: iIdx % 2 === 0 ? '#FFFFFF' : '#FEF9F1' }}>
-                                  <td data-label="Timestamp" style={{ padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.68rem' }}>{new Date(inc.timestamp).toLocaleString()}</td>
+                                  <td data-label="Timestamp" style={{ padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.68rem' }}>{formatTimestampToPlantTime(inc.timestamp, currentPlantId)}</td>
                                   <td data-label="Tag Reference" style={{ padding: '5px 8px' }}>T{inc.tagIndex}: {inc.tagName}</td>
                                   <td data-label="Value" style={{ padding: '5px 8px', textAlign: 'right', fontWeight: 700, color: '#DC2626' }}>{inc.val}</td>
                                   <td data-label="Quality Status" style={{ padding: '5px 8px', color: inc.status === 192 ? '#16A34A' : '#DC2626', fontWeight: 600 }}>
@@ -876,28 +2007,33 @@ export default function Reports({ user }) {
                         {/* ── RAW HISTORIAN DATA APPENDIX ── */}
                         <h4 style={{ fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#0F172A', marginBottom: '8px', borderBottom: '2px solid #1E3A5F', paddingBottom: '4px' }}>
                           Raw Historian Data Appendix{' '}
-                          <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: '#64748B', fontSize: '0.68rem' }}>
-                            ({selectedReport.data.rows.length.toLocaleString()} records shown{selectedReport.data.totalRowsCount > 10000 ? ` of ${selectedReport.data.totalRowsCount.toLocaleString()} total — full dataset in Excel export` : ''})
-                          </span>
+                          {(() => {
+                             const filteredRows = selectedReport.data.rows.filter(row => selectedReport.meta.tags.includes(row.TagIndex));
+                             return (
+                               <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: '#64748B', fontSize: '0.68rem' }}>
+                                 ({filteredRows.length.toLocaleString()} records shown{selectedReport.data.totalRowsCount > 10000 ? ` of ${selectedReport.data.totalRowsCount.toLocaleString()} total — full dataset in Excel export` : ''})
+                               </span>
+                             );
+                           })()}
                         </h4>
                         <div style={{ maxHeight: '300px', overflowY: 'auto', border: '1px solid #E2E8F0', borderRadius: '6px' }} className="no-scroll-print">
                           <table className="responsive-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.68rem' }}>
                             <thead style={{ position: 'sticky', top: 0, background: '#1E3A5F' }}>
                               <tr>
-                                {['DateAndTime', 'Idx', 'Tag Name', 'Value', 'Status', 'Marker'].map(h => (
+                                {['DateAndTime', 'Idx', 'Equipment Name', 'Value', 'Status', 'Marker'].map(h => (
                                   <th key={h} style={{ padding: '6px 8px', textAlign: h === 'Value' ? 'right' : 'left', color: '#FFFFFF', fontWeight: 700, fontSize: '0.66rem' }}>{h}</th>
                                 ))}
                               </tr>
                             </thead>
                             <tbody>
-                              {selectedReport.data.rows.map((row, rIdx) => {
+                              {selectedReport.data.rows.filter(row => selectedReport.meta.tags.includes(row.TagIndex)).map((row, rIdx) => {
                                 const cfg = tagMap[row.TagIndex] || { TagName: row.TagName || `Tag ${row.TagIndex}`, DecimalPlaces: 2 };
                                 const statusGood = row.Status === 192;
                                 return (
                                   <tr key={rIdx} style={{ borderBottom: '1px solid #F1F5F9', background: rIdx % 2 === 0 ? '#FFFFFF' : '#F0F4FA' }}>
-                                    <td data-label="DateAndTime" style={{ padding: '4px 8px', fontFamily: 'monospace', fontSize: '0.66rem' }}>{new Date(row.DateAndTime).toLocaleString()}</td>
+                                    <td data-label="DateAndTime" style={{ padding: '4px 8px', fontFamily: 'monospace', fontSize: '0.66rem' }}>{formatTimestampToPlantTime(row.DateAndTime, currentPlantId)}</td>
                                     <td data-label="Idx" style={{ padding: '4px 8px', fontFamily: 'monospace', fontWeight: 700, color: '#1E3A5F' }}>{row.TagIndex}</td>
-                                    <td data-label="Tag Name" style={{ padding: '4px 8px' }}>{row.TagName || cfg.TagName}</td>
+                                    <td data-label="Equipment Name" style={{ padding: '4px 8px' }}>{row.TagName || cfg.TagName}</td>
                                     <td data-label="Value" style={{ padding: '4px 8px', textAlign: 'right', fontWeight: 700 }}>{row.Val != null ? Number(row.Val).toFixed(cfg.DecimalPlaces) : '—'}</td>
                                     <td data-label="Status" style={{ padding: '4px 8px', color: statusGood ? '#16A34A' : '#DC2626', fontWeight: 600 }}>
                                       {statusGood ? 'Good' : `Bad(${row.Status})`}
@@ -919,22 +2055,22 @@ export default function Reports({ user }) {
                   </div>
 
                   {/* Panel 3: Bottom Action buttons */}
-                  <div className="card" style={{ marginTop: '16px', padding: '12px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+                  <div className="card" style={{ marginTop: '16px', padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px', borderTop: '1px solid var(--border)' }}>
                     <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
                       <strong style={{ color: 'var(--text)' }}>{selectedReport.meta.name}</strong>
-                      <span style={{ marginLeft: '12px', background: 'rgba(59,130,246,0.12)', color: '#3B82F6', padding: '2px 8px', borderRadius: '4px', fontSize: '0.7rem', fontWeight: 700 }}>
+                      <span style={{ marginLeft: '12px', background: 'rgba(0, 240, 255, 0.08)', color: 'var(--secondary)', border: '1px solid rgba(0, 240, 255, 0.15)', padding: '2px 8px', borderRadius: '4px', fontSize: '0.7rem', fontWeight: 700 }}>
                         {selectedReport.data.totalRowsCount.toLocaleString()} records · {selectedReport.data.summaries.length} tags
                       </span>
                     </div>
-                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                      <button onClick={handlePrint} className="btn btn-secondary" style={{ fontSize: '0.8rem' }}>
-                        🖨️ Print / PDF
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', minWidth: '380px' }}>
+                      <button onClick={handleDownloadPDF} className="btn btn-secondary" style={{ fontSize: '0.8rem', height: '36px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }} disabled={isGeneratingReport}>
+                        📥 Export PDF
                       </button>
-                      <button onClick={() => handleExportCSV(selectedReport.meta)} className="btn btn-secondary" style={{ fontSize: '0.8rem' }}>
-                        📥 CSV (Full)
+                      <button onClick={() => handleGenerateReport(selectedReport.meta, 'xlsx')} className="btn btn-secondary" style={{ fontSize: '0.8rem', height: '36px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }} disabled={isGeneratingReport}>
+                        📊 Export Excel (Full)
                       </button>
                       {!isReadOnly && (
-                        <button onClick={handleOpenEmailPrompt} className="btn btn-primary" style={{ fontSize: '0.8rem' }}>
+                        <button onClick={handleOpenEmailPrompt} className="btn btn-primary" style={{ fontSize: '0.8rem', height: '36px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
                           ✉️ Email Report
                         </button>
                       )}
@@ -980,8 +2116,8 @@ export default function Reports({ user }) {
                             <button onClick={() => handleViewReport(item)} className="btn btn-secondary btn-sm">
                               👁️ View Workspace
                             </button>
-                            <button onClick={() => handleExportCSV(item)} className="btn btn-secondary btn-sm">
-                              📥 CSV
+                            <button onClick={() => handleGenerateReport(item, 'xlsx')} className="btn btn-secondary btn-sm" disabled={isGeneratingReport}>
+                              📊 Excel
                             </button>
                             {!isReadOnly && (
                               <button onClick={() => handleDeleteReport(item.id)} className="btn btn-danger btn-sm">
@@ -1008,12 +2144,131 @@ export default function Reports({ user }) {
         <div className="modal-overlay" style={{ zIndex: 1000, position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(5, 8, 17, 0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <div className="card" style={{ maxWidth: '580px', width: '95%', padding: '24px', position: 'relative', maxHeight: '90vh', overflowY: 'auto' }}>
             <h3 style={{ fontSize: '1.1rem', margin: '0 0 10px', color: 'var(--text)' }}>Email Historian Report</h3>
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '18px', lineHeight: 1.5 }}>
-              Send a copy of the compiled report <strong>{selectedReport.meta.name}</strong> as an email attachment.
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '18px', lineHeight: 1.4 }}>
+              Compose and send the compiled production report <strong>{selectedReport.meta.name}</strong> to the plant operations team.
             </p>
+            <div style={{ marginBottom: '16px', backgroundColor: 'rgba(255,255,255,0.02)', padding: '14px', borderRadius: '8px', border: '1px solid var(--border-subtle)' }}>
+              <h4 style={{ fontSize: '0.85rem', margin: '0 0 10px', color: 'var(--text)' }}>Manage Recipients</h4>
+              
+              {/* To Recipients */}
+              <div style={{ marginBottom: '12px' }}>
+                <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>To Recipients:</span>
+                  {toError && <span style={{ color: 'var(--error)', fontSize: '0.72rem' }}>{toError}</span>}
+                </label>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '6px' }}>
+                  {toEmails.map(email => (
+                    <span key={email} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', backgroundColor: 'rgba(59, 130, 246, 0.15)', border: '1px solid rgba(59, 130, 246, 0.3)', color: '#60A5FA', padding: '2px 8px', borderRadius: '12px', fontSize: '0.74rem' }}>
+                      {email}
+                      <button type="button" onClick={() => handleRemoveEmail('to', email)} style={{ background: 'none', border: 'none', color: '#60A5FA', cursor: 'pointer', padding: 0, fontWeight: 'bold' }}>×</button>
+                    </span>
+                  ))}
+                  {toEmails.length === 0 && <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>No To recipients.</span>}
+                </div>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <input
+                    type="text"
+                    className="form-control"
+                    placeholder="Add To email..."
+                    value={toInput}
+                    onChange={e => { setToInput(e.target.value); setToError(''); }}
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); handleAddEmail('to'); } }}
+                    style={{ height: '30px', fontSize: '0.8rem', flex: 1 }}
+                  />
+                  <button type="button" onClick={() => handleAddEmail('to')} className="btn btn-secondary" style={{ height: '30px', padding: '0 10px', fontSize: '0.76rem' }}>Add</button>
+                </div>
+              </div>
+
+              {/* CC Recipients */}
+              <div style={{ marginBottom: '12px' }}>
+                <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>CC Recipients:</span>
+                  {ccError && <span style={{ color: 'var(--error)', fontSize: '0.72rem' }}>{ccError}</span>}
+                </label>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '6px' }}>
+                  {ccEmails.map(email => (
+                    <span key={email} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', backgroundColor: 'rgba(255, 255, 255, 0.05)', border: '1px solid var(--border-subtle)', color: 'var(--text)', padding: '2px 8px', borderRadius: '12px', fontSize: '0.74rem' }}>
+                      {email}
+                      <button type="button" onClick={() => handleRemoveEmail('cc', email)} style={{ background: 'none', border: 'none', color: 'var(--text)', cursor: 'pointer', padding: 0, fontWeight: 'bold' }}>×</button>
+                    </span>
+                  ))}
+                  {ccEmails.length === 0 && <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>No CC recipients.</span>}
+                </div>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <input
+                    type="text"
+                    className="form-control"
+                    placeholder="Add CC email..."
+                    value={ccInput}
+                    onChange={e => { setCcInput(e.target.value); setCcError(''); }}
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); handleAddEmail('cc'); } }}
+                    style={{ height: '30px', fontSize: '0.8rem', flex: 1 }}
+                  />
+                  <button type="button" onClick={() => handleAddEmail('cc')} className="btn btn-secondary" style={{ height: '30px', padding: '0 10px', fontSize: '0.76rem' }}>Add</button>
+                </div>
+              </div>
+
+              {/* BCC Recipients */}
+              <div style={{ marginBottom: '12px' }}>
+                <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>BCC Recipients:</span>
+                  {bccError && <span style={{ color: 'var(--error)', fontSize: '0.72rem' }}>{bccError}</span>}
+                </label>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '6px' }}>
+                  {bccEmails.map(email => (
+                    <span key={email} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', backgroundColor: 'rgba(255, 255, 255, 0.05)', border: '1px solid var(--border-subtle)', color: 'var(--text)', padding: '2px 8px', borderRadius: '12px', fontSize: '0.74rem' }}>
+                      {email}
+                      <button type="button" onClick={() => handleRemoveEmail('bcc', email)} style={{ background: 'none', border: 'none', color: 'var(--text)', cursor: 'pointer', padding: 0, fontWeight: 'bold' }}>×</button>
+                    </span>
+                  ))}
+                  {bccEmails.length === 0 && <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>No BCC recipients.</span>}
+                </div>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <input
+                    type="text"
+                    className="form-control"
+                    placeholder="Add BCC email..."
+                    value={bccInput}
+                    onChange={e => { setBccInput(e.target.value); setBccError(''); }}
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); handleAddEmail('bcc'); } }}
+                    style={{ height: '30px', fontSize: '0.8rem', flex: 1 }}
+                  />
+                  <button type="button" onClick={() => handleAddEmail('bcc')} className="btn btn-secondary" style={{ height: '30px', padding: '0 10px', fontSize: '0.76rem' }}>Add</button>
+                </div>
+              </div>
+
+              {/* Configured Plant Recipients list (Quick Add) */}
+              <div style={{ marginTop: '12px', borderTop: '1px dashed var(--border-subtle)', paddingTop: '10px' }}>
+                <span style={{ fontSize: '0.74rem', fontWeight: 600, color: 'var(--text-muted)', display: 'block', marginBottom: '6px' }}>Quick Add Configured Recipients:</span>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '100px', overflowY: 'auto' }}>
+                  {filteredRecipients.map(rec => (
+                    <div key={rec.email} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.01)', padding: '4px 8px', borderRadius: '4px', border: '1px solid rgba(255,255,255,0.02)' }}>
+                      <span style={{ fontSize: '0.74rem', color: 'var(--text)' }}>
+                        <strong>{rec.name || 'Site User'}</strong> ({rec.email})
+                      </span>
+                      <div style={{ display: 'flex', gap: '4px' }}>
+                        <button type="button" onClick={() => handleQuickAdd(rec.email, 'to')} className="btn" style={{ fontSize: '0.64rem', padding: '2px 6px', height: '20px', backgroundColor: 'rgba(59, 130, 246, 0.1)', color: '#60A5FA', border: '1px solid rgba(59, 130, 246, 0.2)' }}>+To</button>
+                        <button type="button" onClick={() => handleQuickAdd(rec.email, 'cc')} className="btn" style={{ fontSize: '0.64rem', padding: '2px 6px', height: '20px', backgroundColor: 'rgba(255,255,255,0.05)', color: 'var(--text)', border: '1px solid var(--border-subtle)' }}>+CC</button>
+                        <button type="button" onClick={() => handleQuickAdd(rec.email, 'bcc')} className="btn" style={{ fontSize: '0.64rem', padding: '2px 6px', height: '20px', backgroundColor: 'rgba(255,255,255,0.05)', color: 'var(--text)', border: '1px solid var(--border-subtle)' }}>+BCC</button>
+                      </div>
+                    </div>
+                  ))}
+                  {filteredRecipients.length === 0 && (
+                    <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>No active plant-configured recipients. Configure them in Settings.</span>
+                  )}
+                </div>
+              </div>
+
+              {/* Save Defaults Button */}
+              <div style={{ marginTop: '12px', display: 'flex', justifyContent: 'flex-end' }}>
+                <button type="button" onClick={handleSaveDefaultRecipients} className="btn btn-secondary" style={{ fontSize: '0.74rem', height: '28px', padding: '0 10px' }}>
+                  💾 Save current list as default
+                </button>
+              </div>
+            </div>
 
             {/* Select Template dropdown */}
-            <div style={{ marginBottom: '18px' }} className="form-group">
+            <div style={{ marginBottom: '14px' }} className="form-group">
               <label className="form-label" htmlFor="select-template">Select Email Template</label>
               <select
                 id="select-template"
@@ -1032,7 +2287,7 @@ export default function Reports({ user }) {
             </div>
 
             {/* Email Subject input */}
-            <div style={{ marginBottom: '18px' }} className="form-group">
+            <div style={{ marginBottom: '14px' }} className="form-group">
               <label className="form-label" htmlFor="email-subject">Email Subject</label>
               <input
                 id="email-subject"
@@ -1044,148 +2299,61 @@ export default function Reports({ user }) {
             </div>
 
             {/* Email Message input */}
-            <div style={{ marginBottom: '18px' }} className="form-group">
+            <div style={{ marginBottom: '14px' }} className="form-group">
               <label className="form-label" htmlFor="email-message">Email Body Message</label>
               <textarea
                 id="email-message"
                 className="form-control"
                 value={emailMessage}
                 onChange={(e) => setEmailMessage(e.target.value)}
-                style={{ minHeight: '100px', fontSize: '0.82rem', lineHeight: 1.5 }}
+                style={{ minHeight: '80px', fontSize: '0.82rem', lineHeight: 1.5 }}
               />
             </div>
-            
-            {/* Recipient selection list */}
-            <div style={{ marginBottom: '18px' }}>
-              <label className="form-label" style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px', display: 'block' }}>Configured Recipients</label>
-              
-              <div style={{ background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', maxHeight: '180px', overflowY: 'auto', padding: '8px' }}>
-                {recipientsList.length === 0 ? (
-                  <div style={{ padding: '12px', textAlign: 'center', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                    No recipients configured in Settings.
+
+            {/* Attachment toggles */}
+            <div style={{ marginBottom: '14px' }}>
+              <label className="form-label" style={{ marginBottom: '6px', display: 'block' }}>Report Attachments</label>
+              <div style={{ display: 'flex', gap: '20px', fontSize: '0.8rem', color: 'var(--text)' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={attachPdf} onChange={e => setAttachPdf(e.target.checked)} style={{ cursor: 'pointer' }} />
+                  Attach PDF Report
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={attachExcel} onChange={e => setAttachExcel(e.target.checked)} style={{ cursor: 'pointer' }} />
+                  Attach Excel (Full)
+                </label>
+              </div>
+            </div>
+
+            {/* Live Attachment Previews */}
+            <div style={{ backgroundColor: 'rgba(255,255,255,0.03)', padding: '10px 14px', borderRadius: '6px', border: '1px solid var(--border-subtle)', marginBottom: '18px', fontSize: '0.74rem' }}>
+              <strong style={{ color: 'var(--text-muted)', display: 'block', marginBottom: '6px' }}>Attachments Preview:</strong>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                {attachPdf && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--text)' }}>
+                    <span>📄</span> {selectedReport.meta.name}.pdf (~45 KB)
                   </div>
-                ) : (
-                  recipientsList.map(rec => {
-                    const isSelected = selectedRecipients[rec.email] && selectedRecipients[rec.email] !== 'none';
-                    const currentRole = selectedRecipients[rec.email] || 'none';
-                    return (
-                      <div key={rec.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 8px', borderBottom: '1px solid var(--border-subtle)', gap: '10px', flexWrap: 'wrap' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, minWidth: '180px' }}>
-                          <input
-                            type="checkbox"
-                            checked={isSelected}
-                            onChange={(e) => {
-                              setSelectedRecipients(prev => ({
-                                ...prev,
-                                [rec.email]: e.target.checked ? 'to' : 'none'
-                              }));
-                            }}
-                          />
-                          <div>
-                            <span style={{ fontSize: '0.82rem', fontWeight: 600, color: rec.active ? 'var(--text)' : 'var(--text-muted)' }}>{rec.name}</span>
-                            <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', display: 'block' }}>{rec.email}</span>
-                          </div>
-                        </div>
-                        
-                        <div style={{ display: 'flex', gap: '4px' }}>
-                          {['to', 'cc', 'bcc'].map(type => (
-                            <button
-                              key={type}
-                              type="button"
-                              disabled={!isSelected}
-                              onClick={() => {
-                                setSelectedRecipients(prev => ({
-                                  ...prev,
-                                  [rec.email]: type
-                                }));
-                              }}
-                              style={{
-                                padding: '2px 8px',
-                                fontSize: '0.7rem',
-                                fontWeight: 600,
-                                textTransform: 'uppercase',
-                                borderRadius: '3px',
-                                border: '1px solid',
-                                cursor: isSelected ? 'pointer' : 'default',
-                                background: currentRole === type ? 'var(--secondary)' : 'transparent',
-                                color: currentRole === type ? '#fff' : 'var(--text-muted)',
-                                borderColor: currentRole === type ? 'var(--secondary)' : 'var(--border)',
-                                opacity: isSelected ? 1 : 0.4
-                              }}
-                            >
-                              {type}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    );
-                  })
+                )}
+                {attachExcel && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--text)' }}>
+                    <span>📊</span> {selectedReport.meta.name}.xlsx (~12 KB)
+                  </div>
+                )}
+                {!attachPdf && !attachExcel && (
+                  <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>No attachments configured (Email body summary only)</span>
                 )}
               </div>
             </div>
 
-            {/* Custom recipients builder */}
-            <div style={{ marginBottom: '18px' }}>
-              <label className="form-label" style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px', display: 'block' }}>Add Custom Recipient</label>
-              <div style={{ display: 'flex', gap: '8px' }}>
-                <input
-                  type="email"
-                  className="form-control"
-                  placeholder="custom.user@plant.com"
-                  value={customEmail}
-                  onChange={(e) => setCustomEmail(e.target.value)}
-                  style={{ flex: 1, height: '34px', fontSize: '0.8rem' }}
-                />
-                <select
-                  value={customType}
-                  onChange={(e) => setCustomType(e.target.value)}
-                  className="form-control"
-                  style={{ width: '80px', height: '34px', fontSize: '0.8rem', padding: '0 4px' }}
-                >
-                  <option value="to">To</option>
-                  <option value="cc">CC</option>
-                  <option value="bcc">BCC</option>
-                </select>
-                <button
-                  type="button"
-                  onClick={handleAddCustomRecipient}
-                  className="btn btn-secondary"
-                  style={{ height: '34px', fontSize: '0.8rem', padding: '0 12px' }}
-                >
-                  ➕ Add
-                </button>
-              </div>
-              
-              {/* Custom recipients list */}
-              {customRecipients.length > 0 && (
-                <div style={{ marginTop: '8px', background: 'var(--background)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', padding: '6px 10px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  {customRecipients.map(cr => (
-                    <div key={cr.email} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.78rem' }}>
-                      <span style={{ color: 'var(--text)' }}>
-                        <strong style={{ color: 'var(--secondary)', marginRight: '6px', textTransform: 'uppercase' }}>[{cr.type}]</strong>
-                        {cr.email}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => handleRemoveCustomRecipient(cr.email)}
-                        style={{ border: 'none', background: 'transparent', color: 'var(--error)', cursor: 'pointer', fontSize: '0.9rem', padding: '0 4px' }}
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Recipient summary badge counts */}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--surface-raised)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', padding: '10px 14px', marginBottom: '18px', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-              <span>Recipients Selected:</span>
-              <div style={{ display: 'flex', gap: '8px', fontWeight: 600 }}>
-                <span style={{ color: toCount > 0 ? 'var(--secondary)' : 'var(--text-dim)' }}>To: {toCount}</span>
-                <span style={{ color: ccCount > 0 ? 'var(--success)' : 'var(--text-dim)' }}>CC: {ccCount}</span>
-                <span style={{ color: bccCount > 0 ? 'var(--warning)' : 'var(--text-dim)' }}>BCC: {bccCount}</span>
-                <span style={{ borderLeft: '1px solid var(--border)', paddingLeft: '8px', color: 'var(--text)' }}>Total: {totalSelectedCount}</span>
+            {/* Dispatch Confirmation Card */}
+            <div style={{ backgroundColor: 'rgba(59, 130, 246, 0.05)', border: '1px solid rgba(59, 130, 246, 0.25)', borderRadius: '6px', padding: '12px 14px', marginBottom: '20px', fontSize: '0.74rem', textAlign: 'left' }}>
+              <strong style={{ color: '#60A5FA', display: 'block', marginBottom: '6px' }}>✉️ Dispatch Summary Confirmation:</strong>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', color: 'var(--text-muted)' }}>
+                <div><strong>To:</strong> {emailTo || <span style={{ color: 'var(--error)' }}>Empty</span>}</div>
+                {emailCc && <div><strong>CC:</strong> {emailCc}</div>}
+                {emailBcc && <div><strong>BCC:</strong> {emailBcc}</div>}
+                <div><strong>Subject:</strong> {emailSubject}</div>
+                <div><strong>Attachments:</strong> {[attachPdf ? 'PDF' : '', attachExcel ? 'Excel' : ''].filter(Boolean).join(', ') || 'None'}</div>
               </div>
             </div>
 
@@ -1222,7 +2390,7 @@ export default function Reports({ user }) {
           animation: 'slideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1)'
         }}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-          <span style={{ fontSize: '0.82rem', fontWeight: 600 }}>Report email dispatched successfully! Logged to System Server Feed.</span>
+          <span style={{ fontSize: '0.82rem', fontWeight: 600 }}>Production report emailed successfully.</span>
           <style>{`
             @keyframes slideIn {
               from { transform: translateY(20px); opacity: 0; }
@@ -1249,6 +2417,60 @@ export default function Reports({ user }) {
           </div>
         </div>
       )}
+      {/* ── Server-Side Report Generation Progress Modal ── */}
+      {isGeneratingReport && (
+        <div className="modal-overlay" style={{ zIndex: 99999, position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(5, 8, 17, 0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div className="card" style={{ padding: '32px', textAlign: 'center', width: '420px', maxWidth: '95%', boxShadow: '0 20px 40px rgba(0,0,0,0.5)', border: '1px solid #1E2D4A' }}>
+            <h3 style={{ margin: '0 0 10px', fontSize: '1rem', fontWeight: 800, color: 'var(--text)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+              Generating Industrial Report
+            </h3>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '24px' }}>
+              Format: <strong style={{ color: 'var(--secondary)' }}>{generationFormat.toUpperCase()}</strong>
+            </p>
+            
+            {/* Spinning Indicator */}
+            <div style={{
+              width: '48px', height: '48px', borderRadius: '50%',
+              border: '3px solid rgba(59, 130, 246, 0.1)',
+              borderTopColor: 'var(--secondary)',
+              animation: 'spin 1s linear infinite',
+              margin: '0 auto 20px'
+            }} />
+
+            {/* Progress Bar */}
+            <div style={{ background: '#1E293B', height: '10px', borderRadius: '5px', overflow: 'hidden', marginBottom: '12px', border: '1px solid #334155' }}>
+              <div style={{
+                background: 'linear-gradient(90deg, #3B82F6 0%, #10B981 100%)',
+                height: '100%',
+                width: `${generationProgress}%`,
+                transition: 'width 0.4s ease-out',
+                boxShadow: '0 0 10px rgba(59, 130, 246, 0.5)'
+              }} />
+            </div>
+
+            {/* Percentage Indicator */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
+                STATUS LOG
+              </span>
+              <span style={{ fontSize: '0.88rem', fontWeight: 800, color: 'var(--text)', fontFamily: 'monospace' }}>
+                {generationProgress}%
+              </span>
+            </div>
+
+            {/* Status Message */}
+            <div style={{
+              background: '#0D1526', border: '1px solid #1E2D4A', borderRadius: '6px',
+              padding: '10px 14px', fontSize: '0.72rem', color: '#889FC6',
+              fontFamily: 'monospace', minHeight: '38px', display: 'flex',
+              alignItems: 'center', justifyContent: 'center', lineHeight: 1.4
+            }}>
+              {generationMessage}
+            </div>
+          </div>
+        </div>
+      )}
+
 
       {/* Print styles override */}
       <style>{`
