@@ -110,11 +110,21 @@ export function hasColumn(tableName, colName, settings) {
   }
   
   if (String(tableName).toLowerCase() === 'database') {
-    const dbCols = ['dateandtime', 'timestamp', 'millitm', 'tagindex', 'val', 'status', 'marker'];
+    const dbCols = ['dateandtime', 'millitm', 'tagindex', 'val', 'status', 'marker'];
     return dbCols.includes(String(colName).toLowerCase());
   }
   
   return true;
+}
+
+// Helper to resolve the correct timestamp column name for a table
+export function resolveTimestampCol(tableName, mappings = {}, settings = null) {
+  if (mappings && mappings.timestampCol) return mappings.timestampCol;
+  const isDbTable = String(tableName).toLowerCase() === 'database';
+  if (!isDbTable && hasColumn(tableName, 'timestamp', settings)) {
+    return 'timestamp';
+  }
+  return 'DateAndTime';
 }
 
 // Helper to check if a column has a numeric type
@@ -145,8 +155,8 @@ export function translateRowToStandard(row, mappings = {}, isAlarmInt = false, s
   
   let tsCol = mappings.timestampCol;
   if (!tsCol) {
-    if (row.timestamp !== undefined) tsCol = 'timestamp';
-    else if (row.DateAndTime !== undefined) tsCol = 'DateAndTime';
+    if (row.DateAndTime !== undefined) tsCol = 'DateAndTime';
+    else if (row.timestamp !== undefined) tsCol = 'timestamp';
     else tsCol = 'DateAndTime';
   }
   
@@ -179,15 +189,8 @@ export function translateRowToStandard(row, mappings = {}, isAlarmInt = false, s
 export async function getLatestRecord(supabase, tableName, tagIndex, mappings = {}, isAlarmInt = false, settings = null) {
   if (!supabase) return null;
   const tagCol = mappings.tagCol || 'TagIndex';
-  
-  let tsCol = mappings.timestampCol;
-  if (!tsCol) {
-    if (hasColumn(tableName, 'timestamp', settings)) {
-      tsCol = 'timestamp';
-    } else {
-      tsCol = 'DateAndTime';
-    }
-  }
+  const tsCol = resolveTimestampCol(tableName, mappings, settings);
+
   
   // Expand tagIndex to match potential database formats (T0, 0, etc.)
   let targetIndexes = [];
@@ -266,15 +269,7 @@ export async function getLatestRecord(supabase, tableName, tagIndex, mappings = 
 export async function getRecordsInRange(supabase, tableName, tagIndexes, startISO, endISO, mappings = {}, sort = 'asc', isAlarmInt = false, settings = null, maxRows = null) {
   if (!supabase) return [];
   const tagCol = mappings.tagCol || 'TagIndex';
-  
-  let tsCol = mappings.timestampCol;
-  if (!tsCol) {
-    if (hasColumn(tableName, 'timestamp', settings)) {
-      tsCol = 'timestamp';
-    } else {
-      tsCol = 'DateAndTime';
-    }
-  }
+  const tsCol = resolveTimestampCol(tableName, mappings, settings);
 
   // Expand tagIndex filter list if provided
   let targetIndexes = [];
@@ -318,73 +313,63 @@ export async function getRecordsInRange(supabase, tableName, tagIndexes, startIS
     }
     
     const selectCols = selectList.filter(Boolean).join(',');
+    const plantTz = settings?.plantTimezone || settings?.timezone || 'Asia/Kolkata';
+
+    let query = supabase.from(tableName).select(selectCols);
+
+    if (targetIndexes.length > 0) {
+      query = query.in(tagCol, targetIndexes);
+    }
 
     const separator = await detectTimestampSeparator(supabase, tableName, tsCol);
-    // Derive plant timezone from settings (default Asia/Kolkata)
-    const plantTz = settings?.plantTimezone || settings?.timezone || 'Asia/Kolkata';
-    const dbStart = startISO ? formatToDbTimestamp(startISO, separator, plantTz) : null;
-    const dbEnd = endISO ? formatToDbTimestamp(endISO, separator, plantTz) : null;
 
-    let allData = [];
-    let page = 0;
-    const pageSize = 1000;
-    let hasMore = true;
+    if (startISO) {
+      const startDb = formatToDbTimestamp(startISO, separator, plantTz);
+      query = query.gte(tsCol, startDb);
+    }
+    if (endISO) {
+      const endDb = formatToDbTimestamp(endISO, separator, plantTz);
+      query = query.lte(tsCol, endDb);
+    }
 
-    while (hasMore) {
-      const from = page * pageSize;
-      const to = from + pageSize - 1;
-      let query = supabase.from(tableName)
-        .select(selectCols)
-        .order(tsCol, { ascending: sort === 'asc' });
+    query = query.order(tsCol, { ascending: sort === 'asc' });
 
-      // Secondary sort by ID to give deterministic order when timestamps match
-      if (idCol) {
-        query = query.order(idCol, { ascending: sort === 'asc', nullsFirst: false });
-      }
+    if (idCol) {
+      query = query.order(idCol, { ascending: sort === 'asc', nullsFirst: false });
+    }
 
-      query = query.range(from, to);
-
-      if (targetIndexes.length > 0) {
-        query = query.in(tagCol, targetIndexes);
-      }
-      if (dbStart) {
-        query = query.gte(tsCol, dbStart);
-      }
-      if (dbEnd) {
-        query = query.lte(tsCol, dbEnd);
-      }
-
-      // Development Console Logging for Query Audit
-      console.info(`[Supabase Query Audit]
+    const queryStartTime = performance.now();
+    console.info(`[Supabase Query Audit]
   - Query: "getRecordsInRange"
   - Table: "${tableName}"
-  - Filter TagIndexes: ${targetIndexes.length > 0 ? targetIndexes.join(', ') : 'All'}
-  - Date Range: ${dbStart || 'None'} to ${dbEnd || 'None'}
-  - Page: ${page} (range: ${from}-${to})
+  - TagIndexes: [${targetIndexes.join(', ')}]
+  - Range: ${startISO || 'ALL'} → ${endISO || 'ALL'}
   - Columns: "${selectCols}"
   - Triggered at: ${new Date().toLocaleTimeString()}`);
 
-      const { data, error } = await query;
-      if (error) throw error;
+    let data = null;
+    let error = null;
 
-      if (!data || data.length === 0) {
-        hasMore = false;
-      } else {
-        allData = [...allData, ...data];
-        if (data.length < pageSize || (maxRows !== null && allData.length >= maxRows)) {
-          hasMore = false;
-        } else {
-          page++;
-        }
-      }
+    if (maxRows && Number(maxRows) > 0) {
+      const resp = await query.limit(Number(maxRows));
+      data = resp.data;
+      error = resp.error;
+    } else {
+      const resp = await query;
+      data = resp.data;
+      error = resp.error;
     }
 
-    const translated = allData.map(row => translateRowToStandard(row, mappings, isAlarmInt, settings));
-    console.log(`[HistorianService] getRecordsInRange SUCCESS: ${translated.length} rows returned`);
+    const duration = Math.round(performance.now() - queryStartTime);
+
+    if (error) throw error;
+    
+    const translated = (data || []).map(row => translateRowToStandard(row, mappings, isAlarmInt, settings));
+    console.log(`[HistorianService] getRecordsInRange SUCCESS: ${translated.length} rows returned for table ${tableName} (Took ${duration}ms)`);
     return translated;
   } catch (err) {
-    console.error('[HistorianService] getRecordsInRange failed:', err);
-    throw err;
+    console.error(`[HistorianService] Failed getRecordsInRange for table ${tableName}:`, err);
+    return [];
   }
 }
 
@@ -392,15 +377,7 @@ export async function getRecordsInRange(supabase, tableName, tagIndexes, startIS
 export async function getRecordsSince(supabase, tableName, tagIndexes, lastID, lastTimestamp, mappings = {}, isAlarmInt = false, settings = null) {
   if (!supabase) return [];
   const tagCol = mappings.tagCol || 'TagIndex';
-  
-  let tsCol = mappings.timestampCol;
-  if (!tsCol) {
-    if (hasColumn(tableName, 'timestamp', settings)) {
-      tsCol = 'timestamp';
-    } else {
-      tsCol = 'DateAndTime';
-    }
-  }
+  const tsCol = resolveTimestampCol(tableName, mappings, settings);
 
   let idCol = null;
   if (hasColumn(tableName, 'ID', settings)) {
@@ -467,7 +444,7 @@ export async function getRecordsSince(supabase, tableName, tagIndexes, lastID, l
     console.log(`[HistorianService] getRecordsSince SUCCESS: ${translated.length} new rows returned`);
     return translated;
   } catch (err) {
-    console.error('[HistorianService] getRecordsSince failed:', err);
+    console.error(`[HistorianService] getRecordsSince failed:`, err);
     throw err;
   }
 }
@@ -530,20 +507,11 @@ export async function getTagStats(supabase, tableName, tagIndexes, startISO, end
 
   return statsMap;
 }
-
 // ─── Query 5: Get raw rows for Explorer table ──────────────────────────────
 export async function getRawRows(supabase, tableName, tagIndexes, startISO, endISO, limit = 500, sort = 'desc', mappings = {}, isAlarmInt = false, settings = null, rangeFrom = null, rangeTo = null) {
   if (!supabase) return [];
   const tagCol = mappings.tagCol || 'TagIndex';
-  
-  let tsCol = mappings.timestampCol;
-  if (!tsCol) {
-    if (hasColumn(tableName, 'timestamp', settings)) {
-      tsCol = 'timestamp';
-    } else {
-      tsCol = 'DateAndTime';
-    }
-  }
+  const tsCol = resolveTimestampCol(tableName, mappings, settings);
 
   // Expand tagIndex filter list if provided
   let targetIndexes = [];
