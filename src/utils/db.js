@@ -2775,159 +2775,93 @@ export async function getDatabaseTableStats() {
 
 // ─── Sample Station Assignments (new single-row config table) ─────────────────
 
+// ─── Sample Station Assignments (Redirected to sample_station_mappings) ───
+
 /**
- * Read multi-tag configuration from sample_station_assignments.
- * tag_circuits is the authoritative map of TagIndex → circuit ('lump'|'fines'|'').
+ * Read multi-tag configuration from sample_station_mappings cloud table.
  */
 export async function getSampleStationAssignments() {
-  const supabase = getSupabaseClient();
-  if (!supabase) return {};
-  
-  // Always load tagConfigs map to resolve true historian TagName by TagIndex
-  let configMap = {};
   try {
-    const configs = await getTagConfigs();
-    configs.forEach(c => { configMap[c.TagIndex] = c; });
-  } catch (e) {
-    console.warn('[getSampleStationAssignments] Warning loading config map:', e);
-  }
-
-  const resolveTagObj = (tagIndex, fallbackName = null, circuit = '') => {
-    const idx = Number(tagIndex);
-    const cfg = configMap[idx] || {};
-    return {
-      TagIndex: idx,
-      TagName: cfg.TagName || (fallbackName && !fallbackName.includes('Tonnes') && !fallbackName.includes('Shift ID') && !fallbackName.includes('Stockpile') && !fallbackName.includes('Cut') ? fallbackName : `Tag #${idx}`),
-      Circuit: circuit
+    const mappings = await getSampleStationMappings();
+    const grouped = {
+      sample_tag: [],
+      shift_id_tag: [],
+      cumulative_tag: [],
+      stockpile_tag: [],
+      tag_circuits: {}
     };
-  };
 
-  const grouped = {
-    sample_tag: [],
-    shift_id_tag: [],
-    cumulative_tag: [],
-    stockpile_tag: [],
-    fingerid_tag: [],
-    cutid_tag: [],
-    material_tag: [],
-    tag_circuits: {}  // Authoritative map: String(TagIndex) → 'lump' | 'fines' | ''
-  };
+    (mappings || []).forEach(m => {
+      const idx = Number(m.tag_id);
+      const circuit = m.circuit || 'lump';
+      const role = m.role || 'sample_tag';
+      
+      grouped.tag_circuits[String(idx)] = circuit;
 
-  try {
-    // 1. Primary Check: Load full multi-tag JSON structure from email_configuration (id: 'sample_station_assignments')
-    const { data: backupData, error: backupErr } = await supabase
-      .from('email_configuration')
-      .select('password')
-      .eq('id', 'sample_station_assignments')
-      .maybeSingle();
+      const obj = {
+        TagIndex: idx,
+        TagName: m.equipment_name,
+        Circuit: circuit
+      };
 
-    if (!backupErr && backupData && backupData.password) {
-      try {
-        const parsed = JSON.parse(backupData.password);
-        if (parsed && typeof parsed === 'object') {
-          // Restore tag_circuits map first (authoritative circuit per TagIndex)
-          if (parsed.tag_circuits && typeof parsed.tag_circuits === 'object') {
-            grouped.tag_circuits = parsed.tag_circuits;
-          }
-          let hasAnyConfig = false;
-          const roleKeys = ['sample_tag', 'shift_id_tag', 'cumulative_tag', 'stockpile_tag', 'fingerid_tag', 'cutid_tag', 'material_tag'];
-          roleKeys.forEach(k => {
-            if (Array.isArray(parsed[k])) {
-              grouped[k] = parsed[k].map(t => resolveTagObj(
-                t.TagIndex,
-                t.TagName,
-                grouped.tag_circuits[String(t.TagIndex)] || t.Circuit || ''
-              ));
-              if (grouped[k].length > 0) hasAnyConfig = true;
-            }
-          });
-          if (hasAnyConfig || Object.keys(parsed).length > 0) {
-            return grouped;
-          }
-        }
-      } catch (pErr) {
-        console.warn('[getSampleStationAssignments] JSON parse error on backup data:', pErr);
-      }
-    }
+      if (role === 'sample_tag') grouped.sample_tag.push(obj);
+      else if (role === 'shift_id' || role === 'shift_id_tag') grouped.shift_id_tag.push(obj);
+      else if (role === 'shift_cumulative_tonnes' || role === 'cumulative_tag') grouped.cumulative_tag.push(obj);
+      else if (role === 'stockpile_tonnes' || role === 'stockpile_tag') grouped.stockpile_tag.push(obj);
+    });
 
-    // 2. Query multi-tag assignments structure in sample_station_assignments table if available
-    const { data, error } = await supabase
-      .from('sample_station_assignments')
-      .select('*');
-
-    if (!error && data && data.length > 0) {
-      data.forEach(item => {
-        const key = item.column_key || item.role;
-        const tagIdx = item.tag_index != null ? item.tag_index : item.tag_id;
-        if (key && grouped[key] !== undefined && tagIdx != null) {
-          grouped[key].push(resolveTagObj(tagIdx, item.tag_name, ''));
-        }
-      });
-      return grouped;
-    }
+    return grouped;
   } catch (err) {
-    console.error('[getSampleStationAssignments] exception:', err);
+    console.error('[getSampleStationAssignments] Exception:', err);
+    return { sample_tag: [], shift_id_tag: [], cumulative_tag: [], stockpile_tag: [], tag_circuits: {} };
   }
-  return grouped;
 }
 
 /**
- * Save multi-tag assignments in sample_station_assignments.
- * Saves multi-tag JSON in email_configuration table and rows in sample_station_assignments table.
+ * Save multi-tag assignments to sample_station_mappings.
+ * Throws on failure so callers know the database write failed.
  */
 export async function saveSampleStationAssignments(assignments) {
+  console.log('[saveSampleStationAssignments] Redirecting write to sample_station_mappings...');
   const supabase = getSupabaseClient();
   if (!supabase) throw new Error('Supabase client is not initialized');
 
-  // 1. Always save full multi-tag JSON structure in email_configuration backup table (id: 'sample_station_assignments')
-  const { error: upsertErr } = await supabase
-    .from('email_configuration')
-    .upsert({
-      id: 'sample_station_assignments',
-      host: 'sample_station_assignments',
-      port: 587,
-      username: 'assignments@skadomation.internal',
-      password: JSON.stringify(assignments),
-      secure: false
-    }, { onConflict: 'id' });
+  const roleMap = {
+    sample_tag: 'sample_tag',
+    shift_id_tag: 'shift_id',
+    cumulative_tag: 'shift_cumulative_tonnes',
+    stockpile_tag: 'stockpile_tonnes'
+  };
 
-  if (upsertErr) {
-    console.error('[saveSampleStationAssignments] Supabase persistence error:', upsertErr);
-    throw new Error(upsertErr.message || 'Database write failed');
-  }
+  const tagCircuits = assignments?.tag_circuits || {};
+  const promises = [];
 
-  // 2. Build batch list of rows and attempt save in sample_station_assignments table
-  const rows = [];
-  Object.keys(assignments).forEach(columnKey => {
-    const list = assignments[columnKey];
+  ['sample_tag', 'shift_id_tag', 'cumulative_tag', 'stockpile_tag'].forEach(roleKey => {
+    const list = assignments[roleKey];
     if (Array.isArray(list)) {
       list.forEach(tag => {
-        rows.push({
-          column_key: columnKey,
-          tag_index: Number(tag.TagIndex),
-          tag_name: tag.TagName
-        });
+        const tagId = Number(tag.TagIndex);
+        const circuit = tagCircuits[String(tagId)] || tag.Circuit || 'lump';
+        const role = roleMap[roleKey] || 'sample_tag';
+        const equipmentName = tag.TagName || `Tag #${tagId}`;
+
+        promises.push(
+          upsertSampleStationMapping({
+            tag_id: tagId,
+            equipment_name: equipmentName,
+            circuit,
+            role
+          })
+        );
       });
     }
   });
 
-  try {
-    const { error: deleteErr } = await supabase
-      .from('sample_station_assignments')
-      .delete()
-      .neq('id', 0);
-
-    if (!deleteErr && rows.length > 0) {
-      await supabase
-        .from('sample_station_assignments')
-        .insert(rows);
-    }
-  } catch (err) {
-    console.warn('[saveSampleStationAssignments] Auxiliary table insert warning:', err);
-  }
-
+  const results = await Promise.all(promises);
+  console.log(`[saveSampleStationAssignments] Successfully saved ${results.length} mapping(s) to sample_station_mappings`);
   return assignments;
 }
+
 
 /**
  * Write one row to sample_station_datalog.
