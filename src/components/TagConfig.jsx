@@ -468,52 +468,85 @@ export default function TagConfig({ user, isActive }) {
     const circuit = edit.circuit || '';
     const role = edit.role || 'none';
 
+    // ── Step 1: Log the click ──────────────────────────────────────────
+    console.log('%c[SAMPLE-STATION-SAVE] CLICK', 'color:#00d4ff;font-weight:bold',
+      `tag_id=${idx} TagName="${tag.TagName}"`);
+
     // Validate: both circuit and a real role must be set
     if (!circuit || role === 'none') {
+      console.warn('[SAMPLE-STATION-SAVE] VALIDATION FAILED — circuit or role not selected',
+        { circuit, role });
       setRowErrors(prev => ({ ...prev, [idx]: 'Select Circuit and Role first' }));
       setTimeout(() => setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; }), 3000);
       return;
     }
+
+    // ── Step 2: Log the exact payload that will be sent ────────────────
+    const payload = {
+      tag_id: idx,
+      equipment_name: tag.TagName,
+      circuit,
+      role
+    };
+    console.log('%c[SAMPLE-STATION-SAVE] PAYLOAD', 'color:#00d4ff;font-weight:bold', payload);
 
     setRowSaving(prev => ({ ...prev, [idx]: true }));
     setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; });
     setRowSuccess(prev => { const n = { ...prev }; delete n[idx]; return n; });
 
     try {
-      // Write to cloud DB — upsert().select().single() confirms commit in one round-trip
-      const saved = await upsertSampleStationMapping({
-        tag_id: idx,
-        equipment_name: tag.TagName,
-        circuit,
-        role
-      });
+      // ── Step 3: Start the DB request ─────────────────────────────────
+      console.log('%c[SAMPLE-STATION-SAVE] REQUEST START', 'color:#00d4ff;font-weight:bold',
+        '→ calling upsertSampleStationMapping...');
 
-      // Reload ALL mappings fresh from the DB so ssMappings reflects ground-truth
-      // STATUS = SAVED is determined from ssMappings, never from optimistic state
+      const saved = await upsertSampleStationMapping(payload);
+
+      // ── Step 4: Log the returned DB row ──────────────────────────────
+      console.log('%c[SAMPLE-STATION-SAVE] DATA (upsert returned)', 'color:#00ff88;font-weight:bold', saved);
+
+      // ── Step 5: Read back ALL rows from cloud to confirm persistence ──
+      console.log('%c[SAMPLE-STATION-SAVE] READBACK — querying public.sample_station_mappings...', 'color:#00d4ff;font-weight:bold');
       const freshMappings = await getSampleStationMappings();
-      setSsMappings(freshMappings);
-      // Also sync rowEdits so hasRowChanges correctly shows no pending changes
-      const freshEdit = freshMappings.find(m => Number(m.tag_id) === idx);
-      if (freshEdit) {
-        setRowEdits(prev => ({
-          ...prev,
-          [idx]: { circuit: freshEdit.circuit, role: freshEdit.role }
-        }));
+
+      console.log('%c[SAMPLE-STATION-SAVE] READBACK RESULT', 'color:#00ff88;font-weight:bold',
+        `${freshMappings.length} row(s) in cloud table:`,
+        freshMappings.map(m => `tag_id=${m.tag_id} "${m.equipment_name}" → ${m.circuit}/${m.role}`));
+
+      // Verify the saved record appears in the readback
+      const confirmedRow = freshMappings.find(m => Number(m.tag_id) === idx);
+      if (!confirmedRow) {
+        throw new Error(
+          `READBACK MISMATCH: upsert returned data but tag_id=${idx} is NOT in the fresh table read.` +
+          ` Table has ${freshMappings.length} row(s). This indicates an RLS or permission issue.`
+        );
       }
 
-      // rowSuccess used ONLY for the brief ✅ inline indicator, NOT for STATUS badge
+      console.log('%c[SAMPLE-STATION-SAVE] READBACK CONFIRMED', 'color:#00ff88;font-weight:bold',
+        `tag_id=${confirmedRow.tag_id} circuit=${confirmedRow.circuit} role=${confirmedRow.role}`);
+
+      // ── Step 6: Update UI state with ground-truth from DB ─────────────
+      setSsMappings(freshMappings);
+      setRowEdits(prev => ({
+        ...prev,
+        [idx]: { circuit: confirmedRow.circuit, role: confirmedRow.role }
+      }));
+
+      // rowSuccess is ONLY used for a brief ✅ icon — NOT for STATUS badge
       setRowSuccess(prev => ({ ...prev, [idx]: 'Saved' }));
       setTimeout(() => setRowSuccess(prev => { const n = { ...prev }; delete n[idx]; return n; }), 2500);
 
-      console.log(`[handleSaveRow] Confirmed in DB: tag_id=${saved.tag_id} circuit=${saved.circuit} role=${saved.role}`);
     } catch (err) {
-      console.error('[handleSaveRow] Save FAILED:', err.message);
-      setRowErrors(prev => ({ ...prev, [idx]: err.message || 'Save failed' }));
-      setTimeout(() => setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; }), 6000);
+      // ── Step 7: Log the real error clearly ───────────────────────────
+      console.error('%c[SAMPLE-STATION-SAVE] ERROR', 'color:#ff4444;font-weight:bold', err.message);
+      console.error('[SAMPLE-STATION-SAVE] Full error object:', err);
+      setRowErrors(prev => ({ ...prev, [idx]: err.message || 'Save failed — see console' }));
+      setTimeout(() => setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; }), 8000);
     } finally {
       setRowSaving(prev => { const n = { ...prev }; delete n[idx]; return n; });
     }
   };
+
+
 
 
   const handleDeleteTag = async (tagIndex) => {
