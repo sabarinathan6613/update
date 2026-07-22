@@ -1061,30 +1061,27 @@ export default function TagConfig({ user, isActive }) {
             ) : (
               /* Data table */
               <ScrollableTagList className="table-responsive" style={{ overflowX: 'auto', width: '100%', maxHeight: '550px', background: 'var(--card-bg)' }}>
-                <table className="table" style={{ borderCollapse: 'collapse', width: '100%', minWidth: '1350px' }}>
+                <table className="table" style={{ borderCollapse: 'collapse', width: '100%', minWidth: '1100px' }}>
                   <thead>
                     <tr>
                       {[
-                        { name: 'INDEX', align: 'left', width: '80px' },
-                        { name: 'TAG NAME', align: 'left', width: '220px' },
-                        { name: 'UNIT', align: 'left', width: '90px' },
-                        { name: 'DESCRIPTION', align: 'left', width: '240px' },
-                        { name: 'LAST VALUE', align: 'right', width: '120px' },
-                        { name: 'LAST TIMESTAMP', align: 'left', width: '140px' },
-                        { name: 'QUALITY', align: 'left', width: '150px' },
-                        { name: 'STATUS', align: 'left', width: '130px' },
-                        { name: 'DATABASE MAPPING', align: 'left', width: '220px' },
-                        { name: 'RECORDS COUNT', align: 'right', width: '130px' },
-                        { name: 'LAST SYNC', align: 'left', width: '120px' },
-                        { name: 'DASHBOARD', align: 'center', width: '100px' },
-                        { name: 'TRENDS', align: 'center', width: '90px' },
-                        { name: 'REPORTS', align: 'center', width: '90px' },
-                        { name: 'ACTIONS', align: 'right', width: '180px' }
+                        { name: '#', align: 'left', width: '60px' },
+                        { name: 'TAG NAME', align: 'left', width: '180px' },
+                        { name: 'UNIT', align: 'left', width: '70px' },
+                        { name: 'DESCRIPTION', align: 'left', width: '200px' },
+                        { name: 'LAST VALUE', align: 'right', width: '100px' },
+                        { name: 'STATUS', align: 'left', width: '110px' },
+                        { name: 'DB MAPPING', align: 'left', width: '140px' },
+                        { name: 'RECORDS', align: 'right', width: '90px' },
+                        { name: 'DASHBOARD', align: 'center', width: '85px' },
+                        { name: 'TRENDS', align: 'center', width: '85px' },
+                        { name: 'REPORTS', align: 'center', width: '85px' },
+                        { name: 'ACTIONS', align: 'right', width: '140px' }
                       ].map(col => (
                         <th
                           key={col.name}
                           style={{
-                            padding:         '12px 14px',
+                            padding:         '10px 12px',
                             fontSize:        '0.68rem',
                             fontWeight:      700,
                             letterSpacing:   '0.07em',
@@ -1116,27 +1113,27 @@ export default function TagConfig({ user, isActive }) {
                         onMouseLeave={e => e.currentTarget.style.background = idx % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.015)'}
                       >
                         {/* TAG INDEX */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'left' }}>
+                        <td style={{ padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'left' }}>
                           <span className="tag-pill">#{tag.TagIndex}</span>
                         </td>
 
                         {/* NAME */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text)', fontWeight: 600, whiteSpace: 'nowrap', textAlign: 'left' }}>
+                        <td style={{ padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text)', fontWeight: 600, whiteSpace: 'nowrap', textAlign: 'left' }}>
                           {tag.TagName}
                         </td>
 
                         {/* UNIT */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', fontFamily: 'var(--mono)', fontSize: '0.78rem', color: 'var(--text-muted)', textAlign: 'left' }}>
+                        <td style={{ padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)', fontFamily: 'var(--mono)', fontSize: '0.78rem', color: 'var(--text-muted)', textAlign: 'left' }}>
                           {tag.Unit || <span style={{ opacity: 0.35 }}>—</span>}
                         </td>
 
                         {/* DESCRIPTION */}
                         <td style={{
-                          padding:      '12px 14px',
+                          padding:      '10px 12px',
                           borderBottom: '1px solid var(--border-subtle)',
-                          fontSize:     '0.8rem',
+                          fontSize:     '0.78rem',
                           color:        'var(--text-muted)',
-                          maxWidth:     '240px',
+                          maxWidth:     '200px',
                           whiteSpace:   'nowrap',
                           overflow:     'hidden',
                           textOverflow: 'ellipsis',
@@ -1146,7 +1143,7 @@ export default function TagConfig({ user, isActive }) {
                         </td>
 
                         {/* LAST VALUE */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', fontFamily: 'var(--mono)', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap', textAlign: 'right' }}>
+                        <td style={{ padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)', fontFamily: 'var(--mono)', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap', textAlign: 'right' }}>
                           {previews[tag.TagIndex] !== undefined && previews[tag.TagIndex].val !== null && previews[tag.TagIndex].val !== undefined ? (
                             typeof previews[tag.TagIndex].val === 'number' ? (
                               `${previews[tag.TagIndex].val.toFixed(tag.DecimalPlaces ?? 2)}`
@@ -1158,22 +1155,8 @@ export default function TagConfig({ user, isActive }) {
                           )}
                         </td>
 
-                        {/* LAST TIMESTAMP */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', fontSize: '0.78rem', color: 'var(--text-muted)', whiteSpace: 'nowrap', textAlign: 'left' }}>
-                          {previews[tag.TagIndex] !== undefined && previews[tag.TagIndex].timestamp ? (
-                            new Date(previews[tag.TagIndex].timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-                          ) : (
-                            <span style={{ opacity: 0.35 }}>—</span>
-                          )}
-                        </td>
-
-                        {/* QUALITY */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'left' }}>
-                          {renderQuality(tag.TagIndex)}
-                        </td>
-
                         {/* STATUS */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'left' }}>
+                        <td style={{ padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'left' }}>
                           {(() => {
                             const status = statuses[tag.TagIndex] || 'Checking...';
                             let bg = 'rgba(59, 130, 246, 0.1)';
@@ -1214,28 +1197,19 @@ export default function TagConfig({ user, isActive }) {
                         </td>
 
                         {/* DATABASE MAPPING */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'left' }}>
+                        <td style={{ padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'left' }}>
                           <code style={{ fontFamily: 'var(--mono)', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
                             {settings.selectedTable || 'Database'}.{settings.columnMappings?.valueCol || 'Val'}
                           </code>
                         </td>
 
                         {/* RECORDS COUNT */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', fontFamily: 'var(--mono)', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)', textAlign: 'right' }}>
+                        <td style={{ padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)', fontFamily: 'var(--mono)', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)', textAlign: 'right' }}>
                           {recordsCounts[tag.TagIndex] !== undefined ? recordsCounts[tag.TagIndex] : 0}
                         </td>
 
-                        {/* LAST SYNC TIME */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', fontSize: '0.78rem', color: 'var(--text-muted)', whiteSpace: 'nowrap', textAlign: 'left' }}>
-                          {(statuses[tag.TagIndex] === 'Active' || statuses[tag.TagIndex] === 'Connected') && lastSyncTime ? (
-                            lastSyncTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-                          ) : (
-                            <span style={{ opacity: 0.35 }}>—</span>
-                          )}
-                        </td>
-
                         {/* DASHBOARD visibility toggle */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
+                        <td style={{ padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
                           {savingToggleId === `${tag.TagIndex}-DashboardVisible` ? (
                             <SavingSpinner />
                           ) : (
@@ -1249,7 +1223,7 @@ export default function TagConfig({ user, isActive }) {
                         </td>
 
                         {/* TRENDS visibility toggle */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
+                        <td style={{ padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
                           {savingToggleId === `${tag.TagIndex}-TrendsVisible` ? (
                             <SavingSpinner />
                           ) : (
@@ -1263,7 +1237,7 @@ export default function TagConfig({ user, isActive }) {
                         </td>
 
                         {/* REPORTS visibility toggle */}
-                        <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
+                        <td style={{ padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
                           {savingToggleId === `${tag.TagIndex}-ReportsVisible` ? (
                             <SavingSpinner />
                           ) : (
@@ -1275,6 +1249,7 @@ export default function TagConfig({ user, isActive }) {
                             />
                           )}
                         </td>
+
 
                         {/* ACTIONS */}
                         <td style={{ padding: '12px 14px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'right' }}>
