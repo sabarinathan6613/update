@@ -1,8 +1,8 @@
 // src/components/Dashboard.jsx
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { getTagConfigs, getSettings, saveTagConfigs, getSampleStationAssignments, writeSampleStationDatalogRow, getSampleStationDatalog, getSampleStationDirectConfig } from '../utils/db';
+import { getTagConfigs, getSettings, saveTagConfigs, getSampleStationAssignments, writeSampleStationDatalogRow, getSampleStationDatalog } from '../utils/db';
 import { getSupabaseClient } from '../utils/supabaseClient';
-import { getLatestRecord, getRecordsInRange, getTotalCount, getRawRows } from '../utils/historianService';
+import { getLatestRecord, getRecordsInRange, getTotalCount } from '../utils/historianService';
 import { useSimulator } from '../utils/SimulatorContext';
 import { formatTimestampToPlantTime, formatTimeToPlantTime, calculateTelemetryStats } from '../utils/timeService';
 import { useRefresh } from '../utils/useRefresh';
@@ -321,11 +321,7 @@ export default function Dashboard({ onNavigate, isActive }) {
   const [totalRecordsCount, setTotalRecordsCount] = useState(0);
   const [latestIngestionTime, setLatestIngestionTime] = useState(null);
   const [selectedKpis, setSelectedKpis] = useState([]);
-  // Sample Station direct configuration and datalog rows
-  const [directConfig, setDirectConfig] = useState({
-    lump: { sampleEquipmentIds: [], shiftIdEquipmentId: '', shiftCumulativeEquipmentId: '', stockpileEquipmentId: '' },
-    fines: { sampleEquipmentIds: [], shiftIdEquipmentId: '', shiftCumulativeEquipmentId: '', stockpileEquipmentId: '' }
-  });
+  // Sample Station: single-row config + persisted datalog rows
   const [ssAssignments, setSsAssignments] = useState({});
   const [sampleDatalogRows, setSampleDatalogRows] = useState([]);
 
@@ -355,13 +351,11 @@ export default function Dashboard({ onNavigate, isActive }) {
       const finalConfigs = migratedAny ? migratedConfigs : configs;
       setTagConfigs(finalConfigs);
 
-      // Load direct configuration and backup assignments
-      const [directCfg, assignmentData, datalogData] = await Promise.all([
-        getSampleStationDirectConfig(),
+      // Load sample station assignments (single-row config) and datalog rows
+      const [assignmentData, datalogData] = await Promise.all([
         getSampleStationAssignments(),
         getSampleStationDatalog(15)
       ]);
-      setDirectConfig(directCfg);
       setSsAssignments(assignmentData || {});
       setSampleDatalogRows(datalogData || []);
     } catch (e) {
@@ -394,14 +388,14 @@ export default function Dashboard({ onNavigate, isActive }) {
       const downtimeTagIndexes = downtimeTagsList.map(c => c.TagIndex);
 
       const sampleStationTagIndexes = [];
-      ['lump', 'fines'].forEach(circuit => {
-        const cfg = directConfig[circuit] || {};
-        if (Array.isArray(cfg.sampleEquipmentIds)) {
-          cfg.sampleEquipmentIds.forEach(id => sampleStationTagIndexes.push(Number(id)));
+      Object.values(ssAssignments || {}).forEach(list => {
+        if (Array.isArray(list)) {
+          list.forEach(item => {
+            if (item.TagIndex !== undefined && item.TagIndex !== null) {
+              sampleStationTagIndexes.push(Number(item.TagIndex));
+            }
+          });
         }
-        if (cfg.shiftIdEquipmentId) sampleStationTagIndexes.push(Number(cfg.shiftIdEquipmentId));
-        if (cfg.shiftCumulativeEquipmentId) sampleStationTagIndexes.push(Number(cfg.shiftCumulativeEquipmentId));
-        if (cfg.stockpileEquipmentId) sampleStationTagIndexes.push(Number(cfg.stockpileEquipmentId));
       });
 
       const allQueryTagIndexes = [...new Set([
@@ -484,28 +478,27 @@ export default function Dashboard({ onNavigate, isActive }) {
       try {
         const resolvedRows = [];
         const isConnected = getSupabaseConfig() !== null;
-        console.info('[Sample Station Pipeline Debug] isConnected:', isConnected, 'directConfig:', directConfig);
+        console.info('[Sample Station Pipeline Debug] isConnected:', isConnected, 'ssAssignments:', ssAssignments);
 
-        if (isConnected && supabase && directConfig) {
+        if (isConnected && supabase && ssAssignments) {
+          const tc = ssAssignments.tag_circuits || {};
           const circuits = ['lump', 'fines'];
 
           for (const circuit of circuits) {
-            const config = directConfig[circuit];
-            if (!config) continue;
+            // Find configured Sample Tags for this circuit
+            const sampleTags = (ssAssignments.sample_tag || []).filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit);
+            console.info(`[Sample Station Pipeline Debug] Circuit: ${circuit}, Configured Sample Tags:`, sampleTags);
+            if (sampleTags.length === 0) continue;
 
-            const sampleIds = (config.sampleEquipmentIds || []).map(id => Number(id));
-            console.info(`[Sample Station Pipeline Debug] Circuit: ${circuit}, Configured Sample IDs:`, sampleIds);
-            if (sampleIds.length === 0) continue;
-
-            const shiftIdId = config.shiftIdEquipmentId ? Number(config.shiftIdEquipmentId) : null;
-            const shiftCumId = config.shiftCumulativeEquipmentId ? Number(config.shiftCumulativeEquipmentId) : null;
-            const stockpileId = config.stockpileEquipmentId ? Number(config.stockpileEquipmentId) : null;
+            const shiftTags = (ssAssignments.shift_id_tag || []).filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit);
+            const cumTags = (ssAssignments.cumulative_tag || []).filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit);
+            const stockTags = (ssAssignments.stockpile_tag || []).filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit);
 
             const allCircuitTagIndexes = [...new Set([
-              ...sampleIds,
-              ...(shiftIdId ? [shiftIdId] : []),
-              ...(shiftCumId ? [shiftCumId] : []),
-              ...(stockpileId ? [stockpileId] : [])
+              ...sampleTags.flatMap(t => [Number(t.TagIndex), String(t.TagIndex)]),
+              ...shiftTags.flatMap(t => [Number(t.TagIndex), String(t.TagIndex)]),
+              ...cumTags.flatMap(t => [Number(t.TagIndex), String(t.TagIndex)]),
+              ...stockTags.flatMap(t => [Number(t.TagIndex), String(t.TagIndex)])
             ])].filter(idx => idx !== null && idx !== undefined && idx !== '');
 
             console.info(`[Sample Station Pipeline Debug] Circuit: ${circuit}, allCircuitTagIndexes:`, allCircuitTagIndexes);
@@ -537,7 +530,8 @@ export default function Dashboard({ onNavigate, isActive }) {
             });
 
             // Filter out sample records
-            const sampleRecords = rawRows.filter(row => sampleIds.includes(Number(row.TagIndex)));
+            const sampleTagIndexes = sampleTags.map(t => Number(t.TagIndex));
+            const sampleRecords = rawRows.filter(row => sampleTagIndexes.includes(Number(row.TagIndex)));
             console.info(`[Sample Station Pipeline Debug] Circuit: ${circuit}, sampleRecords count:`, sampleRecords.length);
 
             // For each sample record, build a dashboard row
@@ -545,11 +539,11 @@ export default function Dashboard({ onNavigate, isActive }) {
               const tSample = new Date(sampleRec.DateAndTime).getTime();
               if (isNaN(tSample)) return;
 
-              // Resolve Shift ID: find latest record for configured shiftIdId before or at tSample
+              // Resolve Shift ID: find latest record for any shiftTags before or at tSample
               let resolvedShiftId = '—';
-              if (shiftIdId) {
-                const recs = tagRecordsMap[shiftIdId] || [];
-                let bestShiftTime = 0;
+              let bestShiftTime = 0;
+              shiftTags.forEach(st => {
+                const recs = tagRecordsMap[Number(st.TagIndex)] || [];
                 recs.forEach(r => {
                   const tRow = new Date(r.DateAndTime).getTime();
                   if (tRow <= tSample && tRow > bestShiftTime) {
@@ -557,13 +551,13 @@ export default function Dashboard({ onNavigate, isActive }) {
                     bestShiftTime = tRow;
                   }
                 });
-              }
+              });
 
               // Resolve Shift Cumulative Tonnes
               let resolvedCumTonnes = null;
-              if (shiftCumId) {
-                const recs = tagRecordsMap[shiftCumId] || [];
-                let bestCumTime = 0;
+              let bestCumTime = 0;
+              cumTags.forEach(ct => {
+                const recs = tagRecordsMap[Number(ct.TagIndex)] || [];
                 recs.forEach(r => {
                   const tRow = new Date(r.DateAndTime).getTime();
                   if (tRow <= tSample && tRow > bestCumTime) {
@@ -572,13 +566,13 @@ export default function Dashboard({ onNavigate, isActive }) {
                     bestCumTime = tRow;
                   }
                 });
-              }
+              });
 
               // Resolve Stockpile Tonnes
               let resolvedStockpile = null;
-              if (stockpileId) {
-                const recs = tagRecordsMap[stockpileId] || [];
-                let bestStockTime = 0;
+              let bestStockTime = 0;
+              stockTags.forEach(spt => {
+                const recs = tagRecordsMap[Number(spt.TagIndex)] || [];
                 recs.forEach(r => {
                   const tRow = new Date(r.DateAndTime).getTime();
                   if (tRow <= tSample && tRow > bestStockTime) {
@@ -587,7 +581,7 @@ export default function Dashboard({ onNavigate, isActive }) {
                     bestStockTime = tRow;
                   }
                 });
-              }
+              });
 
               // Find Equipment Name: TagName of sample tag
               const eqConfig = tagConfigs.find(c => Number(c.TagIndex) === Number(sampleRec.TagIndex));
@@ -620,7 +614,7 @@ export default function Dashboard({ onNavigate, isActive }) {
     } finally {
       setLoading(false);
     }
-  }, [tagConfigs, chartStart, chartEnd, loadInitialConfig, directConfig]);
+  }, [tagConfigs, chartStart, chartEnd, loadInitialConfig, ssAssignments]);
 
   const handleManualRefreshDashboard = useCallback(async () => {
     await loadInitialConfig();
@@ -775,12 +769,18 @@ export default function Dashboard({ onNavigate, isActive }) {
   }, [sampleRows]);
 
   const hasLumpMappings = useMemo(() => {
-    return (directConfig?.lump?.sampleEquipmentIds || []).length > 0;
-  }, [directConfig]);
+    const tc = ssAssignments.tag_circuits || {};
+    const hasCircuitMap = Object.keys(tc).some(tagIdx => tc[tagIdx] === 'lump');
+    const hasSampleTag = (ssAssignments.sample_tag || []).some(t => (tc[String(t.TagIndex)] || t.Circuit) === 'lump');
+    return hasCircuitMap || hasSampleTag;
+  }, [ssAssignments]);
 
   const hasFinesMappings = useMemo(() => {
-    return (directConfig?.fines?.sampleEquipmentIds || []).length > 0;
-  }, [directConfig]);
+    const tc = ssAssignments.tag_circuits || {};
+    const hasCircuitMap = Object.keys(tc).some(tagIdx => tc[tagIdx] === 'fines');
+    const hasSampleTag = (ssAssignments.sample_tag || []).some(t => (tc[String(t.TagIndex)] || t.Circuit) === 'fines');
+    return hasCircuitMap || hasSampleTag;
+  }, [ssAssignments]);
 
   const sampleMappedCount = useMemo(() => {
     return tableData.filter(t => t.activeStatus !== false && t.sampleDatalog).length;
