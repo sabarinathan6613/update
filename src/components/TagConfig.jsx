@@ -1,6 +1,6 @@
 // src/components/TagConfig.jsx
 import { useState, useEffect, useRef } from 'react';
-import { getTagConfigs, saveTagConfigs, getSettings, saveSettings, getHistorianData, getSampleStationMapping, saveSampleStationMapping } from '../utils/db';
+import { getTagConfigs, saveTagConfigs, getSettings, saveSettings, getHistorianData, getSampleStationMapping, saveSampleStationMapping, getSampleStationAssignments, saveSampleStationAssignments } from '../utils/db';
 import { getSupabaseClient, getSupabaseConfig } from '../utils/supabaseClient';
 import { useSimulator } from '../utils/SimulatorContext';
 import { getLatestRecord } from '../utils/historianService';
@@ -105,6 +105,24 @@ export default function TagConfig({ user, isActive }) {
   const [savingKeys, setSavingKeys] = useState(new Set());
   const [saveStatusMsg, setSaveStatusMsg] = useState(null);
 
+  // UI helper states (used in JSX)
+  const [dbError, setDbError] = useState(null);
+  const [savingToggleId, setSavingToggleId] = useState(null);
+  const [testResult, setTestResult] = useState(null);
+  const [testingMappingId, setTestingMappingId] = useState(null);
+  const [viewingHistoryTag, setViewingHistoryTag] = useState(null);
+  const [allRecentRecords, setAllRecentRecords] = useState([]);
+  const [loadingHistoryId, setLoadingHistoryId] = useState(null);
+
+  // ── Sample Station Mapping State ────────────────────────────────────────
+  // ssAssignments: live (unsaved) edits — { TagIndex: { circuit, role } }
+  const [ssAssignments, setSsAssignments] = useState({});
+  // savedSsAssignments: last persisted state loaded from DB
+  const [savedSsAssignments, setSavedSsAssignments] = useState({});
+  const [rowSaving, setRowSaving] = useState({});
+  const [rowErrors, setRowErrors] = useState({});
+  const [rowSuccess, setRowSuccess] = useState({});
+
   /* ── Load data ──────────────────────────────────────────────────── */
   useEffect(() => {
     const loadConfigData = async () => {
@@ -114,6 +132,30 @@ export default function TagConfig({ user, isActive }) {
         setTagConfigs(configs.sort((a, b) => a.TagIndex - b.TagIndex));
         const sysSettings = await getSettings();
         setSettings(sysSettings);
+
+        // Load saved sample station assignments from DB
+        try {
+          const saved = await getSampleStationAssignments();
+          // Convert the grouped format { sample_tag: [...], shift_id_tag: [...], ... }
+          // into a flat per-TagIndex map for easy UI lookups:
+          // { [TagIndex]: { circuit: 'lump'|'fines'|'', role: 'sample_tag'|'shift_id_tag'|... } }
+          const perTag = {};
+          const roleKeys = ['sample_tag', 'shift_id_tag', 'cumulative_tag', 'stockpile_tag'];
+          const tc = saved?.tag_circuits || {};
+          roleKeys.forEach(roleKey => {
+            (saved?.[roleKey] || []).forEach(t => {
+              const idx = Number(t.TagIndex);
+              perTag[idx] = {
+                circuit: tc[String(idx)] || t.Circuit || '',
+                role: roleKey
+              };
+            });
+          });
+          setSsAssignments(perTag);
+          setSavedSsAssignments(perTag);
+        } catch (ssErr) {
+          console.warn('[TagConfig] Failed to load sample station assignments:', ssErr);
+        }
 
         const isConnected = getSupabaseConfig() !== null;
         const supabase = getSupabaseClient();
@@ -125,6 +167,8 @@ export default function TagConfig({ user, isActive }) {
         }
       } catch (err) {
         console.error('loadConfigData error:', err);
+      } finally {
+        setIsLoadingData(false);
       }
     };
 
@@ -384,6 +428,105 @@ export default function TagConfig({ user, isActive }) {
   };
 
 
+
+  // ── Sample Station Mapping Helpers ──────────────────────────────────────
+
+  // Read the live (unsaved) circuit for a tag
+  const getCircuitForTag = (tagIndex) => {
+    const idx = Number(tagIndex);
+    return ssAssignments[idx]?.circuit || '';
+  };
+
+  // Read the live (unsaved) role for a tag
+  const getRoleForTag = (tagIndex) => {
+    const idx = Number(tagIndex);
+    return ssAssignments[idx]?.role || 'none';
+  };
+
+  // Read the persisted (saved) circuit for a tag from a snapshot object
+  const getCircuitForTagFromObj = (obj, tagIndex) => {
+    const idx = Number(tagIndex);
+    return obj?.[idx]?.circuit || '';
+  };
+
+  // Read the persisted (saved) role for a tag from a snapshot object
+  const getRoleForTagFromObj = (obj, tagIndex) => {
+    const idx = Number(tagIndex);
+    return obj?.[idx]?.role || 'none';
+  };
+
+  const handleCircuitSelect = (tag, value) => {
+    const idx = Number(tag.TagIndex);
+    setSsAssignments(prev => ({
+      ...prev,
+      [idx]: { ...(prev[idx] || { role: 'none' }), circuit: value }
+    }));
+  };
+
+  const handleRoleSelect = (tag, value) => {
+    const idx = Number(tag.TagIndex);
+    setSsAssignments(prev => ({
+      ...prev,
+      [idx]: { ...(prev[idx] || { circuit: '' }), role: value }
+    }));
+  };
+
+  const handleSaveRow = async (tag) => {
+    const idx = Number(tag.TagIndex);
+    const current = ssAssignments[idx] || {};
+    const circuit = current.circuit || '';
+    const role = current.role || 'none';
+
+    // Validate: both circuit and role must be set
+    if (!circuit || role === 'none') {
+      setRowErrors(prev => ({ ...prev, [idx]: 'Select Circuit and Role first' }));
+      setTimeout(() => setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; }), 3000);
+      return;
+    }
+
+    setRowSaving(prev => ({ ...prev, [idx]: true }));
+    setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; });
+    setRowSuccess(prev => { const n = { ...prev }; delete n[idx]; return n; });
+
+    try {
+      // Load the current full assignment object from DB
+      const existing = await getSampleStationAssignments();
+      const roleKeys = ['sample_tag', 'shift_id_tag', 'cumulative_tag', 'stockpile_tag'];
+      // Remove this tag from all role arrays
+      roleKeys.forEach(rk => {
+        if (Array.isArray(existing[rk])) {
+          existing[rk] = existing[rk].filter(t => Number(t.TagIndex) !== idx);
+        } else {
+          existing[rk] = [];
+        }
+      });
+      // Add to the correct role array
+      if (role !== 'none') {
+        if (!Array.isArray(existing[role])) existing[role] = [];
+        existing[role].push({ TagIndex: idx, TagName: tag.TagName, Circuit: circuit });
+      }
+      // Update tag_circuits map
+      if (!existing.tag_circuits) existing.tag_circuits = {};
+      existing.tag_circuits[String(idx)] = circuit;
+
+      await saveSampleStationAssignments(existing);
+
+      // Update local saved snapshot
+      setSavedSsAssignments(prev => ({
+        ...prev,
+        [idx]: { circuit, role }
+      }));
+
+      setRowSuccess(prev => ({ ...prev, [idx]: 'Saved' }));
+      setTimeout(() => setRowSuccess(prev => { const n = { ...prev }; delete n[idx]; return n; }), 2500);
+    } catch (err) {
+      console.error('[handleSaveRow] Save failed:', err);
+      setRowErrors(prev => ({ ...prev, [idx]: 'Save failed' }));
+      setTimeout(() => setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; }), 4000);
+    } finally {
+      setRowSaving(prev => { const n = { ...prev }; delete n[idx]; return n; });
+    }
+  };
 
   const handleDeleteTag = async (tagIndex) => {
     if (isReadOnly) return;
@@ -1226,8 +1369,10 @@ export default function TagConfig({ user, isActive }) {
                           const numIdx = Number(tag.TagIndex);
 
                           // Calculate status text and color
-                          let statusText = 'Saved';
-                          let statusColor = 'var(--success)';
+                          // "Saved" only if circuit AND role are both valid in the persisted state
+                          const isSavedComplete = savedCircuit !== '' && savedRole !== 'none';
+                          let statusText = isSavedComplete ? 'Saved' : 'Incomplete';
+                          let statusColor = isSavedComplete ? 'var(--success)' : '#94A3B8';
                           if (rowSaving[numIdx]) {
                             statusText = 'Saving...';
                             statusColor = 'var(--accent)';
