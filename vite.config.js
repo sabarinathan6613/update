@@ -49,4 +49,15 @@ export default defineConfig({
       }
     }
   ],
+  build: {
+    rollupOptions: {
+      output: {
+        entryFileNames: `assets/app-[name]-${Date.now()}.js`,
+        chunkFileNames: `assets/chunk-[name]-${Date.now()}.js`,
+        assetFileNames: `assets/asset-[name]-${Date.now()}[extname]`
+      }
+    }
+  }
 })
+
+
