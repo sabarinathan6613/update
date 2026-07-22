@@ -1,6 +1,6 @@
 // src/components/TagConfig.jsx
 import { useState, useEffect, useRef } from 'react';
-import { getTagConfigs, saveTagConfigs, getSettings, saveSettings, getHistorianData, getSampleStationMapping, saveSampleStationMapping } from '../utils/db';
+import { getTagConfigs, saveTagConfigs, getSettings, saveSettings, getHistorianData, getSampleStationMapping, saveSampleStationMapping, getSampleStationDirectConfig, saveSampleStationDirectConfig, invalidateCache } from '../utils/db';
 import { getSupabaseClient, getSupabaseConfig } from '../utils/supabaseClient';
 import { useSimulator } from '../utils/SimulatorContext';
 import { getLatestRecord } from '../utils/historianService';
@@ -105,6 +105,18 @@ export default function TagConfig({ user, isActive }) {
   const [savingKeys, setSavingKeys] = useState(new Set());
   const [saveStatusMsg, setSaveStatusMsg] = useState(null);
 
+  // States for direct Sample Station configuration
+  const [directConfig, setDirectConfig] = useState({
+    lump: { sampleEquipmentIds: [], shiftIdEquipmentId: '', shiftCumulativeEquipmentId: '', stockpileEquipmentId: '' },
+    fines: { sampleEquipmentIds: [], shiftIdEquipmentId: '', shiftCumulativeEquipmentId: '', stockpileEquipmentId: '' }
+  });
+  const [savingLump, setSavingLump] = useState(false);
+  const [savingFines, setSavingFines] = useState(false);
+  const [lumpError, setLumpError] = useState(null);
+  const [finesError, setFinesError] = useState(null);
+  const [lumpSuccess, setLumpSuccess] = useState(null);
+  const [finesSuccess, setFinesSuccess] = useState(null);
+
   /* ── Load data ──────────────────────────────────────────────────── */
   useEffect(() => {
     const loadConfigData = async () => {
@@ -114,6 +126,9 @@ export default function TagConfig({ user, isActive }) {
         setTagConfigs(configs.sort((a, b) => a.TagIndex - b.TagIndex));
         const sysSettings = await getSettings();
         setSettings(sysSettings);
+
+        const directCfg = await getSampleStationDirectConfig();
+        setDirectConfig(directCfg);
 
         const isConnected = getSupabaseConfig() !== null;
         const supabase = getSupabaseClient();
@@ -403,6 +418,56 @@ export default function TagConfig({ user, isActive }) {
       text: `Tag configuration for Index #${tagIndex} deleted successfully.`
     });
     setTimeout(() => setSaveStatusMsg(null), 3000);
+  };
+
+  const handleSaveLumpConfig = async () => {
+    if (isReadOnly) return;
+    setSavingLump(true);
+    setLumpError(null);
+    setLumpSuccess(null);
+    try {
+      const updatedConfig = {
+        ...directConfig,
+        lump: directConfig.lump
+      };
+      await saveSampleStationDirectConfig(updatedConfig);
+      invalidateCache();
+      if (setRefreshTrigger) {
+        setRefreshTrigger(prev => prev + 1);
+      }
+      setLumpSuccess("Lump Configuration saved successfully.");
+      setTimeout(() => setLumpSuccess(null), 3000);
+    } catch (e) {
+      console.error(e);
+      setLumpError("Failed to save Lump Configuration.");
+    } finally {
+      setSavingLump(false);
+    }
+  };
+
+  const handleSaveFinesConfig = async () => {
+    if (isReadOnly) return;
+    setSavingFines(true);
+    setFinesError(null);
+    setFinesSuccess(null);
+    try {
+      const updatedConfig = {
+        ...directConfig,
+        fines: directConfig.fines
+      };
+      await saveSampleStationDirectConfig(updatedConfig);
+      invalidateCache();
+      if (setRefreshTrigger) {
+        setRefreshTrigger(prev => prev + 1);
+      }
+      setFinesSuccess("Fines Configuration saved successfully.");
+      setTimeout(() => setFinesSuccess(null), 3000);
+    } catch (e) {
+      console.error(e);
+      setFinesError("Failed to save Fines Configuration.");
+    } finally {
+      setSavingFines(false);
+    }
   };
 
   const handleKpiToggle = (tagIndex) => {
@@ -1178,167 +1243,300 @@ export default function TagConfig({ user, isActive }) {
             )}
           </div>
           
-          {/* ── Sample Station Mapping Table ─────────────────── */}
-          {tagConfigs.some(t => t.SampleDatalog || t.sample_datalog_enabled || t.sample_station) && (
-            <div className="card" style={{ marginTop: '24px', padding: '20px', overflow: 'visible' }}>
-              <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '10px', marginBottom: '16px' }}>
-                <h3 style={{ margin: 0, fontSize: '0.95rem', fontWeight: 700, color: 'var(--text)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                  📋 SAMPLE STATION MAPPING
-                </h3>
-                <p style={{ margin: '4px 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                  Assign roles to Sample Station-enabled tags. Multiple tags can be assigned as Sample Tags.
-                </p>
+          {/* ── Sample Station Direct Configuration ─────────────────── */}
+          {true && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '24px', marginTop: '24px' }}>
+              
+              {/* LUMP SAMPLE STATION CONFIGURATION */}
+              <div className="card" style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '10px' }}>
+                  <h3 style={{ margin: 0, fontSize: '0.95rem', fontWeight: 700, color: 'var(--text)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                    📋 LUMP SAMPLE STATION CONFIGURATION
+                  </h3>
+                  <p style={{ margin: '4px 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    Directly configure equipment mapping for LUMP circuit.
+                  </p>
+                </div>
+
+                {lumpSuccess && (
+                  <div style={{ padding: '8px 12px', background: 'rgba(16,185,129,0.1)', border: '1px solid var(--success)', color: 'var(--success)', borderRadius: '4px', fontSize: '0.8rem' }}>
+                    {lumpSuccess}
+                  </div>
+                )}
+                {lumpError && (
+                  <div style={{ padding: '8px 12px', background: 'rgba(239,68,68,0.1)', border: '1px solid var(--error)', color: 'var(--error)', borderRadius: '4px', fontSize: '0.8rem' }}>
+                    {lumpError}
+                  </div>
+                )}
+
+                {/* Multiple Sample Equipment */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text)' }}>
+                    Sample Equipment (Select Multiple):
+                  </label>
+                  <div style={{
+                    maxHeight: '160px',
+                    overflowY: 'auto',
+                    border: '1px solid var(--border)',
+                    borderRadius: '4px',
+                    padding: '8px',
+                    backgroundColor: 'var(--surface-raised)'
+                  }}>
+                    {tagConfigs.filter(t => t.ActiveStatus !== false && (t.SampleDatalog || t.sample_datalog_enabled || t.sample_station)).map(tag => {
+                      const isChecked = (directConfig.lump?.sampleEquipmentIds || []).includes(tag.TagIndex);
+                      return (
+                        <label key={tag.TagIndex} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 0', cursor: isReadOnly ? 'not-allowed' : 'pointer', fontSize: '0.8rem' }}>
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            disabled={isReadOnly}
+                            onChange={(e) => {
+                              const ids = directConfig.lump?.sampleEquipmentIds || [];
+                              const nextIds = e.target.checked
+                                ? [...ids, tag.TagIndex]
+                                : ids.filter(id => id !== tag.TagIndex);
+                              setDirectConfig({
+                                ...directConfig,
+                                lump: { ...directConfig.lump, sampleEquipmentIds: nextIds }
+                              });
+                            }}
+                          />
+                          <span>#{tag.TagIndex} - {tag.TagName}</span>
+                        </label>
+                      );
+                    })}
+                    {tagConfigs.filter(t => t.ActiveStatus !== false && (t.SampleDatalog || t.sample_datalog_enabled || t.sample_station)).length === 0 && (
+                      <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>
+                        No enabled Sample Station tags available.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Shift ID Equipment */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text)' }}>
+                    Shift ID Equipment:
+                  </label>
+                  <select
+                    className="form-control"
+                    disabled={isReadOnly}
+                    value={directConfig.lump?.shiftIdEquipmentId || ''}
+                    onChange={(e) => {
+                      setDirectConfig({
+                        ...directConfig,
+                        lump: { ...directConfig.lump, shiftIdEquipmentId: e.target.value === '' ? '' : Number(e.target.value) }
+                      });
+                    }}
+                  >
+                    <option value="">Select Equipment</option>
+                    {tagConfigs.filter(t => t.ActiveStatus !== false).map(t => (
+                      <option key={t.TagIndex} value={t.TagIndex}>#{t.TagIndex} - {t.TagName}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Shift Cumulative Tonnes */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text)' }}>
+                    Shift Cumulative Tonnes:
+                  </label>
+                  <select
+                    className="form-control"
+                    disabled={isReadOnly}
+                    value={directConfig.lump?.shiftCumulativeEquipmentId || ''}
+                    onChange={(e) => {
+                      setDirectConfig({
+                        ...directConfig,
+                        lump: { ...directConfig.lump, shiftCumulativeEquipmentId: e.target.value === '' ? '' : Number(e.target.value) }
+                      });
+                    }}
+                  >
+                    <option value="">Select Equipment</option>
+                    {tagConfigs.filter(t => t.ActiveStatus !== false).map(t => (
+                      <option key={t.TagIndex} value={t.TagIndex}>#{t.TagIndex} - {t.TagName}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Stockpile Tonnes */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text)' }}>
+                    Stockpile Tonnes:
+                  </label>
+                  <select
+                    className="form-control"
+                    disabled={isReadOnly}
+                    value={directConfig.lump?.stockpileEquipmentId || ''}
+                    onChange={(e) => {
+                      setDirectConfig({
+                        ...directConfig,
+                        lump: { ...directConfig.lump, stockpileEquipmentId: e.target.value === '' ? '' : Number(e.target.value) }
+                      });
+                    }}
+                  >
+                    <option value="">Select Equipment</option>
+                    {tagConfigs.filter(t => t.ActiveStatus !== false).map(t => (
+                      <option key={t.TagIndex} value={t.TagIndex}>#{t.TagIndex} - {t.TagName}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <button
+                  className="btn btn-primary"
+                  style={{ marginTop: '12px' }}
+                  disabled={isReadOnly || savingLump}
+                  onClick={handleSaveLumpConfig}
+                >
+                  {savingLump ? 'Saving...' : 'Save Lump Configuration'}
+                </button>
               </div>
 
-              {(() => {
-                const enabledSampleTags = tagConfigs.filter(t => (t.ActiveStatus !== false) && (t.SampleDatalog || t.sample_datalog_enabled || t.sample_station));
+              {/* FINES SAMPLE STATION CONFIGURATION */}
+              <div className="card" style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '10px' }}>
+                  <h3 style={{ margin: 0, fontSize: '0.95rem', fontWeight: 700, color: 'var(--text)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                    📋 FINES SAMPLE STATION CONFIGURATION
+                  </h3>
+                  <p style={{ margin: '4px 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    Directly configure equipment mapping for FINES circuit.
+                  </p>
+                </div>
 
-                if (enabledSampleTags.length === 0) {
-                  return (
-                    <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.82rem', fontStyle: 'italic' }}>
-                      No Sample Station tags enabled. Enable the Sample Station toggle for historian tags in the table above to configure roles.
-                    </div>
-                  );
-                }
-
-                return (
-                  <div className="table-responsive" style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                    <table className="table" style={{ width: '100%', borderCollapse: 'collapse' }}>
-                      <thead>
-                        <tr style={{ background: 'var(--surface)', borderBottom: '1px solid var(--border)' }}>
-                          <th style={{ padding: '10px 14px', textAlign: 'left', fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>TAG</th>
-                          <th style={{ padding: '10px 14px', textAlign: 'left', fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>CIRCUIT</th>
-                          <th style={{ padding: '10px 14px', textAlign: 'left', fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>ROLE</th>
-                          <th style={{ padding: '10px 14px', textAlign: 'left', fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>STATUS</th>
-                          <th style={{ padding: '10px 14px', textAlign: 'left', fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>ACTION</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {enabledSampleTags.map((tag) => {
-                          const currentRole = getRoleForTag(tag.TagIndex);
-                          const currentCircuit = getCircuitForTag(tag.TagIndex);
-
-                          const savedRole = getRoleForTagFromObj(savedSsAssignments, tag.TagIndex);
-                          const savedCircuit = getCircuitForTagFromObj(savedSsAssignments, tag.TagIndex);
-
-                          // Enable save button only when row has unsaved modifications
-                          const hasRowChanges = (currentRole !== savedRole) || (currentCircuit !== savedCircuit);
-                          const numIdx = Number(tag.TagIndex);
-
-                          // Calculate status text and color
-                          let statusText = 'Saved';
-                          let statusColor = 'var(--success)';
-                          if (rowSaving[numIdx]) {
-                            statusText = 'Saving...';
-                            statusColor = 'var(--accent)';
-                          } else if (rowErrors[numIdx]) {
-                            statusText = 'Failed';
-                            statusColor = 'var(--error)';
-                          } else if (hasRowChanges) {
-                            statusText = 'Unsaved';
-                            statusColor = '#94A3B8';
-                          } else if (currentRole === 'none' && currentCircuit === '') {
-                            statusText = 'Unassigned';
-                            statusColor = 'var(--text-muted)';
-                          }
-
-                          return (
-                            <tr key={tag.TagIndex} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
-                              <td style={{ padding: '10px 14px', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)' }}>
-                                <span style={{ fontFamily: 'var(--mono)', fontSize: '0.72rem', color: 'var(--text-muted)', marginRight: '6px' }}>[{tag.TagIndex}]</span>
-                                {tag.TagName}
-                              </td>
-                              <td style={{ padding: '10px 14px' }}>
-                                <select
-                                  value={currentCircuit}
-                                  onChange={(e) => handleCircuitSelect(tag, e.target.value)}
-                                  disabled={isReadOnly || rowSaving[numIdx]}
-                                  style={{
-                                    height: '30px',
-                                    fontSize: '0.75rem',
-                                    fontWeight: 700,
-                                    maxWidth: '130px',
-                                    cursor: isReadOnly ? 'not-allowed' : 'pointer',
-                                    borderRadius: '4px',
-                                    padding: '0 8px',
-                                    background: currentCircuit === 'lump'
-                                      ? 'rgba(22,163,74,0.12)'
-                                      : currentCircuit === 'fines'
-                                        ? 'rgba(245,158,11,0.12)'
-                                        : 'var(--surface)',
-                                    color: currentCircuit === 'lump'
-                                      ? '#16A34A'
-                                      : currentCircuit === 'fines'
-                                        ? '#F59E0B'
-                                        : 'var(--text-muted)',
-                                    border: `1px solid ${currentCircuit === 'lump'
-                                      ? 'rgba(22,163,74,0.35)'
-                                      : currentCircuit === 'fines'
-                                        ? 'rgba(245,158,11,0.35)'
-                                        : 'var(--border)'}`
-                                  }}
-                                >
-                                  <option value="">Select Circuit</option>
-                                  <option value="lump">LUMP</option>
-                                  <option value="fines">FINES</option>
-                                </select>
-                              </td>
-                              <td style={{ padding: '10px 14px' }}>
-                                <select
-                                  className="form-control"
-                                  value={currentRole}
-                                  onChange={(e) => handleRoleSelect(tag, e.target.value)}
-                                  disabled={isReadOnly || rowSaving[numIdx]}
-                                  style={{ height: '32px', fontSize: '0.78rem', maxWidth: '240px', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}
-                                >
-                                  <option value="sample_tag">Sample Tag</option>
-                                  <option value="shift_id_tag">Shift ID</option>
-                                  <option value="cumulative_tag">Shift Cumulative Tonnes</option>
-                                  <option value="stockpile_tag">Stockpile Tonnes</option>
-                                  <option value="none">Unassigned</option>
-                                </select>
-                              </td>
-                              <td style={{ padding: '10px 14px', verticalAlign: 'middle' }}>
-                                <span style={{ fontSize: '0.72rem', fontWeight: 700, color: statusColor, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                                  {statusText}
-                                </span>
-                              </td>
-                              <td style={{ padding: '10px 14px', verticalAlign: 'middle' }}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                                  <button
-                                    onClick={() => handleSaveRow(tag)}
-                                    disabled={!hasRowChanges || rowSaving[numIdx] || isReadOnly}
-                                    className="btn btn-primary"
-                                    style={{
-                                      padding: '4px 12px',
-                                      fontSize: '0.72rem',
-                                      fontWeight: 'bold',
-                                      cursor: (!hasRowChanges || rowSaving[numIdx]) ? 'not-allowed' : 'pointer',
-                                      opacity: (!hasRowChanges || rowSaving[numIdx]) ? 0.55 : 1
-                                    }}
-                                  >
-                                    {rowSaving[numIdx] ? 'Saving...' : 'Save'}
-                                  </button>
-                                  {rowSuccess[numIdx] && (
-                                    <span style={{ fontSize: '0.72rem', color: 'var(--success)', fontWeight: 600 }}>
-                                      ✅ {rowSuccess[numIdx]}
-                                    </span>
-                                  )}
-                                  {rowErrors[numIdx] && (
-                                    <span style={{ fontSize: '0.72rem', color: 'var(--error)', fontWeight: 600 }}>
-                                      ⚠️ {rowErrors[numIdx]}
-                                    </span>
-                                  )}
-                                </div>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
+                {finesSuccess && (
+                  <div style={{ padding: '8px 12px', background: 'rgba(16,185,129,0.1)', border: '1px solid var(--success)', color: 'var(--success)', borderRadius: '4px', fontSize: '0.8rem' }}>
+                    {finesSuccess}
                   </div>
-                );
-              })()}
+                )}
+                {finesError && (
+                  <div style={{ padding: '8px 12px', background: 'rgba(239,68,68,0.1)', border: '1px solid var(--error)', color: 'var(--error)', borderRadius: '4px', fontSize: '0.8rem' }}>
+                    {finesError}
+                  </div>
+                )}
+
+                {/* Multiple Sample Equipment */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text)' }}>
+                    Sample Equipment (Select Multiple):
+                  </label>
+                  <div style={{
+                    maxHeight: '160px',
+                    overflowY: 'auto',
+                    border: '1px solid var(--border)',
+                    borderRadius: '4px',
+                    padding: '8px',
+                    backgroundColor: 'var(--surface-raised)'
+                  }}>
+                    {tagConfigs.filter(t => t.ActiveStatus !== false && (t.SampleDatalog || t.sample_datalog_enabled || t.sample_station)).map(tag => {
+                      const isChecked = (directConfig.fines?.sampleEquipmentIds || []).includes(tag.TagIndex);
+                      return (
+                        <label key={tag.TagIndex} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 0', cursor: isReadOnly ? 'not-allowed' : 'pointer', fontSize: '0.8rem' }}>
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            disabled={isReadOnly}
+                            onChange={(e) => {
+                              const ids = directConfig.fines?.sampleEquipmentIds || [];
+                              const nextIds = e.target.checked
+                                ? [...ids, tag.TagIndex]
+                                : ids.filter(id => id !== tag.TagIndex);
+                              setDirectConfig({
+                                ...directConfig,
+                                fines: { ...directConfig.fines, sampleEquipmentIds: nextIds }
+                              });
+                            }}
+                          />
+                          <span>#{tag.TagIndex} - {tag.TagName}</span>
+                        </label>
+                      );
+                    })}
+                    {tagConfigs.filter(t => t.ActiveStatus !== false && (t.SampleDatalog || t.sample_datalog_enabled || t.sample_station)).length === 0 && (
+                      <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>
+                        No enabled Sample Station tags available.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Shift ID Equipment */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text)' }}>
+                    Shift ID Equipment:
+                  </label>
+                  <select
+                    className="form-control"
+                    disabled={isReadOnly}
+                    value={directConfig.fines?.shiftIdEquipmentId || ''}
+                    onChange={(e) => {
+                      setDirectConfig({
+                        ...directConfig,
+                        fines: { ...directConfig.fines, shiftIdEquipmentId: e.target.value === '' ? '' : Number(e.target.value) }
+                      });
+                    }}
+                  >
+                    <option value="">Select Equipment</option>
+                    {tagConfigs.filter(t => t.ActiveStatus !== false).map(t => (
+                      <option key={t.TagIndex} value={t.TagIndex}>#{t.TagIndex} - {t.TagName}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Shift Cumulative Tonnes */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text)' }}>
+                    Shift Cumulative Tonnes:
+                  </label>
+                  <select
+                    className="form-control"
+                    disabled={isReadOnly}
+                    value={directConfig.fines?.shiftCumulativeEquipmentId || ''}
+                    onChange={(e) => {
+                      setDirectConfig({
+                        ...directConfig,
+                        fines: { ...directConfig.fines, shiftCumulativeEquipmentId: e.target.value === '' ? '' : Number(e.target.value) }
+                      });
+                    }}
+                  >
+                    <option value="">Select Equipment</option>
+                    {tagConfigs.filter(t => t.ActiveStatus !== false).map(t => (
+                      <option key={t.TagIndex} value={t.TagIndex}>#{t.TagIndex} - {t.TagName}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Stockpile Tonnes */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text)' }}>
+                    Stockpile Tonnes:
+                  </label>
+                  <select
+                    className="form-control"
+                    disabled={isReadOnly}
+                    value={directConfig.fines?.stockpileEquipmentId || ''}
+                    onChange={(e) => {
+                      setDirectConfig({
+                        ...directConfig,
+                        fines: { ...directConfig.fines, stockpileEquipmentId: e.target.value === '' ? '' : Number(e.target.value) }
+                      });
+                    }}
+                  >
+                    <option value="">Select Equipment</option>
+                    {tagConfigs.filter(t => t.ActiveStatus !== false).map(t => (
+                      <option key={t.TagIndex} value={t.TagIndex}>#{t.TagIndex} - {t.TagName}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <button
+                  className="btn btn-primary"
+                  style={{ marginTop: '12px' }}
+                  disabled={isReadOnly || savingFines}
+                  onClick={handleSaveFinesConfig}
+                >
+                  {savingFines ? 'Saving...' : 'Save Fines Configuration'}
+                </button>
+              </div>
+
             </div>
           )}
         </div>
