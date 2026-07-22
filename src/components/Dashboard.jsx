@@ -474,140 +474,6 @@ export default function Dashboard({ onNavigate, isActive }) {
 
       setHistorianRecords(windowData);
 
-      // ── Query C: Fetch and resolve Sample Station datalog rows from real historian database dynamically ──
-      try {
-        const resolvedRows = [];
-        const isConnected = getSupabaseConfig() !== null;
-        console.info('[Sample Station Pipeline Debug] isConnected:', isConnected, 'ssAssignments:', ssAssignments);
-
-        if (isConnected && supabase && ssAssignments) {
-          const tc = ssAssignments.tag_circuits || {};
-          const circuits = ['lump', 'fines'];
-
-          for (const circuit of circuits) {
-            // Find configured Sample Tags for this circuit
-            const sampleTags = (ssAssignments.sample_tag || []).filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit);
-            console.info(`[Sample Station Pipeline Debug] Circuit: ${circuit}, Configured Sample Tags:`, sampleTags);
-            if (sampleTags.length === 0) continue;
-
-            const shiftTags = (ssAssignments.shift_id_tag || []).filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit);
-            const cumTags = (ssAssignments.cumulative_tag || []).filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit);
-            const stockTags = (ssAssignments.stockpile_tag || []).filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit);
-
-            const allCircuitTagIndexes = [...new Set([
-              ...sampleTags.flatMap(t => [Number(t.TagIndex), String(t.TagIndex)]),
-              ...shiftTags.flatMap(t => [Number(t.TagIndex), String(t.TagIndex)]),
-              ...cumTags.flatMap(t => [Number(t.TagIndex), String(t.TagIndex)]),
-              ...stockTags.flatMap(t => [Number(t.TagIndex), String(t.TagIndex)])
-            ])].filter(idx => idx !== null && idx !== undefined && idx !== '');
-
-            console.info(`[Sample Station Pipeline Debug] Circuit: ${circuit}, allCircuitTagIndexes:`, allCircuitTagIndexes);
-            if (allCircuitTagIndexes.length === 0) continue;
-
-            // Fetch latest raw records for all configured tags in this circuit
-            const rawRows = await getRawRows(
-              supabase,
-              tableName,
-              allCircuitTagIndexes,
-              null,
-              null,
-              500,
-              'desc',
-              mappings,
-              isAlarmInt,
-              settings
-            );
-
-            console.info(`[Sample Station Pipeline Debug] Circuit: ${circuit}, rawRows length:`, rawRows ? rawRows.length : 0);
-            if (!rawRows || rawRows.length === 0) continue;
-
-            // Group non-sample tags by tag index for quick lookup
-            const tagRecordsMap = {};
-            rawRows.forEach(row => {
-              const idx = Number(row.TagIndex);
-              if (!tagRecordsMap[idx]) tagRecordsMap[idx] = [];
-              tagRecordsMap[idx].push(row);
-            });
-
-            // Filter out sample records
-            const sampleTagIndexes = sampleTags.map(t => Number(t.TagIndex));
-            const sampleRecords = rawRows.filter(row => sampleTagIndexes.includes(Number(row.TagIndex)));
-            console.info(`[Sample Station Pipeline Debug] Circuit: ${circuit}, sampleRecords count:`, sampleRecords.length);
-
-            // For each sample record, build a dashboard row
-            sampleRecords.forEach(sampleRec => {
-              const tSample = new Date(sampleRec.DateAndTime).getTime();
-              if (isNaN(tSample)) return;
-
-              // Resolve Shift ID: find latest record for any shiftTags before or at tSample
-              let resolvedShiftId = '—';
-              let bestShiftTime = 0;
-              shiftTags.forEach(st => {
-                const recs = tagRecordsMap[Number(st.TagIndex)] || [];
-                recs.forEach(r => {
-                  const tRow = new Date(r.DateAndTime).getTime();
-                  if (tRow <= tSample && tRow > bestShiftTime) {
-                    resolvedShiftId = r.Val;
-                    bestShiftTime = tRow;
-                  }
-                });
-              });
-
-              // Resolve Shift Cumulative Tonnes
-              let resolvedCumTonnes = null;
-              let bestCumTime = 0;
-              cumTags.forEach(ct => {
-                const recs = tagRecordsMap[Number(ct.TagIndex)] || [];
-                recs.forEach(r => {
-                  const tRow = new Date(r.DateAndTime).getTime();
-                  if (tRow <= tSample && tRow > bestCumTime) {
-                    const parsed = parseFloat(r.Val);
-                    resolvedCumTonnes = isNaN(parsed) ? null : parsed;
-                    bestCumTime = tRow;
-                  }
-                });
-              });
-
-              // Resolve Stockpile Tonnes
-              let resolvedStockpile = null;
-              let bestStockTime = 0;
-              stockTags.forEach(spt => {
-                const recs = tagRecordsMap[Number(spt.TagIndex)] || [];
-                recs.forEach(r => {
-                  const tRow = new Date(r.DateAndTime).getTime();
-                  if (tRow <= tSample && tRow > bestStockTime) {
-                    const parsed = parseFloat(r.Val);
-                    resolvedStockpile = isNaN(parsed) ? null : parsed;
-                    bestStockTime = tRow;
-                  }
-                });
-              });
-
-              // Find Equipment Name: TagName of sample tag
-              const eqConfig = tagConfigs.find(c => Number(c.TagIndex) === Number(sampleRec.TagIndex));
-              const equipmentName = eqConfig ? eqConfig.TagName : (sampleRec.TagName || `Tag #${sampleRec.TagIndex}`);
-
-              resolvedRows.push({
-                timestamp: sampleRec.DateAndTime,
-                tagName: equipmentName,
-                shift_id: resolvedShiftId,
-                shift_cumulative_tonnes: resolvedCumTonnes,
-                stockpile_tonnes: resolvedStockpile,
-                material: circuit, // 'lump' or 'fines'
-                decimalPlaces: 2
-              });
-            });
-          }
-        }
-
-        // Sort all resolved rows by timestamp desc and take latest 30
-        resolvedRows.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-        console.info('[Sample Station Pipeline Debug] Final resolvedRows count:', resolvedRows.length);
-        setSampleDatalogRows(resolvedRows.slice(0, 30));
-      } catch (e) {
-        console.warn("[Dashboard] Failed to fetch and resolve sample station datalog rows dynamically:", e);
-      }
-
     } catch (err) {
       console.error('Failed to load dashboard data:', err);
       throw err; // propagate to useRefresh error handler
@@ -747,10 +613,117 @@ export default function Dashboard({ onNavigate, isActive }) {
     return c;
   };
 
-  // Sample Station Datalog: derived from sampleDatalogRows (which loads from database table sample_station_datalog)
+  // Sample Station rows: derived from the SAME historianRecords already loaded for Production Data.
+  // ssAssignments defines which TagIndex → circuit + role. No extra DB query needed.
   const sampleRows = useMemo(() => {
-    return sampleDatalogRows;
-  }, [sampleDatalogRows]);
+    if (!historianRecords || historianRecords.length === 0) return [];
+    if (!ssAssignments) return [];
+
+    const tc = ssAssignments.tag_circuits || {};
+    const resolvedRows = [];
+
+    const circuits = ['lump', 'fines'];
+    for (const circuit of circuits) {
+      // Collect tag indexes per role for this circuit
+      const sampleTagIndexes = (ssAssignments.sample_tag || [])
+        .filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit)
+        .map(t => Number(t.TagIndex));
+
+      if (sampleTagIndexes.length === 0) continue;
+
+      const shiftIdIndexes = (ssAssignments.shift_id_tag || [])
+        .filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit)
+        .map(t => Number(t.TagIndex));
+
+      const cumIndexes = (ssAssignments.cumulative_tag || [])
+        .filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit)
+        .map(t => Number(t.TagIndex));
+
+      const stockIndexes = (ssAssignments.stockpile_tag || [])
+        .filter(t => (tc[String(t.TagIndex)] || t.Circuit) === circuit)
+        .map(t => Number(t.TagIndex));
+
+      // Group all historianRecords by TagIndex for fast lookup
+      const tagRecordsMap = {};
+      historianRecords.forEach(r => {
+        const idx = Number(r.TagIndex);
+        if (!tagRecordsMap[idx]) tagRecordsMap[idx] = [];
+        tagRecordsMap[idx].push(r);
+      });
+
+      // Each record of a sample tag creates one dashboard row
+      sampleTagIndexes.forEach(sampleIdx => {
+        const sampleRecs = tagRecordsMap[sampleIdx] || [];
+        sampleRecs.forEach(sampleRec => {
+          const tSample = new Date(sampleRec.DateAndTime).getTime();
+          if (isNaN(tSample)) return;
+
+          // Resolve Shift ID — latest record at or before sample timestamp
+          let resolvedShiftId = '—';
+          let bestShiftTime = 0;
+          shiftIdIndexes.forEach(idx => {
+            (tagRecordsMap[idx] || []).forEach(r => {
+              const t = new Date(r.DateAndTime).getTime();
+              if (t <= tSample && t > bestShiftTime) {
+                // Keep string values (e.g. "A", "B") as-is
+                resolvedShiftId = r.Val !== null && r.Val !== undefined ? String(r.Val) : '—';
+                bestShiftTime = t;
+              }
+            });
+          });
+
+          // Resolve Shift Cumulative Tonnes — latest at or before sample timestamp
+          let resolvedCumTonnes = null;
+          let bestCumTime = 0;
+          cumIndexes.forEach(idx => {
+            (tagRecordsMap[idx] || []).forEach(r => {
+              const t = new Date(r.DateAndTime).getTime();
+              if (t <= tSample && t > bestCumTime) {
+                const parsed = parseFloat(r.Val);
+                if (!isNaN(parsed)) {
+                  resolvedCumTonnes = parsed;
+                  bestCumTime = t;
+                }
+              }
+            });
+          });
+
+          // Resolve Stockpile Tonnes — latest at or before sample timestamp
+          let resolvedStockpile = null;
+          let bestStockTime = 0;
+          stockIndexes.forEach(idx => {
+            (tagRecordsMap[idx] || []).forEach(r => {
+              const t = new Date(r.DateAndTime).getTime();
+              if (t <= tSample && t > bestStockTime) {
+                const parsed = parseFloat(r.Val);
+                if (!isNaN(parsed)) {
+                  resolvedStockpile = parsed;
+                  bestStockTime = t;
+                }
+              }
+            });
+          });
+
+          const eqConfig = tagConfigs.find(c => Number(c.TagIndex) === sampleIdx);
+          const equipmentName = eqConfig ? eqConfig.TagName : `Tag #${sampleIdx}`;
+
+          resolvedRows.push({
+            timestamp: sampleRec.DateAndTime,
+            tagName: equipmentName,
+            shift_id: resolvedShiftId,
+            shift_cumulative_tonnes: resolvedCumTonnes,
+            stockpile_tonnes: resolvedStockpile,
+            material: circuit,
+            decimalPlaces: eqConfig?.DecimalPlaces ?? 2
+          });
+        });
+      });
+    }
+
+    // Sort by timestamp desc, latest 30
+    resolvedRows.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    return resolvedRows.slice(0, 30);
+  }, [historianRecords, ssAssignments, tagConfigs]);
 
   const getRowMaterialType = (row) => {
     if (row.material) return row.material.toLowerCase();
