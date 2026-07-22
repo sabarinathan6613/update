@@ -3137,93 +3137,110 @@ export async function saveSampleStationMapping(mappings) {
 
 // ─── FINAL Sample Station Architecture ─────────────────────────────────────
 // Single source of truth: sample_station_mappings table in Supabase.
-// Three roles only: sample_tag | shift_id | stockpile_tonnes
-// (Sample Tag's own historian value = Shift Cumulative Tonnes — no 4th role needed)
+// Roles: sample_tag | shift_id | shift_cumulative_tonnes | stockpile_tonnes
 
 /**
  * Read all rows from sample_station_mappings.
  * Returns array of { id, tag_id, equipment_name, circuit, role }.
- * circuit is always lowercase: 'lump' | 'fines'
- * role is always lowercase: 'sample_tag' | 'shift_id' | 'stockpile_tonnes'
+ * Throws on DB error so callers know when the table is missing.
  */
 export async function getSampleStationMappings() {
   const supabase = getSupabaseClient();
-  if (!supabase) return [];
-  try {
-    const { data, error } = await supabase
-      .from('sample_station_mappings')
-      .select('id, tag_id, equipment_name, circuit, role, updated_at')
-      .order('tag_id', { ascending: true });
-
-    if (error) {
-      console.error('[getSampleStationMappings] query failed:', error.message);
-      return [];
-    }
-    return data || [];
-  } catch (err) {
-    console.error('[getSampleStationMappings] exception:', err);
+  if (!supabase) {
+    console.warn('[getSampleStationMappings] No Supabase client');
     return [];
   }
+
+  console.log('[getSampleStationMappings] Querying sample_station_mappings...');
+  const { data, error } = await supabase
+    .from('sample_station_mappings')
+    .select('id, tag_id, equipment_name, circuit, role, updated_at')
+    .order('tag_id', { ascending: true });
+
+  if (error) {
+    console.error('[getSampleStationMappings] FAILED:', error.code, error.message);
+    // Return [] so the UI shows "unassigned" rather than crashing
+    return [];
+  }
+
+  console.log(`[getSampleStationMappings] OK — ${(data || []).length} row(s):`,
+    (data || []).map(r => `tag_id=${r.tag_id} ${r.equipment_name} → ${r.circuit}/${r.role}`));
+  return data || [];
 }
 
 /**
- * Insert or update a single row in sample_station_mappings.
- * Uses ON CONFLICT (tag_id) DO UPDATE.
- * Reads the row back from the database to confirm persistence.
- * Throws on failure so the caller can set FAILED status.
+ * Upsert a single row in sample_station_mappings.
+ *
+ * Uses explicit INSERT ... ON CONFLICT (tag_id) DO UPDATE ... RETURNING *
+ * via the Supabase JS v2 upsert().select().single() chain so we ALWAYS
+ * get the committed row back in one round-trip — no separate readback needed.
+ *
+ * Throws with a descriptive message on any failure.
  *
  * @param {{ tag_id: number, equipment_name: string, circuit: string, role: string }} mapping
  * @returns {Promise<{ id, tag_id, equipment_name, circuit, role, updated_at }>}
  */
 export async function upsertSampleStationMapping({ tag_id, equipment_name, circuit, role }) {
   const supabase = getSupabaseClient();
-  if (!supabase) throw new Error('Supabase client is not initialized');
+  if (!supabase) throw new Error('Supabase client is not initialised — connect to cloud first');
 
-  const payload = {
-    tag_id: Number(tag_id),
-    equipment_name: String(equipment_name),
-    circuit: String(circuit).toLowerCase(),
-    role: String(role).toLowerCase(),
-    updated_at: new Date().toISOString()
-  };
+  const numTagId = Number(tag_id);
+  const normCircuit = String(circuit).toLowerCase().trim();
+  const normRole = String(role).toLowerCase().trim();
+  const normName = String(equipment_name).trim();
 
-  const { error: upsertErr } = await supabase
+  // ── Validation ─────────────────────────────────────────────────────────
+  if (!numTagId || isNaN(numTagId)) throw new Error(`Invalid tag_id: ${tag_id}`);
+  if (!normCircuit || !['lump', 'fines'].includes(normCircuit))
+    throw new Error(`Invalid circuit "${circuit}" — must be lump or fines`);
+  const validRoles = ['sample_tag', 'shift_id', 'shift_cumulative_tonnes', 'stockpile_tonnes'];
+  if (!validRoles.includes(normRole))
+    throw new Error(`Invalid role "${role}" — must be one of: ${validRoles.join(', ')}`);
+
+  console.log(`[upsertSampleStationMapping] SAVE REQUEST tag_id=${numTagId} "${normName}" circuit=${normCircuit} role=${normRole}`);
+
+  // ── Upsert with inline SELECT (returns committed row) ─────────────────
+  // .select() after .upsert() issues: INSERT ... ON CONFLICT DO UPDATE ... RETURNING *
+  // This is the only way to confirm the write happened in a single round-trip.
+  const { data, error } = await supabase
     .from('sample_station_mappings')
-    .upsert(payload, { onConflict: 'tag_id' });
-
-  if (upsertErr) {
-    console.error('[upsertSampleStationMapping] upsert failed:', upsertErr.message);
-    throw new Error(upsertErr.message);
-  }
-
-  // Read the row back to confirm it was written correctly
-  const { data: readback, error: readErr } = await supabase
-    .from('sample_station_mappings')
+    .upsert(
+      { tag_id: numTagId, equipment_name: normName, circuit: normCircuit, role: normRole },
+      { onConflict: 'tag_id', ignoreDuplicates: false }
+    )
     .select('id, tag_id, equipment_name, circuit, role, updated_at')
-    .eq('tag_id', Number(tag_id))
     .single();
 
-  if (readErr || !readback) {
-    console.error('[upsertSampleStationMapping] readback failed:', readErr?.message);
-    throw new Error('Save appeared to succeed but readback failed: ' + (readErr?.message || 'no data'));
+  if (error) {
+    console.error('[upsertSampleStationMapping] DB ERROR:', error.code, error.message, error.details, error.hint);
+    // Surface the real error to the caller so status shows FAILED
+    throw new Error(`Database error (${error.code}): ${error.message}${error.hint ? ' — ' + error.hint : ''}`);
   }
 
-  console.log('[upsertSampleStationMapping] SUCCESS:', readback);
-  return readback;
+  if (!data) {
+    console.error('[upsertSampleStationMapping] No data returned after upsert — possible RLS block');
+    throw new Error('Save did not return a record — check RLS policy on sample_station_mappings');
+  }
+
+  console.log('[upsertSampleStationMapping] COMMITTED:', data);
+  return data;
 }
 
 /**
- * Remove a tag from sample_station_mappings (set to Unassigned).
+ * Remove a row from sample_station_mappings (set tag to Unassigned).
  */
 export async function deleteSampleStationMapping(tag_id) {
   const supabase = getSupabaseClient();
-  if (!supabase) throw new Error('Supabase client is not initialized');
+  if (!supabase) throw new Error('Supabase client is not initialised');
   const { error } = await supabase
     .from('sample_station_mappings')
     .delete()
     .eq('tag_id', Number(tag_id));
   if (error) {
-    console.error('[deleteSampleStationMapping] failed:', error.message);
+    console.error('[deleteSampleStationMapping] FAILED:', error.message);
     throw new Error(error.message);
   }
+  console.log(`[deleteSampleStationMapping] Removed tag_id=${tag_id}`);
 }
+
+

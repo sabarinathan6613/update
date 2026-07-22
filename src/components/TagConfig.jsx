@@ -480,7 +480,7 @@ export default function TagConfig({ user, isActive }) {
     setRowSuccess(prev => { const n = { ...prev }; delete n[idx]; return n; });
 
     try {
-      // Write to cloud DB and read back to confirm
+      // Write to cloud DB — upsert().select().single() confirms commit in one round-trip
       const saved = await upsertSampleStationMapping({
         tag_id: idx,
         equipment_name: tag.TagName,
@@ -488,18 +488,28 @@ export default function TagConfig({ user, isActive }) {
         role
       });
 
-      // Update local snapshot with confirmed DB row
-      setSsMappings(prev => {
-        const withoutThis = prev.filter(m => Number(m.tag_id) !== idx);
-        return [...withoutThis, saved];
-      });
+      // Reload ALL mappings fresh from the DB so ssMappings reflects ground-truth
+      // STATUS = SAVED is determined from ssMappings, never from optimistic state
+      const freshMappings = await getSampleStationMappings();
+      setSsMappings(freshMappings);
+      // Also sync rowEdits so hasRowChanges correctly shows no pending changes
+      const freshEdit = freshMappings.find(m => Number(m.tag_id) === idx);
+      if (freshEdit) {
+        setRowEdits(prev => ({
+          ...prev,
+          [idx]: { circuit: freshEdit.circuit, role: freshEdit.role }
+        }));
+      }
 
+      // rowSuccess used ONLY for the brief ✅ inline indicator, NOT for STATUS badge
       setRowSuccess(prev => ({ ...prev, [idx]: 'Saved' }));
-      setTimeout(() => setRowSuccess(prev => { const n = { ...prev }; delete n[idx]; return n; }), 3000);
+      setTimeout(() => setRowSuccess(prev => { const n = { ...prev }; delete n[idx]; return n; }), 2500);
+
+      console.log(`[handleSaveRow] Confirmed in DB: tag_id=${saved.tag_id} circuit=${saved.circuit} role=${saved.role}`);
     } catch (err) {
-      console.error('[handleSaveRow] Save failed:', err);
+      console.error('[handleSaveRow] Save FAILED:', err.message);
       setRowErrors(prev => ({ ...prev, [idx]: err.message || 'Save failed' }));
-      setTimeout(() => setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; }), 5000);
+      setTimeout(() => setRowErrors(prev => { const n = { ...prev }; delete n[idx]; return n; }), 6000);
     } finally {
       setRowSaving(prev => { const n = { ...prev }; delete n[idx]; return n; });
     }
@@ -1346,10 +1356,10 @@ export default function TagConfig({ user, isActive }) {
                           const hasRowChanges = (currentRole !== savedRole) || (currentCircuit !== savedCircuit);
                           const numIdx = Number(tag.TagIndex);
 
-                          // Calculate status text and color
-                          // "Saved" = DB record exists with valid circuit AND role, no pending edits
+                          // STATUS is ground-truth: read ONLY from ssMappings (cloud DB snapshot)
+                          // rowSuccess is used ONLY for the inline ✅ indicator, NOT for STATUS badge
                           const dbRecord = ssMappings.find(m => Number(m.tag_id) === Number(tag.TagIndex));
-                          const isSavedComplete = dbRecord && dbRecord.circuit && dbRecord.role && dbRecord.role !== 'none';
+                          const isSavedComplete = !!(dbRecord && dbRecord.circuit && dbRecord.role && dbRecord.role !== 'none');
                           let statusText = isSavedComplete ? 'Saved' : (dbRecord ? 'Incomplete' : 'Unassigned');
                           let statusColor = isSavedComplete ? 'var(--success)' : 'var(--text-muted)';
                           if (rowSaving[numIdx]) {
@@ -1358,9 +1368,6 @@ export default function TagConfig({ user, isActive }) {
                           } else if (rowErrors[numIdx]) {
                             statusText = 'Failed';
                             statusColor = 'var(--error)';
-                          } else if (rowSuccess[numIdx]) {
-                            statusText = 'Saved';
-                            statusColor = 'var(--success)';
                           } else if (hasRowChanges) {
                             statusText = 'Unsaved';
                             statusColor = '#94A3B8';
@@ -1418,6 +1425,7 @@ export default function TagConfig({ user, isActive }) {
                                   <option value="none">Unassigned</option>
                                   <option value="sample_tag">Sample Tag</option>
                                   <option value="shift_id">Shift ID</option>
+                                  <option value="shift_cumulative_tonnes">Shift Cumulative Tonnes</option>
                                   <option value="stockpile_tonnes">Stockpile Tonnes</option>
                                 </select>
                               </td>
