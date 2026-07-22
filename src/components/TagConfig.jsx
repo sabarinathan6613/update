@@ -1,4 +1,4 @@
-// src/components/TagConfig.jsx
+// src/components/TagConfig.jsx - Build trigger 2026-07-22 15:53
 import { useState, useEffect, useRef } from 'react';
 import { getTagConfigs, saveTagConfigs, getSettings, saveSettings, getHistorianData, getSampleStationMappings, upsertSampleStationMapping, deleteSampleStationMapping } from '../utils/db';
 import { getSupabaseClient, getSupabaseConfig } from '../utils/supabaseClient';
