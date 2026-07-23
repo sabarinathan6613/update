@@ -632,8 +632,10 @@ export default function Dashboard({ onNavigate, isActive }) {
         const t = new Date(r.DateAndTime).getTime();
         if (!isNaN(t) && t <= refTs) return r;
       }
+      if (latestRecords[Number(tagId)]) return latestRecords[Number(tagId)];
       return null;
     };
+
 
     const resolvedRows = [];
 
@@ -650,9 +652,15 @@ export default function Dashboard({ onNavigate, isActive }) {
       for (const stConfig of sampleTagConfigs) {
         const sampleTagId = Number(stConfig.tag_id);
         const equipmentName = stConfig.equipment_name;
-        const sampleRecs = tagRecordsMap[sampleTagId] || [];
+        let sampleRecs = tagRecordsMap[sampleTagId] || [];
 
-        console.log(`[SampleStation] ${circuit.toUpperCase()} sample tag "${equipmentName}" (ID=${sampleTagId}): ${sampleRecs.length} records in window`);
+        // Fallback: If time-window query returned 0 rows for sampleTagId, fallback to latestRecords
+        if (sampleRecs.length === 0 && latestRecords[sampleTagId]) {
+          sampleRecs = [latestRecords[sampleTagId]];
+        }
+
+        console.log(`[SampleStation] ${circuit.toUpperCase()} sample tag "${equipmentName}" (ID=${sampleTagId}): ${sampleRecs.length} record(s) processed`);
+
 
         for (const sampleRec of sampleRecs) {
           const tSample = new Date(sampleRec.DateAndTime).getTime();
