@@ -1076,10 +1076,10 @@ export default function TagConfig({ user, isActive }) {
                         { name: 'DATABASE MAPPING', align: 'left', width: '160px' },
                         { name: 'RECORDS COUNT', align: 'right', width: '110px' },
                         { name: 'DASHBOARD', align: 'center', width: '90px' },
-                        { name: 'SAMPLE STATION', align: 'center', width: '120px' },
-                        { name: 'DOWNTIME', align: 'center', width: '95px' },
                         { name: 'TRENDS', align: 'center', width: '80px' },
                         { name: 'REPORTS', align: 'center', width: '80px' },
+                        { name: 'SAMPLE STATION', align: 'center', width: '120px' },
+                        { name: 'DOWNTIME', align: 'center', width: '95px' },
                         { name: 'ACTIVE', align: 'center', width: '80px' },
                         { name: 'ACTIONS', align: 'right', width: '160px' }
                       ].map(col => (
@@ -1241,34 +1241,6 @@ export default function TagConfig({ user, isActive }) {
                           )}
                         </td>
 
-                        {/* SAMPLE STATION toggle */}
-                        <td style={{ padding: '10px 10px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
-                          {savingToggleId === `${tag.TagIndex}-SampleDatalog` ? (
-                            <SavingSpinner />
-                          ) : (
-                            <ToggleSwitch
-                              id={`tbl-sample-${tag.TagIndex}`}
-                              checked={tag.SampleDatalog || tag.sample_station_enabled}
-                              onChange={() => handleToggleVisibility(tag.TagIndex, 'SampleDatalog')}
-                              disabled={isReadOnly}
-                            />
-                          )}
-                        </td>
-
-                        {/* DOWNTIME toggle */}
-                        <td style={{ padding: '10px 10px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
-                          {savingToggleId === `${tag.TagIndex}-DowntimeDatalog` ? (
-                            <SavingSpinner />
-                          ) : (
-                            <ToggleSwitch
-                              id={`tbl-down-${tag.TagIndex}`}
-                              checked={tag.DowntimeDatalog || tag.downtime_datalog_enabled}
-                              onChange={() => handleToggleVisibility(tag.TagIndex, 'DowntimeDatalog')}
-                              disabled={isReadOnly}
-                            />
-                          )}
-                        </td>
-
                         {/* TRENDS visibility toggle */}
                         <td style={{ padding: '10px 10px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
                           {savingToggleId === `${tag.TagIndex}-TrendsVisible` ? (
@@ -1297,6 +1269,34 @@ export default function TagConfig({ user, isActive }) {
                           )}
                         </td>
 
+                        {/* SAMPLE STATION toggle */}
+                        <td style={{ padding: '10px 10px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
+                          {savingToggleId === `${tag.TagIndex}-SampleDatalog` ? (
+                            <SavingSpinner />
+                          ) : (
+                            <ToggleSwitch
+                              id={`tbl-sample-${tag.TagIndex}`}
+                              checked={tag.SampleDatalog || tag.sample_station_enabled}
+                              onChange={() => handleToggleVisibility(tag.TagIndex, 'SampleDatalog')}
+                              disabled={isReadOnly}
+                            />
+                          )}
+                        </td>
+
+                        {/* DOWNTIME toggle */}
+                        <td style={{ padding: '10px 10px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
+                          {savingToggleId === `${tag.TagIndex}-DowntimeDatalog` ? (
+                            <SavingSpinner />
+                          ) : (
+                            <ToggleSwitch
+                              id={`tbl-down-${tag.TagIndex}`}
+                              checked={tag.DowntimeDatalog || tag.downtime_datalog_enabled}
+                              onChange={() => handleToggleVisibility(tag.TagIndex, 'DowntimeDatalog')}
+                              disabled={isReadOnly}
+                            />
+                          )}
+                        </td>
+
                         {/* ACTIVE STATUS toggle */}
                         <td style={{ padding: '10px 10px', borderBottom: '1px solid var(--border-subtle)', textAlign: 'center' }}>
                           {savingToggleId === `${tag.TagIndex}-ActiveStatus` ? (
@@ -1310,6 +1310,7 @@ export default function TagConfig({ user, isActive }) {
                             />
                           )}
                         </td>
+
 
 
                         {/* ACTIONS */}
