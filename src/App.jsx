@@ -595,18 +595,11 @@ function AppContent() {
             ...(token ? { 'Authorization': `Bearer ${token}` } : {})
           }
         });
-        if (!response.ok) {
-          const errorText = await response.text();
-          console.warn(`[Client Poller] Server responded with status ${response.status}:`, errorText.substring(0, 200));
-          return;
-        }
-
         const result = await response.json();
         console.log('[Client Poller] Scheduler engine response:', result);
       } catch (err) {
         console.warn('[Client Poller] Scheduler trigger failed:', err.message || err);
       }
-
     };
 
     // Delay first run slightly to let settings load

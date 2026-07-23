@@ -1936,12 +1936,10 @@ export default async function handler(req, res) {
     const mappings = settings?.columnMappings || {};
 
     const tagCol = mappings.tagCol || 'TagIndex';
-    const isDbTable = String(tableName).toLowerCase() === 'database';
-    const tsCol = isDbTable ? 'DateAndTime' : (mappings.timestampCol || 'DateAndTime');
+    const tsCol = mappings.timestampCol || 'DateAndTime';
     const valCol = mappings.valueCol || 'Val';
     const statusCol = mappings.statusCol || 'Status';
     const alarmCol = mappings.alarmCol || 'Marker';
-
 
     currentStep = "Querying tag configurations from database";
     sendProgress(15, 'Retrieving tag indexes list...');

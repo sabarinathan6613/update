@@ -399,12 +399,11 @@ export default async function handler(req, res) {
         const tableName = settings?.selectedTable || 'Database';
         const mappings = settings?.columnMappings || {};
         
-        const isDbTable = String(tableName).toLowerCase() === 'database';
-        const tsCol = isDbTable ? 'DateAndTime' : (mappings.timestampCol || 'DateAndTime');
+        const tagCol = mappings.tagCol || 'TagIndex';
+        const tsCol = mappings.timestampCol || 'DateAndTime';
         const valCol = mappings.valueCol || 'Val';
         const statusCol = mappings.statusCol || 'Status';
         const alarmCol = mappings.alarmCol || 'Marker';
-
 
         // 2. Query Tag Configurations list
         const { data: dbTags } = await supabase.from('tag_configurations').select('*');
